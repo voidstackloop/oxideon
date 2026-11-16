@@ -623,8 +623,55 @@ class ZeroRedundancyOptimizer:
             self.optim.zero_grad()
 
 
+def launch_workers(
+    fn: Any,
+    world_size: int = 2,
+    master_addr: str = "127.0.0.1",
+    master_port: int = 29500,
+    max_restarts: int = 1,
+    args: tuple = (),
+) -> List[int]:
+    """torchrun-style multi-process launcher with elastic worker restart on transient failures.
+
+    Sets `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, and `MASTER_PORT` for each worker.
+    Returns the list of final exit codes per rank.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+
+    def _run_rank(rank: int) -> int:
+        os.environ["RANK"] = str(rank)
+        os.environ["LOCAL_RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["MASTER_ADDR"] = str(master_addr)
+        os.environ["MASTER_PORT"] = str(master_port)
+        fn(rank, world_size, *args)
+        return 0
+
+    exit_codes: List[int] = [1] * world_size
+    for attempt in range(max_restarts + 1):
+        procs = []
+        for r in range(world_size):
+            if exit_codes[r] == 0:
+                continue
+            p = ctx.Process(target=_run_rank, args=(r,))
+            p.start()
+            procs.append((r, p))
+        for r, p in procs:
+            p.join()
+            exit_codes[r] = p.exitcode if p.exitcode is not None else 1
+        if all(code == 0 for code in exit_codes):
+            break
+    return exit_codes
+
+
 __all__ = [
     "ReduceOp",
+    "NativeProcessGroup",
+    "CommHandle",
+    "FullyShardedParam",
+    "launch_workers",
     "init_process_group",
     "destroy_process_group",
     "is_available",

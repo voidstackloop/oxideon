@@ -149,13 +149,14 @@ pub fn gemm_f32_strided(
         c.len(),
         m.saturating_mul(n)
     );
-    c.fill(0.0);
     if m == 0 || k == 0 || n == 0 {
+        c.fill(0.0);
         return;
     }
 
     // Small matrix fast-path: avoid packing overhead when total work is tiny.
     if m * k * n <= SMALL {
+        c.fill(0.0);
         gemm_f32_small(a, off_a, rs_a, cs_a, b, off_b, rs_b, cs_b, c, m, k, n);
         return;
     }
@@ -166,6 +167,8 @@ pub fn gemm_f32_strided(
     ) {
         return;
     }
+
+    c.fill(0.0);
 
     #[cfg(feature = "rayon")]
     if m >= 128 && m * k * n >= 128 * 128 * 128 {
@@ -182,6 +185,65 @@ pub fn gemm_f32_strided(
         return;
     }
 
+    gemm_f32_macro_m(a, off_a, rs_a, cs_a, b, off_b, rs_b, cs_b, c, m, k, n);
+}
+
+/// Single-threaded strided `f32` GEMM for use inside outer `rayon` parallel loops (avoids thread oversubscription).
+pub fn gemm_f32_strided_seq(
+    a: &[f32],
+    off_a: usize,
+    rs_a: isize,
+    cs_a: isize,
+    b: &[f32],
+    off_b: usize,
+    rs_b: isize,
+    cs_b: isize,
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    if m == 0 || k == 0 || n == 0 {
+        c.fill(0.0);
+        return;
+    }
+    if m * k * n <= SMALL {
+        c.fill(0.0);
+        gemm_f32_small(a, off_a, rs_a, cs_a, b, off_b, rs_b, cs_b, c, m, k, n);
+        return;
+    }
+    #[cfg(feature = "fast-gemm")]
+    {
+        let a_ok = strided_within(a.len(), off_a, rs_a, cs_a, m, k);
+        let b_ok = strided_within(b.len(), off_b, rs_b, cs_b, k, n);
+        if a_ok && b_ok {
+            unsafe {
+                ::gemm::gemm(
+                    m,
+                    n,
+                    k,
+                    c.as_mut_ptr(),
+                    1,
+                    n as isize,
+                    false,
+                    a.as_ptr().add(off_a),
+                    cs_a,
+                    rs_a,
+                    b.as_ptr().add(off_b),
+                    cs_b,
+                    rs_b,
+                    0.0f32,
+                    1.0f32,
+                    false,
+                    false,
+                    false,
+                    ::gemm::Parallelism::None,
+                );
+            }
+            return;
+        }
+    }
+    c.fill(0.0);
     gemm_f32_macro_m(a, off_a, rs_a, cs_a, b, off_b, rs_b, cs_b, c, m, k, n);
 }
 

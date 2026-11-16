@@ -88,12 +88,130 @@ pub fn layer_norm(
         let b32 = bias.map(crate::amp::fp32_value).transpose()?;
         return layer_norm(&x32, normalized_shape, w32.as_ref(), b32.as_ref(), eps);
     }
+    if k == 1
+        && let Some(y) = layer_norm_last_f32(x, weight, bias, eps)?
+    {
+        return Ok(y);
+    }
+    layer_norm_composed(x, normalized_shape, weight, bias, eps)
+}
+
+/// Layer normalization written as a chain of differentiable tensor operations (any dtype, device and
+/// `normalized_shape`); the reference the fused kernel is tested against.
+fn layer_norm_composed(x: &Tensor, normalized_shape: &[usize], weight: Option<&Tensor>, bias: Option<&Tensor>, eps: f64) -> Result<Tensor> {
+    let k = normalized_shape.len();
     let axes: Vec<isize> = (x.ndim() - k..x.ndim()).map(|a| a as isize).collect();
     let mean = x.mean_axes(&axes, true)?;
     let centered = x.sub(&mean)?;
     let var = centered.square()?.mean_axes(&axes, true)?;
     let y = centered.mul(&var.add_scalar(eps)?.rsqrt()?)?;
     affine(y, weight, bias, normalized_shape)
+}
+
+/// Fused layer normalization over the last dimension for contiguous `f32` host tensors: one pass per row computes the
+/// statistics, the normalized values and the affine output (the composed form makes seven passes over the data and as
+/// many temporaries). `None` when the input does not qualify.
+///
+/// The backward pass is the closed form `dx = rstd * (gy - mean(gy) - y_hat * mean(gy * y_hat))` with `gy = g * w`,
+/// built from tensor operations; when the backward pass itself is being recorded (`create_graph`) the statistics are
+/// recomputed differentiably so higher-order gradients stay exact.
+fn layer_norm_last_f32(x: &Tensor, weight: Option<&Tensor>, bias: Option<&Tensor>, eps: f64) -> Result<Option<Tensor>> {
+    use crate::backend::{CpuStorage, Storage};
+    use crate::dtype::DType;
+    use crate::layout::Layout;
+    let nd = x.ndim();
+    let d = x.shape()[nd - 1];
+    let host_f32 = |t: &Tensor| t.dtype() == DType::F32 && t.device().is_cpu();
+    if d == 0 || x.numel() == 0 || !host_f32(x) || weight.is_some_and(|w| !host_f32(w) || w.shape() != [d]) || bias.is_some_and(|b| !host_f32(b) || b.shape() != [d]) {
+        return Ok(None);
+    }
+    let needs_grad = crate::tensor::is_grad_enabled() && (x.requires_grad() || weight.is_some_and(Tensor::requires_grad) || bias.is_some_and(Tensor::requires_grad));
+    let w = weight.map(|w| w.to_vec::<f32>()).transpose()?;
+    let b = bias.map(|b| b.to_vec::<f32>()).transpose()?;
+    let (n, rows) = (x.numel(), x.numel() / d);
+    let take = |len: usize| crate::pool::take_f32(len).unwrap_or_else(|| vec![0.0; len]);
+    let mut out = take(n);
+    let mut y_hat = if needs_grad { take(n) } else { Vec::new() };
+    let mut rstd = vec![0.0f32; rows];
+    {
+        let guard = x.storage().cpu_ref()?;
+        let CpuStorage::F32(v) = &*guard else { return Ok(None) };
+        let Some(range) = x.layout().contiguous_range_in(v.len()) else { return Ok(None) };
+        let src = &v[range];
+        let eps = eps as f32;
+        let row = |xr: &[f32], o: &mut [f32], h: &mut [f32], rs: &mut f32| {
+            let mean = xr.iter().sum::<f32>() / d as f32;
+            let var = xr.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+            let r = 1.0 / (var + eps).sqrt();
+            *rs = r;
+            match (&w, &b) {
+                (Some(w), Some(b)) => o.iter_mut().zip(xr).zip(w.iter().zip(b)).for_each(|((o, &v), (&w, &b))| *o = (v - mean) * r * w + b),
+                (Some(w), None) => o.iter_mut().zip(xr).zip(w).for_each(|((o, &v), &w)| *o = (v - mean) * r * w),
+                (None, Some(b)) => o.iter_mut().zip(xr).zip(b).for_each(|((o, &v), &b)| *o = (v - mean) * r + b),
+                (None, None) => o.iter_mut().zip(xr).for_each(|(o, &v)| *o = (v - mean) * r),
+            }
+            h.iter_mut().zip(xr).for_each(|(h, &v)| *h = (v - mean) * r); // no-op when `h` is empty
+        };
+        // rows are grouped so each parallel task handles about 8K elements
+        let group = (8192 / d).max(1);
+        let task = |xs: &[f32], os: &mut [f32], rs: &mut [f32], hs: &mut [f32]| {
+            let mut hrows = hs.chunks_mut(d);
+            for ((xr, o), r) in xs.chunks(d).zip(os.chunks_mut(d)).zip(rs.iter_mut()) {
+                row(xr, o, hrows.next().unwrap_or(&mut []), r);
+            }
+        };
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            let hs: Vec<&mut [f32]> = if needs_grad { y_hat.chunks_mut(group * d).collect() } else { (0..rows.div_ceil(group)).map(|_| -> &mut [f32] { &mut [] }).collect() };
+            src.par_chunks(group * d).zip(out.par_chunks_mut(group * d)).zip(rstd.par_chunks_mut(group)).zip(hs.into_par_iter()).for_each(|(((xs, os), rs), h)| task(xs, os, rs, h));
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            let mut hs = y_hat.chunks_mut(group * d);
+            for ((xs, os), rs) in src.chunks(group * d).zip(out.chunks_mut(group * d)).zip(rstd.chunks_mut(group)) {
+                task(xs, os, rs, hs.next().unwrap_or(&mut []));
+            }
+        }
+    }
+    let shape = x.shape().to_vec();
+    let out_storage = Storage::new_cpu(CpuStorage::F32(out));
+    if !needs_grad {
+        return Ok(Some(Tensor::from_storage(out_storage, Layout::contiguous(shape))));
+    }
+    let y_hat = Tensor::from_storage(Storage::new_cpu(CpuStorage::F32(y_hat)), Layout::contiguous(shape.clone()));
+    let mut stat_shape = shape.clone();
+    stat_shape[nd - 1] = 1;
+    let rstd = Tensor::from_storage(Storage::new_cpu(CpuStorage::F32(rstd)), Layout::contiguous(stat_shape));
+    let (xi, wi, bi) = (x.clone(), weight.cloned(), bias.cloned());
+    let mut inputs = vec![x.clone()];
+    inputs.extend(weight.cloned());
+    inputs.extend(bias.cloned());
+    let lead: Vec<isize> = (0..nd as isize - 1).collect();
+    Ok(Some(Tensor::from_op(out_storage, Layout::contiguous(shape), "layer_norm", inputs, move |g| {
+        // create_graph (gradient recording is on during this backward pass): the statistics must be functions of x again
+        let (yh, rs) = if crate::tensor::is_grad_enabled() {
+            let c = xi.sub(&xi.mean_axis(-1, true)?)?;
+            let rs = c.square()?.mean_axis(-1, true)?.add_scalar(eps)?.rsqrt()?;
+            (c.mul(&rs)?, rs)
+        } else {
+            (y_hat.clone(), rstd.clone())
+        };
+        let gy = match &wi {
+            Some(w) => g.mul(w)?,
+            None => g.clone(),
+        };
+        let dx = gy.sub(&gy.mean_axis(-1, true)?)?.sub(&yh.mul(&gy.mul(&yh)?.mean_axis(-1, true)?)?)?.mul(&rs)?;
+        let mut grads = vec![Some(dx)];
+        if wi.is_some() {
+            let gw = g.mul(&yh)?;
+            grads.push(Some(if lead.is_empty() { gw } else { gw.sum_axes(&lead, false)? }));
+        }
+        if bi.is_some() {
+            grads.push(Some(if lead.is_empty() { g.clone() } else { g.sum_axes(&lead, false)? }));
+        }
+        Ok(grads)
+    })))
 }
 
 /// Group normalization of `[N, C, ...]` (`torch.nn.functional.group_norm`).
@@ -600,6 +718,73 @@ pub fn fold_2d(
             ))])
         },
     ))
+}
+
+#[cfg(test)]
+mod fused_layer_norm_tests {
+    use super::*;
+
+    fn t(n: usize, shape: &[usize], seed: f32) -> Tensor {
+        Tensor::from_slice(&(0..n).map(|i| ((i as f32 + seed) * 0.713).sin() * 2.0 + 0.3).collect::<Vec<f32>>(), shape).unwrap()
+    }
+
+    fn close(a: &Tensor, b: &Tensor, tol: f32) {
+        assert_eq!(a.shape(), b.shape());
+        let (a, b) = (a.to_vec::<f32>().unwrap(), b.to_vec::<f32>().unwrap());
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!((x - y).abs() <= tol * (1.0 + y.abs()), "element {i}: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn fused_kernel_matches_the_composed_form_in_value_and_gradients() {
+        // 3 x 700 x 40: large enough for several parallel tasks and a ragged last group
+        for (with_w, with_b) in [(true, true), (true, false), (false, true), (false, false)] {
+            let x = t(3 * 700 * 40, &[3, 700, 40], 0.0).requires_grad_(true);
+            let w = t(40, &[40], 1.0).requires_grad_(true);
+            let b = t(40, &[40], 2.0).requires_grad_(true);
+            let (wo, bo) = (with_w.then_some(&w), with_b.then_some(&b));
+            let probe = t(3 * 700 * 40, &[3, 700, 40], 5.0);
+            let fused = layer_norm(&x, &[40], wo, bo, 1e-5).unwrap();
+            let reference = layer_norm_composed(&x, &[40], wo, bo, 1e-5).unwrap();
+            close(&fused, &reference, 2e-5);
+            let grads = |y: &Tensor| {
+                for p in [&x, &w, &b] {
+                    p.zero_grad();
+                }
+                y.mul(&probe).unwrap().sum().unwrap().backward().unwrap();
+                [x.grad(), w.grad(), b.grad()]
+            };
+            let (gf, gr) = (grads(&fused), grads(&reference));
+            for (f, r) in gf.iter().zip(&gr) {
+                match (f, r) {
+                    (Some(f), Some(r)) => close(f, r, 2e-3),
+                    (None, None) => {}
+                    _ => panic!("gradient presence differs"),
+                }
+            }
+        }
+        // no gradient requested: the plain kernel, same values
+        let x = t(64 * 16, &[64, 16], 3.0);
+        close(&layer_norm(&x, &[16], None, None, 1e-5).unwrap(), &layer_norm_composed(&x, &[16], None, None, 1e-5).unwrap(), 2e-5);
+        // a strided view and a 2-D normalized shape fall back to the composed form
+        let v = x.transpose(0, 1).unwrap();
+        close(&layer_norm(&v, &[64], None, None, 1e-5).unwrap(), &layer_norm_composed(&v, &[64], None, None, 1e-5).unwrap(), 1e-6);
+    }
+
+    #[test]
+    fn double_backward_through_the_fused_kernel_matches_the_composed_form() {
+        let second = |f: &dyn Fn(&Tensor) -> Tensor| {
+            let x = t(4 * 6, &[4, 6], 0.5).requires_grad_(true);
+            let y = f(&x).mul(&t(24, &[4, 6], 7.0)).unwrap().sum().unwrap();
+            let g = crate::tensor::grad(&[y], &[x.clone()], None, true).unwrap()[0].clone().unwrap();
+            let z = g.square().unwrap().sum().unwrap();
+            crate::tensor::grad(&[z], &[x], None, false).unwrap()[0].clone().unwrap()
+        };
+        let fused = second(&|x| layer_norm(x, &[6], None, None, 1e-5).unwrap());
+        let reference = second(&|x| layer_norm_composed(x, &[6], None, None, 1e-5).unwrap());
+        close(&fused, &reference, 5e-3);
+    }
 }
 
 #[cfg(test)]

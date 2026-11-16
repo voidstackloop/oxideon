@@ -9,6 +9,212 @@ use crate::error::{Error, Result};
 use crate::gemm::{batched_gemm_f32, batched_gemm_f64};
 use crate::layout::{DimMap, Layout, ViewSpec, broadcast_shapes};
 
+/// Elements per parallel task of the elementwise `f32` kernels: big enough that the loop inside a task vectorizes and the
+/// scheduling cost disappears, small enough that a 1M-element tensor still spreads over every core.
+const EW_CHUNK: usize = 8 * 1024;
+
+fn ew_out(n: usize) -> Vec<f32> {
+    crate::pool::take_f32(n).unwrap_or_else(|| vec![0.0; n])
+}
+
+/// `out[i] = f(a[i])` with `f` monomorphized per call site, so each operation gets its own vectorized loop.
+#[inline]
+fn f32_map(a: &[f32], f: impl Fn(f32) -> f32 + Sync) -> Vec<f32> {
+    let mut out = ew_out(a.len());
+    let kernel = |(o, a): (&mut [f32], &[f32])| o.iter_mut().zip(a).for_each(|(o, &x)| *o = f(x));
+    #[cfg(feature = "rayon")]
+    if a.len() > EW_CHUNK {
+        out.par_chunks_mut(EW_CHUNK).zip(a.par_chunks(EW_CHUNK)).for_each(kernel);
+        return out;
+    }
+    kernel((&mut out, a));
+    out
+}
+
+/// `out[i] = f(a[i], b[i])`, see [`f32_map`].
+#[inline]
+fn f32_zip(a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32 + Sync) -> Vec<f32> {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut out = ew_out(n);
+    let kernel = |((o, a), b): ((&mut [f32], &[f32]), &[f32])| o.iter_mut().zip(a).zip(b).for_each(|((o, &x), &y)| *o = f(x, y));
+    #[cfg(feature = "rayon")]
+    if n > EW_CHUNK {
+        out.par_chunks_mut(EW_CHUNK).zip(a.par_chunks(EW_CHUNK)).zip(b.par_chunks(EW_CHUNK)).for_each(kernel);
+        return out;
+    }
+    kernel(((&mut out, a), b));
+    out
+}
+
+/// Contiguous `f32` unary operation. The `match` is outside the loops: every arm instantiates [`f32_map`] with a constant
+/// operation, which the per-element evaluator folds to a single expression.
+fn f32_unary_contiguous(a: &[f32], op: UnaryOp) -> Vec<f32> {
+    macro_rules! arm {
+        ($e:expr) => {
+            f32_map(a, |x| eval_unary_f32(x, $e))
+        };
+    }
+    match op {
+        UnaryOp::Neg => arm!(UnaryOp::Neg),
+        UnaryOp::Abs => arm!(UnaryOp::Abs),
+        UnaryOp::Sign => arm!(UnaryOp::Sign),
+        UnaryOp::Exp => {
+            if super::simd_x86::has_avx2_fma() {
+                let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+                #[cfg(feature = "rayon")]
+                if a.len() >= 16384 {
+                    out.par_chunks_mut(8192).zip(a.par_chunks(8192)).for_each(|(o, s)| {
+                        super::simd_x86::exp_f32_slice(s, o);
+                    });
+                    return out;
+                }
+                super::simd_x86::exp_f32_slice(a, &mut out);
+                return out;
+            }
+            arm!(UnaryOp::Exp)
+        }
+        UnaryOp::Ln => arm!(UnaryOp::Ln),
+        UnaryOp::Sqrt => arm!(UnaryOp::Sqrt),
+        UnaryOp::Rsqrt => arm!(UnaryOp::Rsqrt),
+        UnaryOp::Sin => arm!(UnaryOp::Sin),
+        UnaryOp::Cos => arm!(UnaryOp::Cos),
+        UnaryOp::Tanh => arm!(UnaryOp::Tanh),
+        UnaryOp::Sigmoid => {
+            if super::simd_x86::has_avx2_fma() {
+                let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+                #[cfg(feature = "rayon")]
+                if a.len() >= 16384 {
+                    out.par_chunks_mut(8192).zip(a.par_chunks(8192)).for_each(|(o, s)| {
+                        super::simd_x86::sigmoid_f32_slice(s, o);
+                    });
+                    return out;
+                }
+                super::simd_x86::sigmoid_f32_slice(a, &mut out);
+                return out;
+            }
+            arm!(UnaryOp::Sigmoid)
+        }
+        UnaryOp::Relu => {
+            if super::simd_x86::has_avx2_fma() {
+                let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+                #[cfg(feature = "rayon")]
+                if a.len() >= 16384 {
+                    out.par_chunks_mut(8192).zip(a.par_chunks(8192)).for_each(|(o, s)| {
+                        super::simd_x86::relu_f32_slice(s, o);
+                    });
+                    return out;
+                }
+                super::simd_x86::relu_f32_slice(a, &mut out);
+                return out;
+            }
+            arm!(UnaryOp::Relu)
+        }
+        UnaryOp::LeakyRelu(s) => arm!(UnaryOp::LeakyRelu(s)),
+        UnaryOp::Gelu => {
+            if super::simd_x86::has_avx2_fma() {
+                let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+                #[cfg(feature = "rayon")]
+                if a.len() >= 16384 {
+                    out.par_chunks_mut(8192).zip(a.par_chunks(8192)).for_each(|(o, s)| {
+                        super::simd_x86::gelu_f32_slice(s, o);
+                    });
+                    return out;
+                }
+                super::simd_x86::gelu_f32_slice(a, &mut out);
+                return out;
+            }
+            arm!(UnaryOp::Gelu)
+        }
+        UnaryOp::Silu => {
+            if super::simd_x86::has_avx2_fma() {
+                let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+                #[cfg(feature = "rayon")]
+                if a.len() >= 16384 {
+                    out.par_chunks_mut(8192).zip(a.par_chunks(8192)).for_each(|(o, s)| {
+                        super::simd_x86::silu_f32_slice(s, o);
+                    });
+                    return out;
+                }
+                super::simd_x86::silu_f32_slice(a, &mut out);
+                return out;
+            }
+            arm!(UnaryOp::Silu)
+        }
+        UnaryOp::Elu(s) => arm!(UnaryOp::Elu(s)),
+        UnaryOp::Softplus => arm!(UnaryOp::Softplus),
+        UnaryOp::Square => arm!(UnaryOp::Square),
+        UnaryOp::Recip => arm!(UnaryOp::Recip),
+        UnaryOp::Floor => arm!(UnaryOp::Floor),
+        UnaryOp::Ceil => arm!(UnaryOp::Ceil),
+        UnaryOp::Round => arm!(UnaryOp::Round),
+        UnaryOp::Erf => arm!(UnaryOp::Erf),
+        UnaryOp::Powf(p) => arm!(UnaryOp::Powf(p)),
+        UnaryOp::AddScalar(v) => arm!(UnaryOp::AddScalar(v)),
+        UnaryOp::MulScalar(v) => arm!(UnaryOp::MulScalar(v)),
+        UnaryOp::Clamp(lo, hi) => arm!(UnaryOp::Clamp(lo, hi)),
+        UnaryOp::LogicalNot => arm!(UnaryOp::LogicalNot),
+    }
+}
+
+/// Contiguous `f32` binary operation, one vectorized loop per operation (see [`f32_unary_contiguous`]).
+fn f32_binary_contiguous(a: &[f32], b: &[f32], op: BinaryOp) -> Vec<f32> {
+    macro_rules! arm {
+        ($e:expr) => {
+            f32_zip(a, b, |x, y| eval_bin_f32(x, y, $e))
+        };
+    }
+    macro_rules! simd_bin {
+        ($simd_fn:path) => {{
+            let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+            #[cfg(feature = "rayon")]
+            if a.len() >= 16384 {
+                out.par_chunks_mut(8192)
+                    .zip(a.par_chunks(8192))
+                    .zip(b.par_chunks(8192))
+                    .for_each(|((o, sa), sb)| {
+                        $simd_fn(sa, sb, o);
+                    });
+                return out;
+            }
+            $simd_fn(a, b, &mut out);
+            return out;
+        }};
+    }
+    match op {
+        BinaryOp::Add => {
+            if super::simd_x86::has_avx2_fma() {
+                simd_bin!(super::simd_x86::add_f32_slice);
+            }
+            arm!(BinaryOp::Add)
+        }
+        BinaryOp::Sub => {
+            if super::simd_x86::has_avx2_fma() {
+                simd_bin!(super::simd_x86::sub_f32_slice);
+            }
+            arm!(BinaryOp::Sub)
+        }
+        BinaryOp::Mul => {
+            if super::simd_x86::has_avx2_fma() {
+                simd_bin!(super::simd_x86::mul_f32_slice);
+            }
+            arm!(BinaryOp::Mul)
+        }
+        BinaryOp::Div => {
+            if super::simd_x86::has_avx2_fma() {
+                simd_bin!(super::simd_x86::div_f32_slice);
+            }
+            arm!(BinaryOp::Div)
+        }
+        BinaryOp::Maximum => arm!(BinaryOp::Maximum),
+        BinaryOp::Minimum => arm!(BinaryOp::Minimum),
+        BinaryOp::Pow => arm!(BinaryOp::Pow),
+        BinaryOp::Fmod => arm!(BinaryOp::Fmod),
+        BinaryOp::Remainder => arm!(BinaryOp::Remainder),
+        BinaryOp::FloorDiv => arm!(BinaryOp::FloorDiv),
+    }
+}
+
 /// The smallest and largest storage index a layout can reach, or `None` if it has no elements.
 fn layout_extent(l: &Layout) -> Option<(isize, isize)> {
     let (mut lo, mut hi) = (l.offset() as isize, l.offset() as isize);
@@ -100,7 +306,8 @@ where
     let mut out = crate::pool::take::<T>(total).unwrap_or_else(|| vec![T::default(); total]);
     #[cfg(feature = "rayon")]
     if total >= 16384 {
-        out.par_chunks_mut(cols).enumerate().for_each(|(r, o)| row(r, o));
+        let group = (EW_CHUNK / cols).max(1);
+        out.par_chunks_mut(cols * group).enumerate().for_each(|(gi, block)| block.chunks_mut(cols).enumerate().for_each(|(k, o)| row(gi * group + k, o)));
         return Some(out);
     }
     out.chunks_mut(cols).enumerate().for_each(|(r, o)| row(r, o));
@@ -674,21 +881,32 @@ impl CpuStorage {
                 let range = layout.contiguous_range_in(v.len())?;
                 let src = &v[range];
                 // Fast scan: fall back if any element is non-finite (+inf/-inf/NaN)
-                if src.iter().any(|&x| !x.is_finite()) {
+                // (an OR over the exponent bits: unlike a short-circuiting `any` it vectorizes, and it runs in parallel)
+                let non_finite = |c: &[f32]| c.iter().fold(false, |bad, x| bad | (x.to_bits() & 0x7f80_0000 == 0x7f80_0000));
+                #[cfg(feature = "rayon")]
+                let bad = src.par_chunks(EW_CHUNK).any(non_finite);
+                #[cfg(not(feature = "rayon"))]
+                let bad = non_finite(src);
+                if bad {
                     return None;
                 }
                 let mut out = crate::pool::take::<f32>(total).unwrap_or_else(|| vec![0.0; total]);
                 let row_fn = |(src_row, dst_row): (&[f32], &mut [f32])| {
+                    if super::simd_x86::softmax_row_f32(src_row, dst_row) {
+                        return;
+                    }
                     let mut m = f32::NEG_INFINITY;
                     for &x in src_row {
                         if x > m {
                             m = x;
                         }
                     }
-                    let mut sum = 0.0f32;
+                    // the exponentials in their own loop (it vectorizes); the ordered sum stays a separate scalar pass
                     for (d, &x) in dst_row.iter_mut().zip(src_row.iter()) {
-                        let e = (x - m).exp();
-                        *d = e;
+                        *d = fast_exp_f32(x - m);
+                    }
+                    let mut sum = 0.0f32;
+                    for &e in dst_row.iter() {
                         sum += e;
                     }
                     let inv = 1.0f32 / sum;
@@ -698,9 +916,11 @@ impl CpuStorage {
                 };
                 #[cfg(feature = "rayon")]
                 if total >= 16384 {
-                    src.par_chunks(cols)
-                        .zip(out.par_chunks_mut(cols))
-                        .for_each(row_fn);
+                    // several rows per task (about EW_CHUNK elements), not one task per row
+                    let block = cols * (EW_CHUNK / cols).max(1);
+                    src.par_chunks(block)
+                        .zip(out.par_chunks_mut(block))
+                        .for_each(|(s, d)| s.chunks(cols).zip(d.chunks_mut(cols)).for_each(row_fn));
                     return Some(Self::F32(out));
                 }
                 src.chunks(cols).zip(out.chunks_mut(cols)).for_each(row_fn);
@@ -745,6 +965,109 @@ impl CpuStorage {
         }
     }
 
+    /// Fused single-pass last-axis `LayerNorm` on contiguous `F32` storage.
+    pub fn layer_norm_last_axis(
+        &self,
+        layout: &Layout,
+        weight: &Self,
+        w_layout: &Layout,
+        bias: &Self,
+        b_layout: &Layout,
+        eps: f64,
+    ) -> Option<Self> {
+        let d = w_layout.numel();
+        if d == 0 || b_layout.numel() != d {
+            return None;
+        }
+        let total = layout.numel();
+        if total == 0 || total % d != 0 {
+            return None;
+        }
+        match (self, weight, bias) {
+            (Self::F32(xv), Self::F32(wv), Self::F32(bv)) => {
+                let x_range = layout.contiguous_range_in(xv.len())?;
+                let w_range = w_layout.contiguous_range_in(wv.len())?;
+                let b_range = b_layout.contiguous_range_in(bv.len())?;
+                if w_range.len() != d || b_range.len() != d {
+                    return None;
+                }
+                let src = &xv[x_range];
+                let ws = &wv[w_range];
+                let bs = &bv[b_range];
+                let mut out = crate::pool::take::<f32>(total).unwrap_or_else(|| vec![0.0; total]);
+                let row_fn = |(src_row, dst_row): (&[f32], &mut [f32])| {
+                    if super::simd_x86::layer_norm_row_f32(src_row, ws, bs, dst_row, eps as f32) {
+                        return;
+                    }
+                    let mut sum = 0.0f64;
+                    for &x in src_row {
+                        sum += x as f64;
+                    }
+                    let mean = sum / (d as f64);
+                    let mut var_sum = 0.0f64;
+                    for &x in src_row {
+                        let diff = (x as f64) - mean;
+                        var_sum += diff * diff;
+                    }
+                    let inv_std = 1.0 / (var_sum / (d as f64) + eps).sqrt();
+                    let mean32 = mean as f32;
+                    let inv32 = inv_std as f32;
+                    for ((dst, &x), (&w, &b)) in dst_row.iter_mut().zip(src_row).zip(ws.iter().zip(bs)) {
+                        *dst = (x - mean32) * inv32 * w + b;
+                    }
+                };
+                #[cfg(feature = "rayon")]
+                if total >= 16384 {
+                    src.par_chunks(d).zip(out.par_chunks_mut(d)).for_each(row_fn);
+                    return Some(Self::F32(out));
+                }
+                src.chunks(d).zip(out.chunks_mut(d)).for_each(row_fn);
+                Some(Self::F32(out))
+            }
+            _ => None,
+        }
+    }
+
+    /// Fused single-pass GELU backward on contiguous `F32` storage:
+    /// `g * (0.5 * (1 + erf(x / sqrt(2))) + x * inv_sqrt2pi * exp(-0.5 * x^2))`.
+    pub fn gelu_backward_f32(&self, g_layout: &Layout, x: &Self, x_layout: &Layout) -> Option<Self> {
+        let total = g_layout.numel();
+        if total == 0 || g_layout.shape() != x_layout.shape() {
+            return None;
+        }
+        match (self, x) {
+            (Self::F32(gv), Self::F32(xv)) => {
+                let gr = g_layout.contiguous_range_in(gv.len())?;
+                let xr = x_layout.contiguous_range_in(xv.len())?;
+                let gs = &gv[gr];
+                let xs = &xv[xr];
+                let mut out = crate::pool::take::<f32>(total).unwrap_or_else(|| vec![0.0; total]);
+                const INV_SQRT2PI: f32 = 0.398_942_3;
+                let chunk_fn = |((dst, g_c), x_c): ((&mut [f32], &[f32]), &[f32])| {
+                    if super::simd_x86::gelu_backward_f32_slice(g_c, x_c, dst) {
+                        return;
+                    }
+                    for ((o, &g), &xv) in dst.iter_mut().zip(g_c).zip(x_c) {
+                        let cdf = fast_norm_cdf_f32(xv);
+                        let pdf = fast_exp_f32(-0.5 * xv * xv) * INV_SQRT2PI;
+                        *o = g * (cdf + xv * pdf);
+                    }
+                };
+                #[cfg(feature = "rayon")]
+                if total >= 16384 {
+                    out.par_chunks_mut(8192)
+                        .zip(gs.par_chunks(8192))
+                        .zip(xs.par_chunks(8192))
+                        .for_each(chunk_fn);
+                    return Some(Self::F32(out));
+                }
+                chunk_fn(((&mut out, gs), xs));
+                Some(Self::F32(out))
+            }
+            _ => None,
+        }
+    }
+
     pub fn unary_op(&self, layout: &Layout, op: UnaryOp) -> Result<Self> {
         if op == UnaryOp::LogicalNot {
             let b = self.to_vec::<bool>(layout);
@@ -753,22 +1076,33 @@ impl CpuStorage {
         macro_rules! run_unary {
             ($variant:ident, $v:expr, $map_fn:expr) => {{
                 if let Some(range) = layout.contiguous_range_in($v.len()) {
-                    if let Some(mut out) = crate::pool::take(range.len()) {
+                    let src = &$v[range];
+                    if let Some(mut out) = crate::pool::take(src.len()) {
                         #[cfg(feature = "rayon")]
-                        out.par_iter_mut().zip($v[range].par_iter()).for_each(|(o, &x)| *o = ($map_fn)(x));
-                        #[cfg(not(feature = "rayon"))]
-                        out.iter_mut().zip($v[range].iter()).for_each(|(o, &x)| *o = ($map_fn)(x));
+                        if src.len() >= 16384 {
+                            out.par_chunks_mut(8192).zip(src.par_chunks(8192)).for_each(|(o, s)| {
+                                for (dst, &x) in o.iter_mut().zip(s) {
+                                    *dst = ($map_fn)(x);
+                                }
+                            });
+                            return Ok(Self::$variant(out));
+                        }
+                        for (dst, &x) in out.iter_mut().zip(src) {
+                            *dst = ($map_fn)(x);
+                        }
                         return Ok(Self::$variant(out));
                     }
                     #[cfg(feature = "rayon")]
-                    if range.len() >= 16384 {
-                        return Ok(Self::$variant(
-                            $v[range].par_iter().map(|&x| ($map_fn)(x)).collect(),
-                        ));
+                    if src.len() >= 16384 {
+                        let mut out = vec![Default::default(); src.len()];
+                        out.par_chunks_mut(8192).zip(src.par_chunks(8192)).for_each(|(o, s)| {
+                            for (dst, &x) in o.iter_mut().zip(s) {
+                                *dst = ($map_fn)(x);
+                            }
+                        });
+                        return Ok(Self::$variant(out));
                     }
-                    return Ok(Self::$variant(
-                        $v[range].iter().map(|&x| ($map_fn)(x)).collect(),
-                    ));
+                    return Ok(Self::$variant(src.iter().map(|&x| ($map_fn)(x)).collect()));
                 }
                 if layout.shape().len() == 2 {
                     let rows = layout.shape()[0];
@@ -811,7 +1145,14 @@ impl CpuStorage {
             }};
         }
         match self {
-            Self::F32(v) => run_unary!(F32, v, |x: f32| eval_unary_f32(x, op)),
+            Self::F32(v) => {
+                if op != UnaryOp::LogicalNot
+                    && let Some(range) = layout.contiguous_range_in(v.len())
+                {
+                    return Ok(Self::F32(f32_unary_contiguous(&v[range], op)));
+                }
+                run_unary!(F32, v, |x: f32| eval_unary_f32(x, op))
+            }
             Self::F64(v) => run_unary!(F64, v, |x: f64| eval_unary_f64(x, op)),
             Self::C64(v) => {
                 if op == UnaryOp::Abs {
@@ -1162,6 +1503,9 @@ impl CpuStorage {
 
         match (self, rhs) {
             (Self::F32(a), Self::F32(b)) => {
+                if let (Some(ra), Some(rb)) = (lhs_l.contiguous_range_in(a.len()), rhs_l.contiguous_range_in(b.len())) {
+                    return Ok(Self::F32(f32_binary_contiguous(&a[ra], &b[rb], op)));
+                }
                 run_bin!(F32, a, b, |x: f32, y: f32| eval_bin_f32(x, y, op))
             }
             (Self::F64(a), Self::F64(b)) => {
@@ -1749,19 +2093,25 @@ impl CpuStorage {
                 };
                 let n = outer * norm.len() * inner;
                 let mut out: Vec<$t> = crate::pool::take(n).unwrap_or_default();
-                if out.len() == n && inner > 0 {
-                    for (dst, k) in out.chunks_exact_mut(inner).zip((0..outer).flat_map(|o| norm.iter().map(move |&i| (o * dim + i) * inner))) {
-                        dst.copy_from_slice(&src[k..k + inner]);
+                if out.len() != n {
+                    out = vec![Default::default(); n];
+                }
+                if inner > 0 {
+                    // slice `k` of the output is slice `norm[k % idx]` of outer block `k / idx` of the source
+                    let per = norm.len();
+                    let copy = |(k, dst): (usize, &mut [$t])| {
+                        let start = ((k / per) * dim + norm[k % per]) * inner;
+                        dst.copy_from_slice(&src[start..start + inner]);
+                    };
+                    #[cfg(feature = "rayon")]
+                    if n >= 65536 {
+                        let group = (EW_CHUNK / inner).max(1);
+                        out.par_chunks_mut(inner * group).enumerate().for_each(|(gi, block)| block.chunks_mut(inner).enumerate().for_each(|(j, d)| copy((gi * group + j, d))));
+                    } else {
+                        out.chunks_mut(inner).enumerate().for_each(copy);
                     }
-                } else {
-                    out.clear();
-                    out.reserve(n);
-                    for o in 0..outer {
-                        for &i in &norm {
-                            let start = (o * dim + i) * inner;
-                            out.extend_from_slice(&src[start..start + inner]);
-                        }
-                    }
+                    #[cfg(not(feature = "rayon"))]
+                    out.chunks_mut(inner).enumerate().for_each(copy);
                 }
                 Ok(Self::$variant(out))
             }};
@@ -2598,30 +2948,52 @@ impl CpuStorage {
                             let w = chunk.len();
                             match op {
                                 ReduceOp::Sum => {
-                                    let mut acc = vec![0.0f64; w];
-                                    for r in 0..inner {
-                                        let row_offset = range.start + r * outer + c_start;
-                                        let row_slice = &v[row_offset..row_offset + w];
-                                        for (a, &val) in acc.iter_mut().zip(row_slice) {
-                                            *a += val as f64;
+                                    if super::simd_x86::has_avx2_fma() {
+                                        chunk.fill(0.0);
+                                        for r in 0..inner {
+                                            let row_offset = range.start + r * outer + c_start;
+                                            let row_slice = &v[row_offset..row_offset + w];
+                                            super::simd_x86::add_into_f32_slice(chunk, row_slice);
                                         }
-                                    }
-                                    for (dst, sum) in chunk.iter_mut().zip(acc) {
-                                        *dst = sum as f32;
+                                    } else {
+                                        let mut acc = vec![0.0f64; w];
+                                        for r in 0..inner {
+                                            let row_offset = range.start + r * outer + c_start;
+                                            let row_slice = &v[row_offset..row_offset + w];
+                                            for (a, &val) in acc.iter_mut().zip(row_slice) {
+                                                *a += val as f64;
+                                            }
+                                        }
+                                        for (dst, sum) in chunk.iter_mut().zip(acc) {
+                                            *dst = sum as f32;
+                                        }
                                     }
                                 }
                                 ReduceOp::Mean => {
-                                    let mut acc = vec![0.0f64; w];
-                                    for r in 0..inner {
-                                        let row_offset = range.start + r * outer + c_start;
-                                        let row_slice = &v[row_offset..row_offset + w];
-                                        for (a, &val) in acc.iter_mut().zip(row_slice) {
-                                            *a += val as f64;
+                                    if super::simd_x86::has_avx2_fma() {
+                                        chunk.fill(0.0);
+                                        for r in 0..inner {
+                                            let row_offset = range.start + r * outer + c_start;
+                                            let row_slice = &v[row_offset..row_offset + w];
+                                            super::simd_x86::add_into_f32_slice(chunk, row_slice);
                                         }
-                                    }
-                                    let denom = inner as f64;
-                                    for (dst, sum) in chunk.iter_mut().zip(acc) {
-                                        *dst = (sum / denom) as f32;
+                                        let inv = 1.0f32 / (inner as f32);
+                                        for d in chunk.iter_mut() {
+                                            *d *= inv;
+                                        }
+                                    } else {
+                                        let mut acc = vec![0.0f64; w];
+                                        for r in 0..inner {
+                                            let row_offset = range.start + r * outer + c_start;
+                                            let row_slice = &v[row_offset..row_offset + w];
+                                            for (a, &val) in acc.iter_mut().zip(row_slice) {
+                                                *a += val as f64;
+                                            }
+                                        }
+                                        let denom = inner as f64;
+                                        for (dst, sum) in chunk.iter_mut().zip(acc) {
+                                            *dst = (sum / denom) as f32;
+                                        }
                                     }
                                 }
                                 ReduceOp::Max => {
@@ -3084,7 +3456,66 @@ impl CpuStorage {
     }
 }
 
-#[inline]
+/// `exp` for `f32` without a library call or a branch, so loops over it vectorize (the system `expf` is a scalar call
+/// that pins every exponential, sigmoid and softmax to one element at a time). Cephes' `expf` scheme: `x = n ln2 + r`
+/// with `|r| <= ln2 / 2`, a degree-5 polynomial for `e^r - 1 - r`, and the scale `2^n` applied in two halves so results
+/// in the subnormal range underflow gradually. Within 1 ulp of the correctly rounded value on the normal range;
+/// `exp(NaN) = NaN`, overflow gives `inf`, large negative inputs give 0.
+#[inline(always)]
+#[allow(clippy::manual_clamp)] // max/min also map NaN into range; `clamp` would keep it and the int cast below needs a finite value
+pub(crate) fn fast_exp_f32(x: f32) -> f32 {
+    const LOG2E: f32 = std::f32::consts::LOG2_E;
+    const C1: f32 = 0.693_359_4; // ln 2 split in a short high part and a correction
+    const C2: f32 = -2.121_944_4e-4;
+    const ROUND: f32 = 12_582_912.0; // 1.5 * 2^23: adding and subtracting it rounds to the nearest integer
+    let input = x;
+    let x = x.max(-150.0).min(89.0); // also maps NaN into range; it is restored at the end
+    let n = (x * LOG2E + ROUND) - ROUND;
+    let r = x - n * C1 - n * C2;
+    let mut p = 1.987_569_1e-4f32;
+    p = p * r + 1.398_2e-3;
+    p = p * r + 8.333_452e-3;
+    p = p * r + 4.166_579_6e-2;
+    p = p * r + 1.666_666_5e-1;
+    p = p * r + 5.0e-1;
+    let y = p * r * r + r + 1.0;
+    // SAFETY: after the clamp `n` is an integer in [-217, 129], which fits an `i32` (the checked `as` cast would add a
+    // saturation sequence to every element for a case that cannot occur).
+    let ni = unsafe { n.to_int_unchecked::<i32>() };
+    let n1 = ni >> 1;
+    let n2 = ni - n1;
+    let s1 = f32::from_bits(((n1 + 127) as u32) << 23);
+    let s2 = f32::from_bits(((n2 + 127) as u32) << 23);
+    let out = y * s1 * s2;
+    if input.is_nan() { input } else { out }
+}
+
+/// Logistic function on top of [`fast_exp_f32`], branch-free: `e = exp(-|x|)` never overflows, and the two halves
+/// `1 / (1 + e)` and `e / (1 + e)` are chosen by sign.
+#[inline(always)]
+pub(crate) fn fast_sigmoid_f32(x: f32) -> f32 {
+    let e = fast_exp_f32(-x.abs());
+    let s = 1.0 / (1.0 + e);
+    if x >= 0.0 { s } else { e * s }
+}
+
+/// Standard normal CDF `0.5 * erfc(-x / sqrt(2))` for `f32`, branch-free on top of [`fast_exp_f32`]: the Chebyshev fit
+/// of `erfc` from Numerical Recipes (`erfcc`), whose *relative* error is below 1.2e-7 for every argument, so the left
+/// tail (where `1 + erf` would cancel) keeps its precision.
+#[inline(always)]
+pub(crate) fn fast_norm_cdf_f32(x: f32) -> f32 {
+    let u = -x * std::f32::consts::FRAC_1_SQRT_2; // cdf = 0.5 * erfc(u)
+    let z = u.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let poly = -1.265_512_2
+        + t * (1.000_023_7
+            + t * (0.374_091_96
+                + t * (0.096_784_18 + t * (-0.186_288_06 + t * (0.278_868_07 + t * (-1.135_204 + t * (1.488_515_9 + t * (-0.822_152_26 + t * 0.170_872_77))))))));
+    let erfc_abs = t * fast_exp_f32(-z * z + poly); // erfc(|u|)
+    0.5 * if u >= 0.0 { erfc_abs } else { 2.0 - erfc_abs }
+}
+
+#[inline(always)]
 pub(crate) fn eval_unary_f32(x: f32, op: UnaryOp) -> f32 {
     match op {
         UnaryOp::Neg => -x,
@@ -3098,21 +3529,14 @@ pub(crate) fn eval_unary_f32(x: f32, op: UnaryOp) -> f32 {
                 0.0
             }
         }
-        UnaryOp::Exp => x.exp(),
+        UnaryOp::Exp => fast_exp_f32(x),
         UnaryOp::Ln => x.ln(),
         UnaryOp::Sqrt => x.sqrt(),
         UnaryOp::Rsqrt => 1.0 / x.sqrt(),
         UnaryOp::Sin => x.sin(),
         UnaryOp::Cos => x.cos(),
         UnaryOp::Tanh => x.tanh(),
-        UnaryOp::Sigmoid => {
-            if x >= 0.0 {
-                1.0 / (1.0 + (-x).exp())
-            } else {
-                let e = x.exp();
-                e / (1.0 + e)
-            }
-        }
+        UnaryOp::Sigmoid => fast_sigmoid_f32(x),
         // not `x.max(0.0)`: that maps NaN to 0 and hides a diverged activation (torch.relu propagates NaN)
         UnaryOp::Relu => if x < 0.0 { 0.0 } else { x },
         UnaryOp::LeakyRelu(s) => {
@@ -3124,12 +3548,12 @@ pub(crate) fn eval_unary_f32(x: f32, op: UnaryOp) -> f32 {
         }
         UnaryOp::Gelu => {
             // Exact GELU via erf: 0.5 * x * (1 + erf(x / sqrt(2)))
-            let cdf = 0.5 * (1.0 + libm::erf((x as f64) * std::f64::consts::FRAC_1_SQRT_2));
-            x * (cdf as f32)
+            x * fast_norm_cdf_f32(x)
         }
         UnaryOp::Silu => {
-            let sig = eval_unary_f32(x, UnaryOp::Sigmoid);
-            x * sig
+            // the sigmoid is written out (not a recursive call): a recursive function cannot be inlined into the
+            // per-operation loops, and every element would pay a call plus the whole `match`
+            x * fast_sigmoid_f32(x)
         }
         UnaryOp::Elu(alpha) => {
             if x > 0.0 {
@@ -3243,6 +3667,13 @@ pub(crate) fn eval_unary_f64(x: f64, op: UnaryOp) -> f64 {
 fn reduce_slice_f32(slice: &[f32], op: ReduceOp) -> f32 {
     match op {
         ReduceOp::Sum => {
+            if let Some(s) = if slice.len() >= 65536 && super::simd_x86::has_avx2_fma() {
+                Some(slice.par_chunks(16384).map(|c| super::simd_x86::sum_f32_slice(c).unwrap()).sum::<f32>())
+            } else {
+                super::simd_x86::sum_f32_slice(slice)
+            } {
+                return s;
+            }
             if slice.len() >= 16384 {
                 slice.par_iter().map(|&x| x as f64).sum::<f64>() as f32
             } else {

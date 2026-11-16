@@ -77,26 +77,101 @@ impl Linear {
 
 impl Module for Linear {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        let orig = input.shape().to_vec();
+        let k = *orig
+            .last()
+            .ok_or_else(|| Error::Msg("Linear requires rank >= 1".into()))?;
+        let rows = match input.numel().checked_div(k) {
+            Some(r) => r,
+            None => orig[..orig.len() - 1]
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| Error::Msg("Linear: leading dimensions overflow".into()))?,
+        };
+        let can_fuse = rows > 0
+            && k == self.in_features()
+            && self.out_features > 0
+            && input.dtype() == crate::dtype::DType::F32
+            && self.weight.dtype() == crate::dtype::DType::F32
+            && input.device().is_cpu()
+            && self.weight.device().is_cpu()
+            && self.bias.as_ref().is_none_or(|b| b.dtype() == crate::dtype::DType::F32 && b.device().is_cpu())
+            && !crate::amp::is_autocast_enabled();
+
+        if can_fuse {
+            let x2 = if input.ndim() == 2 { input.clone() } else { input.reshape(&[rows, k])? };
+            let mut y2 = crate::tensor::no_grad(|| -> Result<Tensor> {
+                let wt = self.weight.t()?;
+                let mm = x2.matmul(&wt)?;
+                if let Some(bias) = &self.bias {
+                    mm.add(bias)
+                } else {
+                    Ok(mm)
+                }
+            })?;
+            if y2.ndim() != orig.len() {
+                let mut out_shape = orig[..orig.len() - 1].to_vec();
+                out_shape.push(self.out_features);
+                y2 = y2.reshape(&out_shape)?;
+            }
+            let needs_grad = crate::tensor::is_grad_enabled()
+                && (input.requires_grad()
+                    || self.weight.requires_grad()
+                    || self.bias.as_ref().is_some_and(Tensor::requires_grad));
+            if !needs_grad {
+                return Ok(y2);
+            }
+            let x_saved = input.clone();
+            let w_saved = self.weight.clone();
+            let b_saved = self.bias.clone();
+            let out_f = self.out_features;
+            let mut inputs = vec![x_saved.clone(), w_saved.clone()];
+            if let Some(b) = &b_saved {
+                inputs.push(b.clone());
+            }
+            let backward: crate::tensor::BackwardFn = Box::new(move |g: &Tensor| {
+                let g2 = if g.ndim() == 2 { g.clone() } else { g.reshape(&[rows, out_f])? };
+                let x_in = if x_saved.ndim() == 2 { x_saved.clone() } else { x_saved.reshape(&[rows, k])? };
+                let gx = if x_saved.requires_grad() {
+                    let dx2 = g2.matmul(&w_saved)?;
+                    Some(if orig.len() == 2 { dx2 } else { dx2.reshape(&orig)? })
+                } else {
+                    None
+                };
+                let gw = if w_saved.requires_grad() {
+                    Some(g2.t()?.matmul(&x_in)?)
+                } else {
+                    None
+                };
+                let mut grads = vec![gx, gw];
+                if let Some(b) = &b_saved {
+                    let gb = if b.requires_grad() {
+                        Some(g2.sum_axis(0, false)?)
+                    } else {
+                        None
+                    };
+                    grads.push(gb);
+                }
+                Ok(grads)
+            });
+            return Ok(Tensor::from_parts(
+                y2.storage().clone(),
+                y2.layout().clone(),
+                true,
+                Some(crate::tensor::Node {
+                    op: "linear",
+                    inputs,
+                    backward,
+                }),
+            ));
+        }
+
         // Because `self.weight.t()` is a zero-copy view and our GEMM accepts arbitrary
         // strides directly, `input.matmul(&self.weight.t()?)` never copies `weight`!
         let wt = self.weight.t()?;
         let y = if input.ndim() == 2 {
             input.matmul(&wt)?
         } else {
-            let orig = input.shape().to_vec();
-            let k = *orig
-                .last()
-                .ok_or_else(|| Error::Msg("Linear requires rank >= 1".into()))?;
-            // Empty trailing dim (checked_div is None): rows is the checked
-            // leading product (the factors are real dims but their product
-            // can still overflow).
-            let rows = match input.numel().checked_div(k) {
-                Some(r) => r,
-                None => orig[..orig.len() - 1]
-                    .iter()
-                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                    .ok_or_else(|| Error::Msg("Linear: leading dimensions overflow".into()))?,
-            };
             let flat = input.reshape(&[rows, k])?.matmul(&wt)?;
             let mut out_shape = orig[..orig.len() - 1].to_vec();
             out_shape.push(self.out_features);
@@ -931,6 +1006,68 @@ impl Module for LayerNorm {
                 "LayerNorm input trailing shape {:?} does not match normalized_shape {:?}",
                 trailing, self.normalized_shape
             )));
+        }
+
+        if k == 1
+            && let Some(out_storage) = input.storage().try_layer_norm_last_axis(
+                input.layout(),
+                self.weight.storage(),
+                self.weight.layout(),
+                self.bias.storage(),
+                self.bias.layout(),
+                self.eps,
+            )
+        {
+            let out_layout = crate::layout::Layout::contiguous(in_shape);
+            let needs_grad = crate::tensor::is_grad_enabled()
+                && (input.requires_grad() || self.weight.requires_grad() || self.bias.requires_grad());
+            if !needs_grad {
+                return Ok(Tensor::from_parts(out_storage, out_layout, false, None));
+            }
+            let x_saved = input.clone();
+            let w_saved = self.weight.clone();
+            let b_saved = self.bias.clone();
+            let eps = self.eps;
+            let backward: crate::tensor::BackwardFn = Box::new(move |g: &Tensor| {
+                let mu = x_saved.mean_axes(&[-1], true)?;
+                let centered = x_saved.sub(&mu)?;
+                let var = centered.square()?.mean_axes(&[-1], true)?;
+                let inv_std = var.add_scalar(eps)?.rsqrt()?;
+                let x_hat = centered.mul(&inv_std)?;
+
+                let gx = if x_saved.requires_grad() {
+                    let g_xhat = g.mul(&w_saved)?;
+                    let mean_g_xhat = g_xhat.mean_axes(&[-1], true)?;
+                    let mean_g_xhat_xhat = g_xhat.mul(&x_hat)?.mean_axes(&[-1], true)?;
+                    let dx = g_xhat.sub(&mean_g_xhat)?.sub(&x_hat.mul(&mean_g_xhat_xhat)?)?.mul(&inv_std)?;
+                    Some(dx)
+                } else {
+                    None
+                };
+                let sum_axes: Vec<isize> = (0..x_saved.ndim().saturating_sub(1) as isize).collect();
+                let gw = if w_saved.requires_grad() {
+                    let prod = g.mul(&x_hat)?;
+                    Some(if sum_axes.is_empty() { prod } else { prod.sum_axes(&sum_axes, false)? })
+                } else {
+                    None
+                };
+                let gb = if b_saved.requires_grad() {
+                    Some(if sum_axes.is_empty() { g.clone() } else { g.sum_axes(&sum_axes, false)? })
+                } else {
+                    None
+                };
+                Ok(vec![gx, gw, gb])
+            });
+            return Ok(Tensor::from_parts(
+                out_storage,
+                out_layout,
+                true,
+                Some(crate::tensor::Node {
+                    op: "layer_norm",
+                    inputs: vec![input.clone(), self.weight.clone(), self.bias.clone()],
+                    backward,
+                }),
+            ));
         }
 
         let axes: Vec<isize> = (-(k as isize)..0).collect();

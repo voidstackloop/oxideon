@@ -1,7 +1,8 @@
 //! Wall-time of common CPU tensor operations (best of several runs, microseconds). `tools/core_ops_bench_torch.py` prints
 //! the same table for PyTorch so the two can be compared on one machine.
 //!
-//! `cargo run --release --example core_ops_bench [name filter]`
+//! `cargo run --release --example core_ops_bench [names]`. Laptops throttle a process after a few seconds of load, which
+//! distorts the later rows of one long run: `tools/core_ops_bench_compare.py` runs every benchmark in its own process.
 
 use oxideon::nn::functional_ext::layer_norm;
 use oxideon::prelude::*;
@@ -14,8 +15,8 @@ fn rnd(shape: &[usize], seed: f32) -> Tensor {
 }
 
 fn bench(name: &str, mut f: impl FnMut()) {
-    // an optional argument keeps only the benchmarks whose name contains it
-    if std::env::args().nth(1).is_some_and(|k| !k.split(',').any(|p| name.contains(p))) {
+    // an optional argument keeps only the benchmarks named in it (comma-separated, exact names)
+    if std::env::args().nth(1).is_some_and(|k| !k.split(',').any(|p| name == p)) {
         return;
     }
     f(); // warm up
@@ -29,17 +30,6 @@ fn bench(name: &str, mut f: impl FnMut()) {
         runs += 1;
     }
     println!("BENCH {name:<28} {:>12.1}", best * 1e6);
-    if std::env::var("PROBE").is_ok() {
-        thread_local! { static P: (Tensor, Tensor, Vec<f32>) = (rnd(&[1000, 1000], 1.0), rnd(&[1000, 1000], 2.0), vec![1.0; 1_000_000]); }
-        P.with(|(x, y, v)| {
-            let best = |f: &mut dyn FnMut()| { let mut b = f64::MAX; for _ in 0..20 { let t = Instant::now(); f(); b = b.min(t.elapsed().as_secs_f64()); } b * 1e6 };
-            let add = best(&mut || drop(x.add(y).unwrap()));
-            let sum = best(&mut || drop(x.sum().unwrap()));
-            let serial = best(&mut || { std::hint::black_box(v.iter().sum::<f32>()); });
-            let (h, m) = oxideon::pool::hit_stats();
-            println!("   probe: add {add:.0}  sum {sum:.0}  serial-sum {serial:.0}  pool {} MiB hits {h} misses {m}", oxideon::pool::held_bytes() >> 20);
-        });
-    }
 }
 
 fn main() -> Result<()> {
@@ -93,30 +83,9 @@ fn main() -> Result<()> {
         loss.backward().unwrap();
     });
     let ag = rnd(&[1024, 1024], 13.0).requires_grad_(true);
-    if let Ok(v) = std::env::var("SLEEP") { std::thread::sleep(std::time::Duration::from_secs(v.parse().unwrap())); }
-    bench("add 1M again", || drop(a.add(&b).unwrap()));
-    println!("pool hits/misses before chain: {:?}", oxideon::pool::hit_stats());
-    println!("pool held before chain: {} MiB, live {} MiB", oxideon::pool::held_bytes() >> 20, oxideon::memory::allocated_bytes() >> 20);
-    if std::env::var("CLEAR").is_ok() { oxideon::pool::clear(); }
-    if std::env::var("DROPW").is_ok() { w1.zero_grad(); w2.zero_grad(); }
     bench("autograd elementwise chain", || {
         ag.zero_grad();
         ag.mul(&b).unwrap().tanh().unwrap().add(&b).unwrap().square().unwrap().sum().unwrap().backward().unwrap();
     });
-    if std::env::var("PROF").is_ok() {
-        let t = Instant::now();
-        let (_, p) = oxideon::profiler::profile(|| {
-            ag.zero_grad();
-            ag.mul(&b).unwrap().tanh().unwrap().add(&b).unwrap().square().unwrap().sum().unwrap().backward().unwrap();
-        });
-        println!("chain wall {:.0} us, in ops {:.0} us", t.elapsed().as_secs_f64() * 1e6, p.total_op_time_us());
-        let mut ev = p.events.clone();
-        ev.sort_by(|a, b| a.start_us.partial_cmp(&b.start_us).unwrap());
-        let mut prev_end = 0.0;
-        for e in &ev {
-            println!("  gap {:>8.0}  {:<12} {:>8.0} us {:?}", e.start_us - prev_end, e.name, e.dur_us, e.shape);
-            prev_end = e.start_us + e.dur_us;
-        }
-    }
     Ok(())
 }

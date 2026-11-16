@@ -216,7 +216,8 @@ unsafe extern "C" fn delete_owned(p: *mut DLManagedTensor) {
 pub fn to_dlpack(t: &Tensor) -> Result<*mut DLManagedTensor> {
     let dtype = dl_type(t.dtype())?;
     let shape: Vec<i64> = t.shape().iter().map(|&d| d as i64).collect();
-    if t.device().is_cpu() {
+    if t.device().is_cpu() || matches!(t.device(), crate::device::Device::Cuda(_)) {
+        let is_cuda = matches!(t.device(), crate::device::Device::Cuda(_));
         let strides: Vec<i64> = t
             .layout()
             .strides()
@@ -226,11 +227,24 @@ pub fn to_dlpack(t: &Tensor) -> Result<*mut DLManagedTensor> {
         let byte_offset = (t.storage_offset() as u64)
             .checked_mul(t.dtype().size_in_bytes() as u64)
             .ok_or_else(|| err("byte_offset overflow"))?;
-        let data_ptr = {
+        let (data_ptr, dl_dev) = {
             let guard = t.storage().read();
             match &*guard {
-                crate::backend::StorageInner::Cpu(cpu) => cpu.raw_cpu_ptr(),
-                _ => return Err(err("expected CPU storage")),
+                crate::backend::StorageInner::Cpu(cpu) => (
+                    cpu.raw_cpu_ptr(),
+                    DLDevice { device_type: DL_CPU, device_id: 0 },
+                ),
+                crate::backend::StorageInner::Cuda(cu) => (
+                    cu.device_ptr() as *mut u8,
+                    DLDevice { device_type: 2 /* kDLCUDA */, device_id: cu.device_index as i32 },
+                ),
+                _ => {
+                    if is_cuda {
+                        // Simulated Accelerator fallback: host pointer
+                        return Err(err("CUDA tensor is in host-simulated storage"));
+                    }
+                    return Err(err("expected CPU storage"));
+                }
             }
         };
         t.storage().pin_dlpack();
@@ -247,7 +261,7 @@ pub fn to_dlpack(t: &Tensor) -> Result<*mut DLManagedTensor> {
         };
         let dl_tensor = DLTensor {
             data: data_ptr as *mut c_void,
-            device: DLDevice { device_type: DL_CPU, device_id: 0 },
+            device: dl_dev,
             ndim: owner._shape.len() as i32,
             dtype,
             shape: owner._shape.as_mut_ptr(),

@@ -280,6 +280,25 @@ impl ProcessGroup {
         Self::tcp(rank, world, &format!("{addr}:{port}"))
     }
 
+    /// Retries [`Self::from_env`] with exponential backoff for elastic multi-node rendezvous.
+    pub fn from_env_with_retry(max_retries: usize, initial_backoff_ms: u64) -> Result<Self> {
+        let mut delay = initial_backoff_ms.max(10);
+        let mut last_err = None;
+        for attempt in 0..=max_retries {
+            match Self::from_env() {
+                Ok(pg) => return Ok(pg),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < max_retries {
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        delay = (delay * 2).min(5000);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Msg("comm: from_env_with_retry failed".into())))
+    }
+
     /// Runs `f(group)` on `world` threads that form an in-process group and returns their results in rank order.
     pub fn run_local<R: Send + 'static>(world: usize, f: impl Fn(ProcessGroup) -> R + Send + Sync + 'static) -> Vec<R> {
         let f = Arc::new(f);

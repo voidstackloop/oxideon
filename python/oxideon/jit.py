@@ -247,10 +247,66 @@ def load(path: Union[str, os.PathLike]) -> ScriptModule:
     return ScriptModule.load(path)
 
 
+class CompiledCallable:
+    """torch.compile-style wrapper that traces & caches execution graphs by input shape/dtype."""
+
+    def __init__(self, fn: Callable[..., Any], backend: str = "inductor", fullgraph: bool = False):
+        self.fn = fn
+        self.backend = backend
+        self.fullgraph = fullgraph
+        self._cache: Dict[Tuple[Any, ...], Any] = {}
+        functools.update_wrapper(self, fn)
+
+    def _sig(self, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        sig = []
+        for a in args:
+            if hasattr(a, "shape") and hasattr(a, "dtype"):
+                sig.append((tuple(a.shape), str(a.dtype), str(getattr(a, "device", "cpu"))))
+            else:
+                sig.append(type(a).__name__)
+        return tuple(sig)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if kwargs:
+            return self.fn(*args, **kwargs)
+        key = self._sig(args)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached(*args)
+        try:
+            from .fx import symbolic_trace
+            gm = symbolic_trace(self.fn)
+            self._cache[key] = gm
+            return gm(*args)
+        except Exception:
+            if self.fullgraph:
+                raise
+            self._cache[key] = self.fn
+            return self.fn(*args)
+
+
+def compile(
+    model: Optional[Callable[..., Any]] = None,
+    *,
+    backend: str = "inductor",
+    fullgraph: bool = False,
+) -> Callable[..., Any]:
+    """Traces and compiles a function or `nn.Module` (supports decorator syntax `@ox.compile`)."""
+    if model is not None:
+        return CompiledCallable(model, backend=backend, fullgraph=fullgraph)
+
+    def _decorator(fn: Callable[..., Any]) -> CompiledCallable:
+        return CompiledCallable(fn, backend=backend, fullgraph=fullgraph)
+
+    return _decorator
+
+
 __all__ = [
     "Node",
     "Graph",
     "ScriptModule",
+    "CompiledCallable",
+    "compile",
     "trace",
     "script",
     "ignore",

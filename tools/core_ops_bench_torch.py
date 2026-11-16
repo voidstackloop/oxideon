@@ -1,4 +1,5 @@
 """PyTorch timings for the same operations as examples/core_ops_bench.rs (best of several runs, microseconds)."""
+import sys
 import time
 
 import torch
@@ -13,6 +14,8 @@ def rnd(shape, seed):
 
 
 def bench(name, f):
+    if len(sys.argv) > 1 and name not in sys.argv[1].split(","):
+        return
     f()
     best, runs, start = float("inf"), 0, time.perf_counter()
     while runs < 200 and (runs < 5 or time.perf_counter() - start < 0.5):

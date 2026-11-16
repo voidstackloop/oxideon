@@ -15,6 +15,8 @@ type CUcontext = *mut c_void;
 type CUmodule = *mut c_void;
 type CUfunction = *mut c_void;
 type CUstream = *mut c_void;
+type CUgraph = *mut c_void;
+type CUgraphExec = *mut c_void;
 type CUdeviceptr = u64;
 
 const CUDA_SUCCESS: CUresult = 0;
@@ -48,7 +50,13 @@ struct CudaApi {
     cu_mem_free: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
     cu_memcpy_htod: unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult,
     cu_memcpy_dtoh: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
-    cu_module_load_data: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
+    cu_module_load_data_ex: unsafe extern "C" fn(
+        *mut CUmodule,
+        *const c_void,
+        c_uint,
+        *mut c_int,
+        *mut *mut c_void,
+    ) -> CUresult,
     cu_module_unload: unsafe extern "C" fn(CUmodule) -> CUresult,
     cu_module_get_function:
         unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
@@ -65,6 +73,15 @@ struct CudaApi {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> CUresult,
+    cu_stream_create: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
+    cu_stream_destroy: unsafe extern "C" fn(CUstream) -> CUresult,
+    cu_stream_synchronize: unsafe extern "C" fn(CUstream) -> CUresult,
+    cu_stream_begin_capture: unsafe extern "C" fn(CUstream, c_int) -> CUresult,
+    cu_stream_end_capture: unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult,
+    cu_graph_instantiate: unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult,
+    cu_graph_launch: unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult,
+    cu_graph_destroy: unsafe extern "C" fn(CUgraph) -> CUresult,
+    cu_graph_exec_destroy: unsafe extern "C" fn(CUgraphExec) -> CUresult,
 }
 
 unsafe impl Send for CudaApi {}
@@ -146,10 +163,19 @@ impl CudaApi {
                 cu_mem_free: load_fn(lib, b"cuMemFree_v2\0")?,
                 cu_memcpy_htod: load_fn(lib, b"cuMemcpyHtoD_v2\0")?,
                 cu_memcpy_dtoh: load_fn(lib, b"cuMemcpyDtoH_v2\0")?,
-                cu_module_load_data: load_fn(lib, b"cuModuleLoadData\0")?,
+                cu_module_load_data_ex: load_fn(lib, b"cuModuleLoadDataEx\0")?,
                 cu_module_unload: load_fn(lib, b"cuModuleUnload\0")?,
                 cu_module_get_function: load_fn(lib, b"cuModuleGetFunction\0")?,
                 cu_launch_kernel: load_fn(lib, b"cuLaunchKernel\0")?,
+                cu_stream_create: load_fn(lib, b"cuStreamCreate\0")?,
+                cu_stream_destroy: load_fn(lib, b"cuStreamDestroy_v2\0")?,
+                cu_stream_synchronize: load_fn(lib, b"cuStreamSynchronize\0")?,
+                cu_stream_begin_capture: load_fn(lib, b"cuStreamBeginCapture_v2\0")?,
+                cu_stream_end_capture: load_fn(lib, b"cuStreamEndCapture\0")?,
+                cu_graph_instantiate: load_fn(lib, b"cuGraphInstantiateWithFlags\0")?,
+                cu_graph_launch: load_fn(lib, b"cuGraphLaunch\0")?,
+                cu_graph_destroy: load_fn(lib, b"cuGraphDestroy\0")?,
+                cu_graph_exec_destroy: load_fn(lib, b"cuGraphExecDestroy\0")?,
             }
         };
         let rc = unsafe { (api.cu_init)(0) };
@@ -380,10 +406,29 @@ impl CudaPtxModule {
         let a = api()?;
         let c_ptx = CString::new(ptx).map_err(|e| Error::Backend(e.to_string()))?;
         let mut module: CUmodule = std::ptr::null_mut();
-        check(
-            unsafe { (a.cu_module_load_data)(&mut module, c_ptx.as_ptr() as *const c_void) },
-            "cuModuleLoadData",
-        )?;
+        let mut err_buf = vec![0u8; 4096];
+        let mut opts: [c_int; 2] = [5 /* CU_JIT_ERROR_LOG_BUFFER */, 6 /* CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES */];
+        let mut vals: [*mut c_void; 2] = [
+            err_buf.as_mut_ptr() as *mut c_void,
+            err_buf.len() as *mut c_void,
+        ];
+        let rc = unsafe {
+            (a.cu_module_load_data_ex)(
+                &mut module,
+                c_ptx.as_ptr() as *const c_void,
+                2,
+                opts.as_mut_ptr(),
+                vals.as_mut_ptr(),
+            )
+        };
+        if rc != CUDA_SUCCESS {
+            let msg = CStr::from_bytes_until_nul(&err_buf)
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            return Err(Error::Backend(format!(
+                "CUDA cuModuleLoadDataEx failed with error code {rc}: {msg}"
+            )));
+        }
         Ok(Arc::new(Self {
             module,
             device_index,
@@ -399,6 +444,31 @@ impl CudaPtxModule {
         if numel == 0 {
             return Ok(());
         }
+        let block = 256u32;
+        let grid = (numel as u32).div_ceil(block);
+        self.launch_grid(func_name, [grid, 1, 1], [block, 1, 1], 0, kernel_params)
+    }
+
+    pub fn launch_grid(
+        &self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem_bytes: u32,
+        kernel_params: &mut [*mut c_void],
+    ) -> Result<()> {
+        self.launch_grid_on(func_name, grid, block, shared_mem_bytes, None, kernel_params)
+    }
+
+    pub fn launch_grid_on(
+        &self,
+        func_name: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem_bytes: u32,
+        stream: Option<&CudaStream>,
+        kernel_params: &mut [*mut c_void],
+    ) -> Result<()> {
         ensure_context(self.device_index)?;
         let a = api()?;
         let c_name = CString::new(func_name).map_err(|e| Error::Backend(e.to_string()))?;
@@ -407,26 +477,119 @@ impl CudaPtxModule {
             unsafe { (a.cu_module_get_function)(&mut func, self.module, c_name.as_ptr()) },
             "cuModuleGetFunction",
         )?;
-        let block = 256u32;
-        let grid = (numel as u32).div_ceil(block);
+        let raw_stream = stream.map_or(std::ptr::null_mut(), |s| s.stream);
         check(
             unsafe {
                 (a.cu_launch_kernel)(
                     func,
-                    grid,
-                    1,
-                    1,
-                    block,
-                    1,
-                    1,
-                    0,
-                    std::ptr::null_mut(),
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    block[0],
+                    block[1],
+                    block[2],
+                    shared_mem_bytes,
+                    raw_stream,
                     kernel_params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )
             },
             "cuLaunchKernel",
         )
+    }
+}
+
+/// Non-blocking CUDA stream for asynchronous kernel launches and CUDA Graph capture.
+pub struct CudaStream {
+    stream: CUstream,
+    device_index: usize,
+}
+
+unsafe impl Send for CudaStream {}
+unsafe impl Sync for CudaStream {}
+
+impl CudaStream {
+    pub fn new(device_index: usize) -> Result<Self> {
+        ensure_context(device_index)?;
+        let a = api()?;
+        let mut stream: CUstream = std::ptr::null_mut();
+        check(unsafe { (a.cu_stream_create)(&mut stream, 0) }, "cuStreamCreate")?;
+        Ok(Self { stream, device_index })
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        ensure_context(self.device_index)?;
+        let a = api()?;
+        check(unsafe { (a.cu_stream_synchronize)(self.stream) }, "cuStreamSynchronize")
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        if !self.stream.is_null()
+            && let Ok(a) = api()
+            && ensure_context(self.device_index).is_ok()
+        {
+            unsafe {
+                let _ = (a.cu_stream_destroy)(self.stream);
+            }
+        }
+    }
+}
+
+/// Captured and instantiated CUDA Graph for zero-CPU-launch-overhead replay.
+pub struct CudaGraph {
+    exec: CUgraphExec,
+    device_index: usize,
+}
+
+unsafe impl Send for CudaGraph {}
+unsafe impl Sync for CudaGraph {}
+
+impl CudaGraph {
+    /// Captures all CUDA kernels launched on `stream` during `f` and instantiates an executable graph.
+    pub fn capture(stream: &CudaStream, f: impl FnOnce(&CudaStream) -> Result<()>) -> Result<Self> {
+        ensure_context(stream.device_index)?;
+        let a = api()?;
+        check(
+            unsafe { (a.cu_stream_begin_capture)(stream.stream, 0 /* CU_STREAM_CAPTURE_MODE_GLOBAL */) },
+            "cuStreamBeginCapture",
+        )?;
+        let res = f(stream);
+        let mut graph: CUgraph = std::ptr::null_mut();
+        let end_rc = unsafe { (a.cu_stream_end_capture)(stream.stream, &mut graph) };
+        res?;
+        check(end_rc, "cuStreamEndCapture")?;
+        let mut exec: CUgraphExec = std::ptr::null_mut();
+        let inst_rc = unsafe { (a.cu_graph_instantiate)(&mut exec, graph, 0) };
+        unsafe {
+            let _ = (a.cu_graph_destroy)(graph);
+        }
+        check(inst_rc, "cuGraphInstantiateWithFlags")?;
+        Ok(Self {
+            exec,
+            device_index: stream.device_index,
+        })
+    }
+
+    /// Replays the entire captured kernel graph in a single driver call.
+    pub fn launch(&self, stream: &CudaStream) -> Result<()> {
+        ensure_context(self.device_index)?;
+        let a = api()?;
+        check(unsafe { (a.cu_graph_launch)(self.exec, stream.stream) }, "cuGraphLaunch")
+    }
+}
+
+impl Drop for CudaGraph {
+    fn drop(&mut self) {
+        if !self.exec.is_null()
+            && let Ok(a) = api()
+            && ensure_context(self.device_index).is_ok()
+        {
+            unsafe {
+                let _ = (a.cu_graph_exec_destroy)(self.exec);
+            }
+        }
     }
 }
 

@@ -1,7 +1,57 @@
 //! Pluggable compute backends (`Cpu`, accelerated devices, and optional `Wgpu`) and reference-counted [`Storage`].
 
 pub mod cpu;
+#[cfg(target_arch = "x86_64")]
+pub mod simd_x86;
+#[cfg(not(target_arch = "x86_64"))]
+pub mod simd_x86 {
+    #[inline]
+    pub fn has_avx2_fma() -> bool { false }
+    #[inline]
+    pub fn exp_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn gelu_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn gelu_backward_f32_slice(_g: &[f32], _x: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn sum_f32_slice(_src: &[f32]) -> Option<f32> { None }
+    #[inline]
+    pub fn softmax_row_f32(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn layer_norm_row_f32(_src: &[f32], _w: &[f32], _b: &[f32], _dst: &mut [f32], _eps: f32) -> bool { false }
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_oc_block4_s1d1_f32(
+        _src: &[f32], _w_block: &[f32], _b_block: [f32; 4], _out_block: &mut [f32],
+        _c_in: usize, _h: usize, _w: usize,
+        _kh: usize, _kw: usize, _ph: usize, _pw: usize, _out_h: usize, _out_w: usize,
+    ) -> bool { false }
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_image_s1d1_f32(
+        _src: &[f32], _wv: &[f32], _bias: Option<&[f32]>, _out: &mut [f32],
+        _c_in: usize, _h: usize, _w: usize, _c_out: usize,
+        _kh: usize, _kw: usize, _ph: usize, _pw: usize, _out_h: usize, _out_w: usize,
+    ) -> bool { false }
+    #[inline]
+    pub fn add_into_f32_slice(_dst: &mut [f32], _src: &[f32]) -> bool { false }
+    #[inline]
+    pub fn add_f32_slice(_a: &[f32], _b: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn sub_f32_slice(_a: &[f32], _b: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn mul_f32_slice(_a: &[f32], _b: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn div_f32_slice(_a: &[f32], _b: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn sigmoid_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn silu_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn relu_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+}
 pub mod cuda_driver;
+pub mod cuda_kernels;
 pub mod stream;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_backend;
@@ -118,6 +168,7 @@ pub enum StorageInner {
     Cpu(CpuStorage),
     #[cfg(feature = "wgpu")]
     Wgpu(WgpuStorage),
+    Cuda(cuda_kernels::CudaStorage),
     /// Placement label only: the data lives in host memory and every kernel runs on the CPU.
     /// Backs the simulated `Cuda`/`Metal`/`Vulkan`/`Tpu`/`Npu` devices (see [`Device::is_simulated`]).
     Accelerator {
@@ -155,6 +206,7 @@ impl Tracked {
             StorageInner::Cpu(s) | StorageInner::Accelerator { storage: s, .. } => s.len() * s.dtype().size_in_bytes(),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => s.len() * s.dtype().size_in_bytes(),
+            StorageInner::Cuda(s) => s.len * s.dtype.size_in_bytes(),
             StorageInner::Meta { .. } => 0,
         };
         crate::memory::on_alloc(bytes);
@@ -204,10 +256,50 @@ impl Storage {
             let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
             match &*guard {
                 StorageInner::Cpu(s) => StorageInner::Cpu(s.softmax_last_axis(layout)?),
+                StorageInner::Cuda(s) => StorageInner::Cuda(s.softmax_last_axis(layout)?),
                 StorageInner::Accelerator { device, storage } => StorageInner::Accelerator {
                     device: device.clone(),
                     storage: storage.softmax_last_axis(layout)?,
                 },
+                _ => return None,
+            }
+        };
+        Some(Self(Tracked::new(out_inner)))
+    }
+
+    /// Fused single-pass last-axis `LayerNorm` on contiguous CPU `F32` storage.
+    pub(crate) fn try_layer_norm_last_axis(
+        &self,
+        layout: &Layout,
+        weight: &Self,
+        w_layout: &Layout,
+        bias: &Self,
+        b_layout: &Layout,
+        eps: f64,
+    ) -> Option<Self> {
+        let out_inner = {
+            let gx = self.0.read().unwrap_or_else(|p| p.into_inner());
+            let gw = weight.0.read().unwrap_or_else(|p| p.into_inner());
+            let gb = bias.0.read().unwrap_or_else(|p| p.into_inner());
+            match (&*gx, &*gw, &*gb) {
+                (StorageInner::Cpu(xs), StorageInner::Cpu(ws), StorageInner::Cpu(bs)) => {
+                    StorageInner::Cpu(xs.layer_norm_last_axis(layout, ws, w_layout, bs, b_layout, eps)?)
+                }
+                _ => return None,
+            }
+        };
+        Some(Self(Tracked::new(out_inner)))
+    }
+
+    /// Fused single-pass GELU backward on contiguous CPU `F32` storage.
+    pub(crate) fn try_gelu_backward(&self, g_layout: &Layout, x: &Self, x_layout: &Layout) -> Option<Self> {
+        let out_inner = {
+            let gg = self.0.read().unwrap_or_else(|p| p.into_inner());
+            let gx = x.0.read().unwrap_or_else(|p| p.into_inner());
+            match (&*gg, &*gx) {
+                (StorageInner::Cpu(gs), StorageInner::Cpu(xs)) => {
+                    StorageInner::Cpu(gs.gelu_backward_f32(g_layout, xs, x_layout)?)
+                }
                 _ => return None,
             }
         };
@@ -221,6 +313,27 @@ impl Storage {
     #[cfg(feature = "wgpu")]
     pub fn new_wgpu(s: WgpuStorage) -> Self {
         Self(Tracked::new(StorageInner::Wgpu(s)))
+    }
+
+    pub fn new_cuda(s: cuda_kernels::CudaStorage) -> Self {
+        Self(Tracked::new(StorageInner::Cuda(s)))
+    }
+
+    fn from_cpu_on_device(cpu: CpuStorage, dst: &Device) -> Result<Self> {
+        match dst {
+            Device::Cpu => Ok(Self::new_cpu(cpu)),
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(dev) => Ok(Self::new_wgpu(WgpuStorage::from_cpu(&cpu, dev)?)),
+            Device::Cuda(idx)
+                if cpu.dtype() == DType::F32
+                    && cuda_driver::cuda_available()
+                    && *idx < cuda_driver::cuda_device_count() =>
+            {
+                Ok(Self::new_cuda(cuda_kernels::CudaStorage::from_cpu(&cpu, *idx)?))
+            }
+            Device::Meta => Ok(Self::new_meta(cpu.dtype(), cpu.len())),
+            dev => Ok(Self::new_accelerator(dev.clone(), cpu)),
+        }
     }
 
     pub fn new_accelerator(device: Device, storage: CpuStorage) -> Self {
@@ -274,6 +387,7 @@ impl Storage {
             StorageInner::Cpu(s) => s.dtype(),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => s.dtype(),
+            StorageInner::Cuda(s) => s.dtype,
             StorageInner::Accelerator { storage, .. } => storage.dtype(),
             StorageInner::Meta { dtype, .. } => *dtype,
         }
@@ -284,6 +398,7 @@ impl Storage {
             StorageInner::Cpu(_) => Device::Cpu,
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Device::Wgpu(s.device().clone()),
+            StorageInner::Cuda(s) => Device::Cuda(s.device_index),
             StorageInner::Accelerator { device, .. } => device.clone(),
             StorageInner::Meta { .. } => Device::Meta,
         }
@@ -294,6 +409,7 @@ impl Storage {
             StorageInner::Cpu(s) => s.len(),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => s.len(),
+            StorageInner::Cuda(s) => s.len,
             StorageInner::Accelerator { storage, .. } => storage.len(),
             StorageInner::Meta { len, .. } => *len,
         }
@@ -320,6 +436,7 @@ impl Storage {
             StorageInner::Cpu(_) | StorageInner::Accelerator { .. } => Ok(CpuRef::Borrowed(guard)),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Ok(CpuRef::Owned(s.to_cpu()?)),
+            StorageInner::Cuda(s) => Ok(CpuRef::Owned(s.to_cpu()?)),
             StorageInner::Meta { .. } => Err(Error::Msg(
                 "Cannot access raw memory of a Meta tensor (device='meta')".into(),
             )),
@@ -331,6 +448,7 @@ impl Storage {
             StorageInner::Cpu(s) => Ok(s.clone()),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => s.to_cpu(),
+            StorageInner::Cuda(s) => s.to_cpu(),
             StorageInner::Accelerator { storage, .. } => Ok(storage.clone()),
             StorageInner::Meta { .. } => Err(Error::Msg(
                 "Cannot access raw memory of a Meta tensor (device='meta')".into(),
@@ -340,13 +458,7 @@ impl Storage {
 
     pub fn from_slice<T: Element>(data: &[T], device: &Device) -> Result<Self> {
         let cpu = CpuStorage::from_slice(data)?;
-        match device {
-            Device::Cpu => Ok(Self::new_cpu(cpu)),
-            #[cfg(feature = "wgpu")]
-            Device::Wgpu(dev) => Ok(Self::new_wgpu(WgpuStorage::from_cpu(&cpu, dev)?)),
-            Device::Meta => Ok(Self::new_meta(cpu.dtype(), cpu.len())),
-            dev => Ok(Self::new_accelerator(dev.clone(), cpu)),
-        }
+        Self::from_cpu_on_device(cpu, device)
     }
 
     pub fn full(numel: usize, val: f64, dtype: DType, device: &Device) -> Result<Self> {
@@ -354,12 +466,7 @@ impl Storage {
             return Ok(Self::new_meta(dtype, numel)); // no data: do not build a buffer just to drop it
         }
         let cpu = CpuStorage::full(numel, val, dtype)?;
-        match device {
-            Device::Cpu => Ok(Self::new_cpu(cpu)),
-            #[cfg(feature = "wgpu")]
-            Device::Wgpu(dev) => Ok(Self::new_wgpu(WgpuStorage::from_cpu(&cpu, dev)?)),
-            dev => Ok(Self::new_accelerator(dev.clone(), cpu)),
-        }
+        Self::from_cpu_on_device(cpu, device)
     }
 
     pub fn unary_op(&self, layout: &Layout, op: UnaryOp) -> Result<Self> {
@@ -368,6 +475,7 @@ impl Storage {
             StorageInner::Cpu(s) => Ok(Self::new_cpu(s.unary_op(layout, op)?)),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Ok(Self::new_wgpu(s.unary_op(layout, op)?)),
+            StorageInner::Cuda(s) => Ok(Self::new_cuda(s.unary_op(layout, op)?)),
             StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                 device.clone(),
                 storage.unary_op(layout, op)?,
@@ -404,6 +512,9 @@ impl Storage {
                 StorageInner::Wgpu(s) => {
                     Ok(Self::new_wgpu(s.binary_op(lhs_layout, s, rhs_layout, op)?))
                 }
+                StorageInner::Cuda(s) => {
+                    Ok(Self::new_cuda(s.binary_op(lhs_layout, s, rhs_layout, op)?))
+                }
                 StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                     device.clone(),
                     storage.binary_op(lhs_layout, storage, rhs_layout, op)?,
@@ -421,6 +532,9 @@ impl Storage {
             #[cfg(feature = "wgpu")]
             (StorageInner::Wgpu(a), StorageInner::Wgpu(b)) => {
                 Ok(Self::new_wgpu(a.binary_op(lhs_layout, b, rhs_layout, op)?))
+            }
+            (StorageInner::Cuda(a), StorageInner::Cuda(b)) => {
+                Ok(Self::new_cuda(a.binary_op(lhs_layout, b, rhs_layout, op)?))
             }
             (
                 StorageInner::Accelerator { device, storage: a },
@@ -469,6 +583,11 @@ impl Storage {
                     let out = cpu.cmp_op(lhs_layout, &cpu, rhs_layout, op)?;
                     Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, s.device())?))
                 }
+                StorageInner::Cuda(s) => {
+                    let cpu = s.to_cpu()?;
+                    let out = cpu.cmp_op(lhs_layout, &cpu, rhs_layout, op)?;
+                    Self::from_cpu_on_device(out, &Device::Cuda(s.device_index))
+                }
                 StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                     device.clone(),
                     storage.cmp_op(lhs_layout, storage, rhs_layout, op)?,
@@ -492,6 +611,12 @@ impl Storage {
                 let cb = b.to_cpu()?;
                 let out = ca.cmp_op(lhs_layout, &cb, rhs_layout, op)?;
                 Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, a.device())?))
+            }
+            (StorageInner::Cuda(a), StorageInner::Cuda(b)) => {
+                let ca = a.to_cpu()?;
+                let cb = b.to_cpu()?;
+                let out = ca.cmp_op(lhs_layout, &cb, rhs_layout, op)?;
+                Self::from_cpu_on_device(out, &Device::Cuda(a.device_index))
             }
             (
                 StorageInner::Accelerator { device, storage: a },
@@ -541,6 +666,11 @@ impl Storage {
                     let out = f(&cpu, lhs_layout, &cpu, rhs_layout)?;
                     Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, s.device())?))
                 }
+                StorageInner::Cuda(s) => {
+                    let cpu = s.to_cpu()?;
+                    let out = f(&cpu, lhs_layout, &cpu, rhs_layout)?;
+                    Self::from_cpu_on_device(out, &Device::Cuda(s.device_index))
+                }
                 StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                     device.clone(),
                     f(storage, lhs_layout, storage, rhs_layout)?,
@@ -561,6 +691,12 @@ impl Storage {
                 let cb = b.to_cpu()?;
                 let out = f(&ca, lhs_layout, &cb, rhs_layout)?;
                 Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, a.device())?))
+            }
+            (StorageInner::Cuda(a), StorageInner::Cuda(b)) => {
+                let ca = a.to_cpu()?;
+                let cb = b.to_cpu()?;
+                let out = f(&ca, lhs_layout, &cb, rhs_layout)?;
+                Self::from_cpu_on_device(out, &Device::Cuda(a.device_index))
             }
             (
                 StorageInner::Accelerator { device, storage: a },
@@ -595,6 +731,11 @@ impl Storage {
                 let cpu = s.to_cpu()?;
                 let out = f(&cpu, layout)?;
                 Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, s.device())?))
+            }
+            StorageInner::Cuda(s) => {
+                let cpu = s.to_cpu()?;
+                let out = f(&cpu, layout)?;
+                Self::from_cpu_on_device(out, &Device::Cuda(s.device_index))
             }
             StorageInner::Accelerator { device, storage } => {
                 Ok(Self::new_accelerator(device.clone(), f(storage, layout)?))
@@ -695,6 +836,10 @@ impl Storage {
             StorageInner::Cpu(s) => Ok(Self::new_cpu(s.reduce_op(layout, axes, op)?)),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Ok(Self::new_wgpu(s.reduce_op(layout, axes, op)?)),
+            StorageInner::Cuda(s) => {
+                let cpu_out = s.to_cpu()?.reduce_op(layout, axes, op)?;
+                Self::from_cpu_on_device(cpu_out, &Device::Cuda(s.device_index))
+            }
             StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                 device.clone(),
                 storage.reduce_op(layout, axes, op)?,
@@ -778,6 +923,10 @@ impl Storage {
                     let (out, shape) = s.matmul(lhs_l, s, rhs_l)?;
                     Ok((Self::new_wgpu(out), shape))
                 }
+                StorageInner::Cuda(s) => {
+                    let (out, shape) = s.matmul(lhs_l, s, rhs_l)?;
+                    Ok((Self::new_cuda(out), shape))
+                }
                 StorageInner::Accelerator { device, storage } => {
                     let (out, shape) = storage.matmul(lhs_l, storage, rhs_l)?;
                     Ok((Self::new_accelerator(device.clone(), out), shape))
@@ -798,6 +947,10 @@ impl Storage {
             (StorageInner::Wgpu(a), StorageInner::Wgpu(b)) => {
                 let (out, shape) = a.matmul(lhs_l, b, rhs_l)?;
                 Ok((Self::new_wgpu(out), shape))
+            }
+            (StorageInner::Cuda(a), StorageInner::Cuda(b)) => {
+                let (out, shape) = a.matmul(lhs_l, b, rhs_l)?;
+                Ok((Self::new_cuda(out), shape))
             }
             (
                 StorageInner::Accelerator { device, storage: a },
@@ -832,6 +985,7 @@ impl Storage {
             StorageInner::Cpu(s) => Ok(Self::new_cpu(s.to_contiguous(layout)?)),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Ok(Self::new_wgpu(s.to_contiguous(layout)?)),
+            StorageInner::Cuda(s) => Ok(Self::new_cuda(s.to_contiguous(layout)?)),
             StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                 device.clone(),
                 storage.to_contiguous(layout)?,
@@ -849,6 +1003,10 @@ impl Storage {
             StorageInner::Cpu(s) => Ok(Self::new_cpu(s.to_dtype(layout, dst)?)),
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Ok(Self::new_wgpu(s.to_dtype(layout, dst)?)),
+            StorageInner::Cuda(s) => {
+                let cpu_out = s.to_cpu()?.to_dtype(layout, dst)?;
+                Self::from_cpu_on_device(cpu_out, &Device::Cuda(s.device_index))
+            }
             StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                 device.clone(),
                 storage.to_dtype(layout, dst)?,
@@ -874,13 +1032,7 @@ impl Storage {
             ));
         }
         let cpu = self.cpu_ref()?.to_contiguous(layout)?;
-        match dst {
-            Device::Cpu => Ok(Self::new_cpu(cpu)),
-            #[cfg(feature = "wgpu")]
-            Device::Wgpu(dev) => Ok(Self::new_wgpu(WgpuStorage::from_cpu(&cpu, dev)?)),
-            Device::Meta => Ok(Self::new_meta(cpu.dtype(), cpu.len())),
-            dev => Ok(Self::new_accelerator(dev.clone(), cpu)),
-        }
+        Self::from_cpu_on_device(cpu, dst)
     }
 
     pub fn view_scatter(&self, src_layout: &Layout, spec: &ViewSpec) -> Result<Self> {
@@ -891,13 +1043,7 @@ impl Storage {
         }
         let cpu = self.cpu_ref()?;
         let out = cpu.view_scatter(src_layout, spec)?;
-        match &dev {
-            Device::Cpu => Ok(Self::new_cpu(out)),
-            #[cfg(feature = "wgpu")]
-            Device::Wgpu(d) => Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, d)?)),
-            Device::Meta => Ok(Self::new_meta(out.dtype(), out.len())),
-            d => Ok(Self::new_accelerator(d.clone(), out)),
-        }
+        Self::from_cpu_on_device(out, &dev)
     }
 
     pub fn index_select_vals(&self, layout: &Layout, ax: usize, idx: &[i64]) -> Result<Self> {
@@ -913,6 +1059,7 @@ impl Storage {
                 let cpu = s.to_cpu()?.index_select_vals(layout, ax, idx)?;
                 Ok(Self::new_wgpu(WgpuStorage::from_cpu(&cpu, &dev)?))
             }
+            StorageInner::Cuda(s) => Ok(Self::new_cuda(s.index_select_vals(layout, ax, idx)?)),
             StorageInner::Accelerator { device, storage } => Ok(Self::new_accelerator(
                 device.clone(),
                 storage.index_select_vals(layout, ax, idx)?,

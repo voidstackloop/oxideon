@@ -55,6 +55,67 @@ pub(crate) enum DivKind {
 // Inherent `add`/`sub`/`mul`/`div`/`neg` mirror PyTorch's method API; std::ops traits
 // are also implemented below (returning `Result<Tensor>`).
 #[allow(clippy::should_implement_trait)]
+/// Direct max pooling of a contiguous `f32` image batch `[planes, h, w]` into `[planes, out_h, out_w]`. Padding never
+/// wins; a NaN in a window wins (it propagates, like the reduction this replaces); among equal values the first in
+/// row-major window order is taken. `arg`, when not empty, receives the winner's position `ih * w + iw` in its plane.
+fn max_pool_fill(src: &[f32], out: &mut [f32], arg: &mut [i64], g: &UnfoldGeom) {
+    let (l, plane_len) = (g.out_h * g.out_w, g.h * g.w);
+    if l == 0 || plane_len == 0 {
+        return;
+    }
+    let body = |pi: usize, o: &mut [f32], a: &mut [i64]| {
+        let plane = &src[pi * plane_len..(pi + 1) * plane_len];
+        for oh in 0..g.out_h {
+            let h0 = (oh * g.sh).saturating_sub(g.ph);
+            let h1 = (oh * g.sh + g.kh).saturating_sub(g.ph).min(g.h);
+            for ow in 0..g.out_w {
+                let w0 = (ow * g.sw).saturating_sub(g.pw);
+                let w1 = (ow * g.sw + g.kw).saturating_sub(g.pw).min(g.w);
+                let (mut best, mut at) = (f32::NEG_INFINITY, h0 * g.w + w0);
+                for ih in h0..h1 {
+                    let row = &plane[ih * g.w + w0..ih * g.w + w1];
+                    for (j, &v) in row.iter().enumerate() {
+                        if v > best || (v.is_nan() && !best.is_nan()) {
+                            best = v;
+                            at = ih * g.w + w0 + j;
+                        }
+                    }
+                }
+                o[oh * g.out_w + ow] = best;
+                if let Some(slot) = a.get_mut(oh * g.out_w + ow) {
+                    *slot = at as i64;
+                }
+            }
+        }
+    };
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        if arg.is_empty() {
+            out.par_chunks_mut(l).enumerate().for_each(|(pi, o)| body(pi, o, &mut []));
+        } else {
+            out.par_chunks_mut(l).zip(arg.par_chunks_mut(l)).enumerate().for_each(|(pi, (o, a))| body(pi, o, a));
+        }
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        let mut args = arg.chunks_mut(l);
+        for (pi, o) in out.chunks_mut(l).enumerate() {
+            body(pi, o, args.next().unwrap_or(&mut []));
+        }
+    }
+}
+
+/// Borrows the contiguous `f32` host data of `t`, or `None` when it is another dtype, a view, or on a device.
+fn with_f32_host<R>(t: &Tensor, f: impl FnOnce(&[f32]) -> R) -> Result<Option<R>> {
+    if t.dtype() != DType::F32 || !t.device().is_cpu() {
+        return Ok(None);
+    }
+    let guard = t.storage().cpu_ref()?;
+    let CpuStorage::F32(v) = &*guard else { return Ok(None) };
+    Ok(t.layout().contiguous_range_in(v.len()).map(|r| f(&v[r])))
+}
+
 /// Window geometry of [`Tensor::unfold2d`].
 struct UnfoldGeom {
     h: usize,
@@ -118,6 +179,225 @@ fn unfold_fill<T: Copy + Send + Sync>(src: &[T], cols: &mut [T], g: &UnfoldGeom)
         return;
     }
     cols.chunks_mut(per_ch).enumerate().for_each(body);
+}
+
+/// Single-threaded `unfold_fill` for use inside an outer `rayon` loop (avoids nested thread oversubscription).
+fn unfold_fill_seq<T: Copy>(src: &[T], cols: &mut [T], g: &UnfoldGeom) {
+    let l = g.out_h * g.out_w;
+    let per_ch = g.kh * g.kw * l;
+    let plane_len = g.h * g.w;
+    if per_ch == 0 || plane_len == 0 {
+        return;
+    }
+    for (bc, block) in cols.chunks_mut(per_ch).enumerate() {
+        let plane = &src[bc * plane_len..(bc + 1) * plane_len];
+        for r in 0..g.kh {
+            for s in 0..g.kw {
+                let dst = &mut block[(r * g.kw + s) * l..(r * g.kw + s + 1) * l];
+                let off = s * g.dw;
+                let ow_lo = if off >= g.pw { 0 } else { (g.pw - off).div_ceil(g.sw) };
+                let ow_hi = if g.w + g.pw > off { ((g.w - 1 + g.pw - off) / g.sw + 1).min(g.out_w) } else { 0 };
+                if ow_lo >= ow_hi {
+                    continue;
+                }
+                let first = ow_lo * g.sw + off - g.pw;
+                for oh in 0..g.out_h {
+                    let ih = (oh * g.sh + r * g.dh) as isize - g.ph as isize;
+                    if ih < 0 || ih as usize >= g.h {
+                        continue;
+                    }
+                    let srow = &plane[ih as usize * g.w..(ih as usize + 1) * g.w];
+                    let drow = &mut dst[oh * g.out_w + ow_lo..oh * g.out_w + ow_hi];
+                    if g.sw == 1 {
+                        drow.copy_from_slice(&srow[first..first + drow.len()]);
+                    } else {
+                        for (d, x) in drow.iter_mut().zip(srow[first..].iter().step_by(g.sw)) {
+                            *d = *x;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Winograd F(2x2, 3x3) convolution for `F32` `[N, C_in, H, W]` * `[C_out, C_in, 3, 3]`,
+/// reducing multiplications per output pixel by 2.25x and executing 16 parallel GEMMs.
+#[cfg(feature = "rayon")]
+#[allow(clippy::too_many_arguments)]
+fn conv2d_winograd_3x3_f32(
+    src: &[f32],
+    wv: &[f32],
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    n: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    ph: usize,
+    pw: usize,
+    out_h: usize,
+    out_w: usize,
+) {
+    use rayon::prelude::*;
+
+    let th = out_h.div_ceil(2);
+    let tw = out_w.div_ceil(2);
+    let tiles_per_img = th * tw;
+    let total_tiles = n * tiles_per_img;
+    let l = out_h * out_w;
+
+    // 1. Filter transform U[16, c_out, c_in] = G g G^T
+    let u_stride = c_out * c_in;
+    let mut u = vec![0.0f32; 16 * u_stride];
+    for oc in 0..c_out {
+        for ic in 0..c_in {
+            let g = &wv[(oc * c_in + ic) * 9..(oc * c_in + ic) * 9 + 9];
+            let mut t = [[0.0f32; 4]; 3];
+            for r in 0..3 {
+                let (g0, g1, g2) = (g[r * 3], g[r * 3 + 1], g[r * 3 + 2]);
+                t[r][0] = g0;
+                t[r][1] = 0.5 * (g0 + g1 + g2);
+                t[r][2] = 0.5 * (g0 - g1 + g2);
+                t[r][3] = g2;
+            }
+            for c in 0..4 {
+                let (t0, t1, t2) = (t[0][c], t[1][c], t[2][c]);
+                let base = oc * c_in + ic;
+                u[c * u_stride + base] = t0;
+                u[(4 + c) * u_stride + base] = 0.5 * (t0 + t1 + t2);
+                u[(8 + c) * u_stride + base] = 0.5 * (t0 - t1 + t2);
+                u[(12 + c) * u_stride + base] = t2;
+            }
+        }
+    }
+
+    // 2. Input transform V[16, c_in, total_tiles] = B^T d B
+    let v_stride = c_in * total_tiles;
+    let mut v = crate::pool::take_f32(16 * v_stride).unwrap_or_else(|| vec![0.0; 16 * v_stride]);
+    let hw = h * w;
+    let img_elems = c_in * hw;
+    let v_ptr = v.as_mut_ptr() as usize;
+    (0..n * c_in).into_par_iter().for_each(|bi| {
+        let b = bi / c_in;
+        let ic = bi % c_in;
+        let plane = &src[b * img_elems + ic * hw..b * img_elems + (ic + 1) * hw];
+        let v_base_ptr = v_ptr as *mut f32;
+        for ty in 0..th {
+            let iy0 = (ty * 2) as isize - ph as isize;
+            for tx in 0..tw {
+                let ix0 = (tx * 2) as isize - pw as isize;
+                let mut d = [[0.0f32; 4]; 4];
+                if iy0 >= 0 && (iy0 as usize) + 3 < h && ix0 >= 0 && (ix0 as usize) + 3 < w {
+                    let y0 = iy0 as usize;
+                    let x0 = ix0 as usize;
+                    for r in 0..4 {
+                        let row = &plane[(y0 + r) * w + x0..(y0 + r) * w + x0 + 4];
+                        d[r].copy_from_slice(row);
+                    }
+                } else {
+                    for r in 0..4 {
+                        let iy = iy0 + r as isize;
+                        if iy >= 0 && (iy as usize) < h {
+                            let row = &plane[iy as usize * w..iy as usize * w + w];
+                            for c in 0..4 {
+                                let ix = ix0 + c as isize;
+                                if ix >= 0 && (ix as usize) < w {
+                                    d[r][c] = row[ix as usize];
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut s = [[0.0f32; 4]; 4];
+                for c in 0..4 {
+                    s[0][c] = d[0][c] - d[2][c];
+                    s[1][c] = d[1][c] + d[2][c];
+                    s[2][c] = -d[1][c] + d[2][c];
+                    s[3][c] = d[1][c] - d[3][c];
+                }
+                let tile_idx = (b * th + ty) * tw + tx;
+                let col_off = ic * total_tiles + tile_idx;
+                for r in 0..4 {
+                    let (a0, a1, a2, a3) = (s[r][0], s[r][1], s[r][2], s[r][3]);
+                    unsafe {
+                        *v_base_ptr.add((r * 4) * v_stride + col_off) = a0 - a2;
+                        *v_base_ptr.add((r * 4 + 1) * v_stride + col_off) = a1 + a2;
+                        *v_base_ptr.add((r * 4 + 2) * v_stride + col_off) = -a1 + a2;
+                        *v_base_ptr.add((r * 4 + 3) * v_stride + col_off) = a1 - a3;
+                    }
+                }
+            }
+        }
+    });
+
+    // 3. 16 parallel GEMMs: M[p, c_out, total_tiles] = U[p, c_out, c_in] @ V[p, c_in, total_tiles]
+    let m_stride = c_out * total_tiles;
+    let mut m = crate::pool::take_f32(16 * m_stride).unwrap_or_else(|| vec![0.0; 16 * m_stride]);
+    m.par_chunks_mut(m_stride)
+        .enumerate()
+        .for_each(|(p, m_slice)| {
+            let up = &u[p * u_stride..(p + 1) * u_stride];
+            let vp = &v[p * v_stride..(p + 1) * v_stride];
+            crate::gemm::gemm_f32_strided_seq(
+                up,
+                0,
+                c_in as isize,
+                1,
+                vp,
+                0,
+                total_tiles as isize,
+                1,
+                m_slice,
+                c_out,
+                c_in,
+                total_tiles,
+            );
+        });
+    crate::pool::give(v);
+
+    // 4. Inverse transform Y = A^T M A + bias -> out[n, c_out, out_h, out_w]
+    out.par_chunks_mut(l).enumerate().for_each(|(bo, o_plane)| {
+        let b = bo / c_out;
+        let oc = bo % c_out;
+        let bb = bias.map_or(0.0, |bv| bv[oc]);
+        for ty in 0..th {
+            let y0 = ty * 2;
+            let has_y1 = y0 + 1 < out_h;
+            for tx in 0..tw {
+                let x0 = tx * 2;
+                let has_x1 = x0 + 1 < out_w;
+                let tile_idx = (b * th + ty) * tw + tx;
+                let col_off = oc * total_tiles + tile_idx;
+                let mut mp = [0.0f32; 16];
+                for p in 0..16 {
+                    mp[p] = m[p * m_stride + col_off];
+                }
+                let mut t0 = [0.0f32; 4];
+                let mut t1 = [0.0f32; 4];
+                for c in 0..4 {
+                    t0[c] = mp[c] + mp[4 + c] + mp[8 + c];
+                    t1[c] = mp[4 + c] - mp[8 + c] - mp[12 + c];
+                }
+                let y00 = t0[0] + t0[1] + t0[2] + bb;
+                let y01 = t0[1] - t0[2] - t0[3] + bb;
+                let y10 = t1[0] + t1[1] + t1[2] + bb;
+                let y11 = t1[1] - t1[2] - t1[3] + bb;
+                o_plane[y0 * out_w + x0] = y00;
+                if has_x1 {
+                    o_plane[y0 * out_w + x0 + 1] = y01;
+                }
+                if has_y1 {
+                    o_plane[(y0 + 1) * out_w + x0] = y10;
+                    if has_x1 {
+                        o_plane[(y0 + 1) * out_w + x0 + 1] = y11;
+                    }
+                }
+            }
+        }
+    });
+    crate::pool::give(m);
 }
 
 impl Tensor {
@@ -729,6 +1009,16 @@ impl Tensor {
 
     pub fn gelu(&self) -> Result<Tensor> {
         self.run_unary("gelu", UnaryOp::Gelu, |g, x, _| {
+            if !crate::tensor::is_grad_enabled()
+                && let Some(out_storage) = g.storage().try_gelu_backward(g.layout(), x.storage(), x.layout())
+            {
+                return Ok(Tensor::from_parts(
+                    out_storage,
+                    Layout::contiguous(g.shape()),
+                    false,
+                    None,
+                ));
+            }
             // d/dx [0.5 * x * (1 + erf(x / sqrt(2)))]
             // = 0.5 * (1 + erf(x / sqrt(2))) + x * (1 / sqrt(2*pi)) * exp(-0.5 * x^2)
             let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
@@ -3568,6 +3858,202 @@ impl Tensor {
         let out_h = (h + 2 * padding.0 - eff_kh) / stride.0 + 1;
         let out_w = (w + 2 * padding.1 - eff_kw) / stride.1 + 1;
 
+        // inference on contiguous f32 host tensors: im2col and the matrix product run image by image, so the column
+        // buffer (kh*kw times one image) stays in cache instead of being built for the whole batch first
+        let needs_grad = crate::tensor::is_grad_enabled() && (self.requires_grad() || weight.requires_grad() || bias.is_some_and(Tensor::requires_grad));
+        if !needs_grad && bias.is_none_or(|b| b.dtype() == DType::F32 && b.shape() == [c_out]) {
+            let geom = UnfoldGeom { h, w, kh, kw, sh: stride.0, sw: stride.1, ph: padding.0, pw: padding.1, dh: dilation.0, dw: dilation.1, out_h, out_w };
+            let (l, kdim) = (out_h * out_w, c_in * kh * kw);
+            let bias_v = bias.map(|b| b.to_vec::<f32>()).transpose()?;
+            let fused = with_f32_host(self, |src| {
+                with_f32_host(weight, |wv| {
+                    let total = n * c_out * l;
+                    let mut out = crate::pool::take_f32(total).unwrap_or_else(|| vec![0.0; total]);
+                    #[cfg(not(feature = "rayon"))]
+                    let image = |(b, o): (usize, &mut [f32])| {
+                        let mut cols = match crate::pool::take_f32(kdim * l) {
+                            Some(mut v) => {
+                                v.fill(0.0);
+                                v
+                            }
+                            None => vec![0.0; kdim * l],
+                        };
+                        unfold_fill(&src[b * c_in * h * w..(b + 1) * c_in * h * w], &mut cols, &geom);
+                        crate::gemm::gemm_f32_strided(wv, 0, kdim as isize, 1, &cols, 0, l as isize, 1, o, c_out, kdim, l);
+                        if let Some(bv) = &bias_v {
+                            o.chunks_mut(l).zip(bv).for_each(|(ch, &bb)| ch.iter_mut().for_each(|v| *v += bb));
+                        }
+                        crate::pool::give(cols);
+                    };
+                    if total > 0 && kdim * l > 0 {
+                        #[cfg(feature = "rayon")]
+                        if kh == 3
+                            && kw == 3
+                            && stride == (1, 1)
+                            && dilation == (1, 1)
+                            && c_in >= 8
+                            && c_out >= 8
+                            && out_h >= 4
+                            && out_w >= 4
+                        {
+                            conv2d_winograd_3x3_f32(
+                                src,
+                                wv,
+                                bias_v.as_deref(),
+                                &mut out,
+                                n,
+                                c_in,
+                                h,
+                                w,
+                                c_out,
+                                padding.0,
+                                padding.1,
+                                out_h,
+                                out_w,
+                            );
+                        } else if stride == (1, 1)
+                            && dilation == (1, 1)
+                            && out_w >= 8
+                            && c_out % 4 == 0
+                            && crate::backend::simd_x86::has_avx2_fma()
+                        {
+                            use rayon::prelude::*;
+                            let bv_slice = bias_v.as_deref();
+                            let blocks_per_img = c_out / 4;
+                            let img_elems = c_in * h * w;
+                            out.par_chunks_mut(4 * l).enumerate().for_each(|(task_id, o_blk)| {
+                                let b = task_id / blocks_per_img;
+                                let oc = (task_id % blocks_per_img) * 4;
+                                let bb = bv_slice.map_or([0.0; 4], |bv| [bv[oc], bv[oc + 1], bv[oc + 2], bv[oc + 3]]);
+                                crate::backend::simd_x86::conv2d_oc_block4_s1d1_f32(
+                                    &src[b * img_elems..(b + 1) * img_elems],
+                                    &wv[oc * kdim..(oc + 4) * kdim],
+                                    bb,
+                                    o_blk,
+                                    c_in,
+                                    h,
+                                    w,
+                                    kh,
+                                    kw,
+                                    padding.0,
+                                    padding.1,
+                                    out_h,
+                                    out_w,
+                                );
+                            });
+                        } else if stride == (1, 1)
+                            && dilation == (1, 1)
+                            && out_w >= 8
+                            && crate::backend::simd_x86::has_avx2_fma()
+                        {
+                            use rayon::prelude::*;
+                            let bv_slice = bias_v.as_deref();
+                            out.par_chunks_mut(c_out * l).enumerate().for_each(|(b, o)| {
+                                crate::backend::simd_x86::conv2d_image_s1d1_f32(
+                                    &src[b * c_in * h * w..(b + 1) * c_in * h * w],
+                                    wv,
+                                    bv_slice,
+                                    o,
+                                    c_in,
+                                    h,
+                                    w,
+                                    c_out,
+                                    kh,
+                                    kw,
+                                    padding.0,
+                                    padding.1,
+                                    out_h,
+                                    out_w,
+                                );
+                            });
+                        } else if n >= 2 && kdim * n * l >= 65536 {
+                            use rayon::prelude::*;
+                            let nl = n * l;
+                            let mut cols_all = crate::pool::take_f32(kdim * nl).unwrap_or_else(|| vec![0.0; kdim * nl]);
+                            if padding.0 > 0 || padding.1 > 0 {
+                                cols_all.par_chunks_mut(65536).for_each(|c| c.fill(0.0));
+                            }
+                            let img_plane = c_in * h * w;
+                            // Fill cols_all in [kdim, n * l] layout: each kernel row k has [b * l .. (b+1) * l]
+                            cols_all.par_chunks_mut(nl).enumerate().for_each(|(k_idx, k_row)| {
+                                let c = k_idx / (kh * kw);
+                                let rem = k_idx % (kh * kw);
+                                let r = rem / kw;
+                                let s = rem % kw;
+                                let off = s * dilation.1;
+                                let ow_lo = if off >= padding.1 { 0 } else { (padding.1 - off).div_ceil(stride.1) };
+                                let ow_hi = if w + padding.1 > off { ((w - 1 + padding.1 - off) / stride.1 + 1).min(out_w) } else { 0 };
+                                if ow_lo >= ow_hi {
+                                    return;
+                                }
+                                let first = ow_lo * stride.1 + off - padding.1;
+                                for b in 0..n {
+                                    let plane = &src[b * img_plane + c * h * w..b * img_plane + (c + 1) * h * w];
+                                    let dst = &mut k_row[b * l..(b + 1) * l];
+                                    for oh in 0..out_h {
+                                        let ih = (oh * stride.0 + r * dilation.0) as isize - padding.0 as isize;
+                                        if ih < 0 || ih as usize >= h {
+                                            continue;
+                                        }
+                                        let srow = &plane[ih as usize * w..(ih as usize + 1) * w];
+                                        let drow = &mut dst[oh * out_w + ow_lo..oh * out_w + ow_hi];
+                                        if stride.1 == 1 {
+                                            drow.copy_from_slice(&srow[first..first + drow.len()]);
+                                        } else {
+                                            for (d, x) in drow.iter_mut().zip(srow[first..].iter().step_by(stride.1)) {
+                                                *d = *x;
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            let mut tmp = crate::pool::take_f32(total).unwrap_or_else(|| vec![0.0; total]);
+                            crate::gemm::gemm_f32_strided(wv, 0, kdim as isize, 1, &cols_all, 0, nl as isize, 1, &mut tmp, c_out, kdim, nl);
+                            crate::pool::give(cols_all);
+                            // Transpose [c_out, n, l] -> out[n, c_out, l] + bias in parallel
+                            out.par_chunks_mut(c_out * l).enumerate().for_each(|(b, ob)| {
+                                for oc in 0..c_out {
+                                    let src_sl = &tmp[oc * nl + b * l..oc * nl + (b + 1) * l];
+                                    let dst_sl = &mut ob[oc * l..(oc + 1) * l];
+                                    if let Some(bv) = &bias_v {
+                                        let bb = bv[oc];
+                                        for (d, &s) in dst_sl.iter_mut().zip(src_sl) {
+                                            *d = s + bb;
+                                        }
+                                    } else {
+                                        dst_sl.copy_from_slice(src_sl);
+                                    }
+                                }
+                            });
+                            crate::pool::give(tmp);
+                        } else {
+                            use rayon::prelude::*;
+                            out.par_chunks_mut(c_out * l).enumerate().for_each_init(
+                                || vec![0.0f32; kdim * l],
+                                |cols, (b, o)| {
+                                    if padding.0 > 0 || padding.1 > 0 {
+                                        cols.fill(0.0);
+                                    }
+                                    unfold_fill_seq(&src[b * c_in * h * w..(b + 1) * c_in * h * w], cols, &geom);
+                                    crate::gemm::gemm_f32_strided_seq(wv, 0, kdim as isize, 1, cols, 0, l as isize, 1, o, c_out, kdim, l);
+                                    if let Some(bv) = &bias_v {
+                                        o.chunks_mut(l).zip(bv).for_each(|(ch, &bb)| ch.iter_mut().for_each(|v| *v += bb));
+                                    }
+                                },
+                            );
+                        }
+                        #[cfg(not(feature = "rayon"))]
+                        out.chunks_mut(c_out * l).enumerate().for_each(image);
+                    }
+                    out
+                })
+            })?;
+            if let Some(inner) = fused
+                && let Some(out) = inner?
+            {
+                return Ok(Tensor::from_storage(Storage::new_cpu(CpuStorage::F32(out)), Layout::contiguous(vec![n, c_out, out_h, out_w])));
+            }
+        }
         let cols = self.unfold2d((kh, kw), stride, padding, dilation)?; // [N, C_in*kH*kW, L]
         let w_flat = weight.reshape(&[1, c_out, c_in * kh * kw])?;
         let out = w_flat.matmul(&cols)?.reshape(&[n, c_out, out_h, out_w])?;
@@ -3657,6 +4143,29 @@ impl Tensor {
         let out_w = (w + 2 * padding.1 - kw) / stride.1 + 1;
         let l = out_h * out_w;
 
+        // contiguous f32 host images: one direct pass per plane (the general path below builds an im2col copy kh*kw
+        // times the size of the input and reduces it)
+        let geom = UnfoldGeom { h, w, kh, kw, sh: stride.0, sw: stride.1, ph: padding.0, pw: padding.1, dh: 1, dw: 1, out_h, out_w };
+        let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+        let direct = with_f32_host(self, |src| {
+            let mut out = crate::pool::take_f32(n * c * l).unwrap_or_else(|| vec![0.0; n * c * l]);
+            let mut arg = if needs_grad { vec![0i64; n * c * l] } else { Vec::new() };
+            max_pool_fill(src, &mut out, &mut arg, &geom);
+            (out, arg)
+        })?;
+        if let Some((out, arg)) = direct {
+            let storage = Storage::new_cpu(CpuStorage::F32(out));
+            let out_layout = Layout::contiguous(vec![n, c, out_h, out_w]);
+            if !needs_grad {
+                return Ok(Tensor::from_storage(storage, out_layout));
+            }
+            let arg = Tensor::from_slice(&arg, &[n, c, l])?;
+            return Ok(Tensor::from_op(storage, out_layout, "max_pool2d", vec![self.clone()], move |g| {
+                // each output sends its gradient to the input position that won its window
+                let zeros = Tensor::zeros(&[n, c, h * w], g.dtype(), &g.device())?;
+                Ok(vec![Some(zeros.scatter_add(2, &arg, &g.reshape(&[n, c, l])?)?.reshape(&[n, c, h, w])?)])
+            }));
+        }
         let cols = self.unfold2d(kernel_size, stride, padding, (1, 1))?; // [N, C*kh*kw, L]
         // unfold zero-fills padding, which would win over all-negative windows;
         // exclude padded entries (torch parity). Skipped for bool, where the
