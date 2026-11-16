@@ -1,0 +1,15 @@
+[package]
+name = "oxideon-engines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Oxideon engines: science, physics, crypto-demo and synthesis-chain engine catalog built on oxideon-core"
+license.workspace = true
+keywords = ["science", "physics", "simulation"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+oxideon-core.workspace = true
+
+[lints]
+workspace = true

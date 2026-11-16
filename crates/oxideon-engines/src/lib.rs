@@ -1,0 +1,492 @@
+//! Oxideon engines: the science, physics, crypto-demo and synthesis-chain engine catalog.
+//!
+//! Engine modules address core modules as `crate::tensor`, `crate::error`, `crate::quant`, ...; the glob below
+//! re-exports everything from `oxideon-core` so those paths keep working unchanged.
+
+pub(crate) use oxideon_core::*;
+
+pub mod crypto;
+pub mod hardware;
+pub mod omni_diamond_v;
+pub mod omni_octa_vii;
+pub mod omni_science;
+pub mod omni_septua_vi;
+pub mod omni_singularity;
+pub mod omni_trans_universal;
+pub mod physics;
+pub mod science;
+pub mod universal_engine;
+pub use crypto::LatticeLweEngine;
+pub use crypto::{
+    CkksContext, DifferentiableR1csQap, FheCiphertext, FhePublicKey, FheSecretKey, FieldElement,
+    LinearCombination, R1CSConstraint, R1csConstraint, ZkMlEngine, ZkMlProof,
+};
+pub use hardware::{
+    CoherentPhotonicCircuit, MachZehnderInterferometer, PhotonicLinear, PhotonicMesh,
+    SaturableAbsorber, WaveguideProfile,
+};
+pub use omni_diamond_v::{GrandOmniReportV, GrandOmniUniversalEngineV};
+pub use omni_octa_vii::{GrandOmniOctaEngineVII, GrandOmniOctaReportVII};
+pub use omni_science::{OmniScientificFoundationEngine, OmniScientificReport};
+pub use omni_septua_vi::{GrandOmniSeptuaEngineVI, GrandOmniSeptuaReportVI};
+pub use omni_singularity::{OmniTransSingularityEngine, OmniTransSingularityReport};
+pub use omni_trans_universal::{GrandTransUniversalEngineIV, GrandTransUniversalReportIV};
+pub use physics::RelativisticLbm1D;
+pub use physics::{
+    AdsCftHolographicEngine, ComplexEigenvalue, ContactHamiltonianSystem, ExceptionalPointReport,
+    HamiltonianNeuralEngine, HeisenbergLieAlgebra, HeisenbergPoint, HypoellipticDiffusion3D,
+    JarzynskiReport, KerrSpacetime, LangevinThermodynamics, LiePoissonState, LiePoissonSystem,
+    NonHermitianHamiltonian2x2, RigidBodyInertia, RmhdPrimitiveState, SolitonPhysics,
+    SpatialGrid1D, SplitStepNlsEngine, StochasticThermoEngine, SymplecticTopologyEngine,
+    divergence, helmholtz_pinn_residual, laplacian, poisson_pinn_loss, spatial_gradient,
+};
+pub use science::DiscreteMorseEngine;
+pub use science::FreeProbabilityEngine;
+pub use science::PAdicAnalysisEngine;
+pub use science::TropicalSpectralEngine;
+pub use science::{
+    AInfinityOperadEngine, AdaptiveCellularSheaf, DeepONet, FourierNeuralOperator1d,
+    GromovWassersteinConfig, GromovWassersteinEngine, GromovWassersteinResult, HigherSimplex,
+    InfoNceEstimator, InformationGeometryEngine, KernelRidgeRegressor, MercerKernel, MineEstimator,
+    MolecularGeometryDiffusion, OrientedSimplex, PairformerBlock, PersistenceDiagram,
+    PersistencePair, PersistentHomologyEngine, QuasiCategoryEngine, RandomFourierFeatures,
+    SE3EquivariantLayer, SheafDiffusionLayer, SherringtonKirkpatrickModel, Simplex,
+    SimplicialComplex, SpectralConv1d, TapSolution, TensorTrain, TriangularMultiplicativeUpdate,
+    TropicalMatrix, TropicalMonomial, TropicalPolynomial, TtCore, maximum_mean_discrepancy,
+    tropical_distance, wasserstein_distance,
+};
+pub use universal_engine::{UniversalAGIConfig, UniversalAGIEngine, UniversalAGIReport};
+pub mod omni_nona_viii;
+pub use omni_nona_viii::{GrandOmniNonaEngineVIII, GrandOmniNonaReportVIII};
+pub use physics::JaynesCummingsCavityQed;
+pub use physics::PenroseTwistorEngine;
+pub use science::ConnesSpectralTriple;
+pub use science::DglaMaurerCartanEngine;
+pub use science::LanglandsHeckeEngine;
+pub mod omni_centennial_x;
+pub use omni_centennial_x::{GrandCentennialSingularityEngineX, GrandCentennialSingularityReportX};
+pub use science::BridgelandStabilityEngine;
+pub use science::ChowHirzebruchRiemannRoch;
+pub use science::ClusterAlgebraQuiverEngine;
+pub use science::DonaldsonThomasEngine;
+pub use science::EtaleWeilZetaEngine;
+pub use science::GromovWittenWdvvEngine;
+pub use science::HitchinHiggsBundleEngine;
+pub use science::MotivicHodgeEngine;
+pub use science::PerfectoidTiltingEngine;
+pub mod omni_hendeca_xi;
+pub use omni_hendeca_xi::GrandOmniHendecaEngineXI;
+pub use physics::AmplituhedronGrassmannianEngine;
+pub use physics::BorelResurgenceEngine;
+pub use physics::CausalTriangulationEngine;
+pub use physics::CelestialHolographyEngine;
+pub use physics::ConformalBootstrapEngine;
+pub use physics::ExactWkbQuantizationEngine;
+pub use physics::SpinNetworkLqgEngine;
+pub use physics::SwamplandVerifierEngine;
+pub use physics::TraversableWormholeEngine;
+pub mod omni_dodeca_xii;
+pub use omni_dodeca_xii::GrandOmniDodecaEngineXII;
+pub mod omni_trideca_xiii;
+pub use omni_trideca_xiii::GrandOmniTridecaEngineXIII;
+pub use science::AtiyahSingerIndexEngine;
+pub use science::BpsMagneticMonopoleEngine;
+pub use science::BpstYangMillsInstanton;
+pub use science::CalabiYauMongeAmpereEngine;
+pub use science::MeanCurvatureFlowEngine;
+pub use science::MicrolocalWavefrontEngine;
+pub use science::PerelmanRicciFlowEngine;
+pub use science::SeibergWittenMonopoleEngine;
+pub use science::WeierstrassMinimalSurfaceEngine;
+pub mod omni_tetradeca_xiv;
+pub use omni_tetradeca_xiv::GrandOmniTetradecaEngineXIV;
+pub use science::AbcSzpiroArakelovEngine;
+pub use science::BirchSwinnertonDyerEngine;
+pub use science::FaltingsHeightEngine;
+pub use science::HardyLittlewoodCircleEngine;
+pub use science::IwasawaMainConjectureEngine;
+pub use science::KatzSarnakSymmetryEngine;
+pub use science::RiemannSiegelZEngine;
+pub use science::SelbergSieveEngine;
+pub use science::SelbergTraceFormulaEngine;
+pub mod omni_pentadeca_xv;
+pub use omni_pentadeca_xv::GrandOmniPentadecaEngineXV;
+pub use physics::AlfvenMhdDynamoEngine;
+pub use physics::CharneyRossbyWaveEngine;
+pub use physics::GradShafranovTokamakEngine;
+pub use physics::GrossPitaevskiiVortexEngine;
+pub use physics::HydrodynamicInstabilityEngine;
+pub use physics::KolmogorovCascadeEngine;
+pub use physics::KraichnanEnstrophyCascade;
+pub use physics::RayleighBenardConvection;
+pub use physics::VlasovLandauDampingEngine;
+pub mod omni_hexadeca_xvi;
+pub use omni_hexadeca_xvi::GrandOmniHexadecaEngineXVI;
+pub mod omni_heptadeca_xvii;
+pub use omni_heptadeca_xvii::GrandOmniHeptadecaEngineXVII;
+pub use physics::BcsGapEquationEngine;
+pub use physics::BktVortexUnbindingEngine;
+pub use physics::BrinkmanRiceGutzwillerEngine;
+pub use physics::HaldaneHoneycombModel;
+pub use physics::KondoScreeningEngine;
+pub use physics::LaughlinFqheEngine;
+pub use physics::MagicAngleGrapheneEngine;
+pub use physics::MagneticSkyrmionEngine;
+pub use physics::WeylChiralAnomalyEngine;
+pub mod omni_octodeca_xviii;
+pub use omni_octodeca_xviii::GrandOmniOctodecaEngineXVIII;
+pub use science::ChemicalMasterEntropyEngine;
+pub use science::FokkerPlanckOrnsteinUhlenbeck;
+pub use science::ForsterResonanceEnergyEngine;
+pub use science::HodgkinHuxleyActionPotential;
+pub use science::JarzynskiCrooksEngine;
+pub use science::KratkyPorodPolymerEngine;
+pub use science::MarcusElectronTransferEngine;
+pub use science::TuringReactionDiffusionEngine;
+pub use science::WilsonCowanCorticalEngine;
+pub mod omni_nonadeca_xix;
+pub use omni_nonadeca_xix::GrandOmniNonadecaEngineXIX;
+pub use science::AdamsJHomomorphismEngine;
+pub use science::ChromaticMoravaKTheory;
+pub use science::CondensedLiquidTensorEngine;
+pub use science::FukayaArnoldConjectureEngine;
+pub use science::HeegaardFloerKnotEngine;
+pub use science::KhovanovHomologyEngine;
+pub use science::LurieLittleDisksFactorization;
+pub use science::PrismaticSiteBreuilKisin;
+pub use science::VoevodskyMilnorBlochKato;
+pub mod omni_bicentennial_xx;
+pub use omni_bicentennial_xx::GrandBicentennialSingularityEngineXX;
+pub use science::CoupledClusterCcsdTEngine;
+pub use science::EyringTransitionStateEngine;
+pub use science::HedinGwBetheSalpeterEngine;
+pub use science::KohnShamJacobLadderEngine;
+pub use science::MollerPlessetMp2Engine;
+pub use science::MultireferenceCasEngine;
+pub use science::RingPolymerMolecularDynamics;
+pub use science::RoothaanHallScfEngine;
+pub use science::YarkonyConicalIntersectionEngine;
+pub mod omni_henicosa_xxi;
+pub use omni_henicosa_xxi::GrandOmniHenicosaEngineXXI;
+pub use physics::ChirikovStandardMapEngine;
+pub use physics::CircularRestrictedThreeBodyEngine;
+pub use physics::KamDiophantineTorusEngine;
+pub use physics::NekhoroshevExponentialStability;
+pub mod omni_docosa_xxii;
+pub use omni_docosa_xxii::GrandOmniDocosaEngineXXII;
+pub use physics::BlandfordZnajekPenroseEngine;
+pub use physics::ChandrasekharWhiteDwarfEngine;
+pub use physics::CmbAcousticPeakEngine;
+pub use physics::GravitationalWaveChirpEngine;
+pub use physics::HawkingPagePhaseTransition;
+pub use physics::KerrQuasinormalModeEngine;
+pub use physics::PressSchechterHaloEngine;
+pub use physics::SunyaevZeldovichKompaneetsEngine;
+pub use physics::TolmanOppenheimerVolkoffEngine;
+pub mod omni_tricosa_xxiii;
+pub use crypto::ArikanPolarCodeEngine;
+pub use crypto::FastReedSolomonIopEngine;
+pub use crypto::KzgPolynomialCommitment;
+pub use crypto::QuadraticArithmeticProgramEngine;
+pub use crypto::RateDistortionBlahutArimoto;
+pub use crypto::RenyiDifferentialPrivacyAccountant;
+pub use crypto::ShamirSecretSharingFp;
+pub use crypto::SlepianWolfDistributedCoding;
+pub use crypto::TsfasmanVladutZinkAgCode;
+pub use omni_tricosa_xxiii::GrandOmniTricosaEngineXXIII;
+pub mod omni_tetracosa_xxiv;
+pub use omni_tetracosa_xxiv::GrandOmniTetracosaEngineXXIV;
+pub mod omni_pentacosa_xxv;
+pub use omni_pentacosa_xxv::GrandOmniPentacosaEngineXXV;
+pub use physics::BiotPoroelasticConsolidation;
+pub use physics::EshelbyInclusionMoriTanaka;
+pub use physics::HyperelasticStrainEnergyEngine;
+pub use physics::J2PlasticityReturnMapping;
+pub use physics::KaneLubenskyIsostaticEngine;
+pub use physics::KirchhoffLovePlateEngine;
+pub use physics::PendryMetamaterialCloakEngine;
+pub use physics::PhotonicBraggQuarterWaveStack;
+pub use physics::RiceJIntegralFractureEngine;
+pub mod omni_hexacosa_xxvi;
+pub use omni_hexacosa_xxvi::GrandOmniHexacosaEngineXXVI;
+pub use science::BassSerreGraphOfGroupsEngine;
+pub use science::DrinfeldShtukaLanglandsEngine;
+pub use science::GromovDeltaHyperbolicEngine;
+pub use science::KazhdanPropertyTExpander;
+pub use science::NgoFundamentalLemmaEngine;
+pub use science::RatnerUnipotentFlowEngine;
+pub use science::SatakeHeckeLanglandsEngine;
+pub use science::TeichmullerWeilPeterssonEngine;
+pub use science::ThurstonHyperbolicDehnEngine;
+pub mod omni_heptacosa_xxvii;
+pub use omni_heptacosa_xxvii::GrandOmniHeptacosaEngineXXVII;
+pub use physics::AbjChiralAnomalyEngine;
+pub use physics::CasimirLifshitzVacuumEngine;
+pub use physics::ElectroweakSphaleronBaryogenesis;
+pub use physics::KibbleZurekDefectScaling;
+pub use physics::MswNeutrinoOscillationEngine;
+pub use physics::QcdAsymptoticFreedomEngine;
+pub use physics::SchwingerEulerHeisenbergQED;
+pub use physics::UnruhRindlerBogoliubovEngine;
+pub use physics::WilsonLatticeGaugeQCD;
+pub mod omni_octacosa_xxviii;
+pub use omni_octacosa_xxviii::GrandOmniOctacosaEngineXXVIII;
+pub use science::EigenQuasispeciesThreshold;
+pub use science::FisherKppWavefrontEngine;
+pub use science::HubbellEwensBiodiversityEngine;
+pub use science::KermackMcKendrickEpidemicEngine;
+pub use science::KimuraWrightFisherEngine;
+pub use science::KingmanCoalescentEngine;
+pub use science::MayWignerComplexityStability;
+pub use science::PriceHamiltonEvolutionEngine;
+pub use science::ReplicatorMutatorGameEngine;
+pub mod omni_nonacosa_xxix;
+pub use omni_nonacosa_xxix::GrandOmniNonacosaEngineXXIX;
+pub use science::DinurPcpGapAmplification;
+pub use science::GoodsteinParisHarringtonEngine;
+pub use science::HrushovskiZariskiGeometry;
+pub use science::MartinBorelDeterminacyEngine;
+pub use science::OMinimalPfaffianCellEngine;
+pub use science::ShelahStabilitySauerEngine;
+pub use science::SolomonoffLevinUniversalPrior;
+pub use science::SunflowerNaturalProofsBarrier;
+pub use science::WilliamsSatCircuitLowerBound;
+pub mod omni_tricentennial_xxx;
+pub use omni_tricentennial_xxx::GrandOmniTricentennialEngineXXX;
+pub mod omni_henetricosa_xxxi;
+pub use omni_henetricosa_xxxi::GrandOmniHenetricosaEngineXXXI;
+pub use science::AlmgrenChrissOptimalExecution;
+pub use science::AvellanedaStoikovMarketMaker;
+pub use science::EisenbergNoeSystemicClearing;
+pub use science::HaganSabrVolatilityEngine;
+pub use science::HeathJarrowMortonTermStructure;
+pub use science::KellyLogOptimalPortfolio;
+pub use science::KyleLambdaAuctionEquilibrium;
+pub use science::MertonStructuralDefaultEngine;
+pub use science::RockafellarUryasevCVaREngine;
+pub mod omni_dotricosa_xxxii;
+pub use omni_dotricosa_xxxii::GrandOmniDotricosaEngineXXXII;
+pub use physics::AkiRichardsSeismicAvoEngine;
+pub use physics::BackusGilbertInverseResolution;
+pub use physics::BudykoSellersClimateBifurcation;
+pub use physics::EddingtonChandrasekharRadiative;
+pub use physics::ElsasserGeodynamoCoreEngine;
+pub use physics::KanamoriGutenbergSeismicEngine;
+pub use physics::StommelSverdrupOceanCirculation;
+pub use physics::ThermalWindEadyBaroclinic;
+pub use physics::ToomreHillPlanetaryDisk;
+pub mod omni_tritricosa_xxxiii;
+pub use omni_tritricosa_xxxiii::GrandOmniTritricosaEngineXXXIII;
+pub use science::EhrhartMacdonaldPolytopeEngine;
+pub use science::HookLengthYoungTableauxEngine;
+pub use science::HuhKatzMatroidLogConcavity;
+pub use science::KazhdanLusztigHeckeEngine;
+pub use science::MacdonaldSymmetricCatalanEngine;
+pub use science::MikhalkinTropicalGeometryEngine;
+pub use science::StanleyReisnerDehnSommerville;
+pub use science::SzemerediGreenTaoRegularity;
+pub use science::TuttePolynomialMatroidEngine;
+pub mod omni_tetratricosa_xxxiv;
+pub use omni_tetratricosa_xxxiv::GrandOmniTetratricosaEngineXXXIV;
+pub use science::CaffarelliKohnNirenbergNavierStokes;
+pub use science::CalderonZygmundSingularIntegral;
+pub use science::CrandallLionsViscosityPucci;
+pub use science::DeGiorgiNashMoserRegularity;
+pub use science::LaxKdvInverseScatteringSoliton;
+pub use science::LionsConcentrationCompactness;
+pub use science::ModicaMortolaGammaConvergence;
+pub use science::StrichartzDispersiveEstimate;
+pub use science::ZakharovShabatNlsSoliton;
+pub mod omni_pentatricosa_xxxv;
+pub use omni_pentatricosa_xxxv::GrandOmniPentatricosaEngineXXXV;
+pub use physics::AmbegaokarBaratoffJosephson;
+pub use physics::ChuaStrukovMemristorSynapse;
+pub use physics::DattaDasRashbaSpintronics;
+pub use physics::LandauerButtikerBallisticTransport;
+pub use physics::ShockleyQueisserPhotovoltaic;
+pub use physics::SlonczewskiSpinTransferTorque;
+pub use physics::ThermoelectricFigureOfMeritZT;
+pub use physics::TsuEsakiResonantTunneling;
+pub mod omni_hexatricosa_xxxvi;
+pub use omni_hexatricosa_xxxvi::GrandOmniHexatricosaEngineXXXVI;
+pub use science::BellEvansMechanobiologyBond;
+pub use science::BriggsHaldaneEnzymeKinetics;
+pub use science::CrisprCas9RLoopKinetics;
+pub use science::FelsensteinPhylogeneticLikelihood;
+pub use science::KarlinAltschulSequenceAlignment;
+pub use science::MonodWymanChangeuxAllostery;
+pub use science::RnaVelocityWaddingtonLandscape;
+pub use science::WolynesProteinFoldingFunnel;
+pub use science::ZimmBraggRamachandranHelix;
+pub mod omni_heptatricosa_xxxvii;
+pub use omni_heptatricosa_xxxvii::GrandOmniHeptatricosaEngineXXXVII;
+pub use physics::ActiveNematicDefectTurbulence;
+pub use physics::DeGennesPolymerReptationTube;
+pub use physics::DlvoColloidalStabilityEngine;
+pub use physics::FloryHugginsSpinodalMixing;
+pub use physics::MotilityInducedPhaseSeparation;
+pub use physics::OldroydBViscoelasticRheology;
+pub use physics::OnsagerMaierSaupeNematic;
+pub use physics::TonerTuVicsekActiveMatter;
+pub use physics::WashburnYoungLaplaceCapillary;
+pub mod omni_octatricosa_xxxviii;
+pub use omni_octatricosa_xxxviii::GrandOmniOctatricosaEngineXXXVIII;
+pub use science::ByzantineQuorumConsensusEngine;
+pub use science::ClarkeEmersonModelChecker;
+pub use science::CousotGaloisAbstractInterpreter;
+pub use science::GilbertLynchPacelcTheorem;
+pub use science::GirardLinearLogicResource;
+pub use science::KargerConsistentHashingRing;
+pub use science::MatternVectorClockCausality;
+pub use science::ReynoldsSeparationLogicHeap;
+pub use science::ShapiroCrdtJoinSemilattice;
+pub mod omni_nonatricosa_xxxix;
+pub use omni_nonatricosa_xxxix::GrandOmniNonatricosaEngineXXXIX;
+pub use physics::FermiHillasCosmicRayShock;
+pub use physics::GamowThermonuclearPeakEngine;
+pub use physics::HoyleSalpeterEddingtonStellar;
+pub use physics::KruskalShafranovTroyonMhd;
+pub use physics::LawsonTripleProductIgnition;
+pub use physics::ParkerSolarWindSpiralEngine;
+pub use physics::SpitzerDreicerPlasmaTransport;
+pub use physics::SweetParkerPetschekReconnection;
+pub use physics::TajimaDawsonLaserWakefield;
+pub mod omni_quadricentennial_xl;
+pub use omni_quadricentennial_xl::GrandOmniQuadricentennialEngineXL;
+pub use science::AllardVarifoldMonotonicityEngine;
+pub use science::AlmgrenFrequencyCurrentsEngine;
+pub use science::AltCaffarelliFreeBoundaryWeiss;
+pub use science::BesicovitchMarstrandRectifiable;
+pub use science::CaffarelliMongeAmpereTransport;
+pub use science::CaffarelliSilvestreFractionalExt;
+pub use science::CheegerBuserSpectralInequality;
+pub use science::FedererFlemingCurrentsCoarea;
+pub use science::SimonsMinimalConeBernstein;
+pub mod omni_henatetracosa_xli;
+pub use omni_henatetracosa_xli::GrandOmniHenatetracosaEngineXLI;
+pub use physics::BdmpsJetQuenchingEnergyLoss;
+pub use physics::BetheWeizsackerNuclearMass;
+pub use physics::BjorkenQgpHydroExpansion;
+pub use physics::ChiralMagneticEffectKharzeev;
+pub use physics::ColorGlassCondensateSaturation;
+pub use physics::KovtunSonStarinetsViscosityBound;
+pub use physics::MatsuiSatzQuarkoniumMelting;
+pub use physics::MayerJensenNuclearShellMagic;
+pub use physics::WaleckaRelativisticMeanFieldNuclear;
+pub mod omni_dotetracosa_xlii;
+pub use omni_dotetracosa_xlii::GrandOmniDotetracosaEngineXLII;
+pub use science::AlonBoppanaRamanujanExpander;
+pub use science::BalogSzemerediGowersFreiman;
+pub use science::ErdosRenyiBollobasPhaseTransition;
+pub use science::FriedgutBourgainSharpThreshold;
+pub use science::KahnKalaiParkPhamThreshold;
+pub use science::LovaszLocalLemmaMoserTardos;
+pub use science::LovaszThetaShannonCapacity;
+pub use science::RothBourgainCapSetBounds;
+pub use science::TalagrandConvexConcentration;
+pub mod omni_tritetracosa_xliii;
+pub use omni_tritetracosa_xliii::GrandOmniTritetracosaEngineXLIII;
+pub use physics::KolmogorovK41ObukhovIntermittency;
+pub use physics::Kraichnan2DTurbulenceCascade;
+pub use physics::OrrSommerfeldSquireStability;
+pub use physics::PrandtlBlasiusVonKarmanBoundary;
+pub use physics::RankineHugoniotShockAdiabat;
+pub use physics::RayleighBenardLorenzConvection;
+pub use physics::RayleighPlessetCavitationBubble;
+pub use physics::SedovTaylorBlastWave;
+pub use physics::ZeldovichVonNeumannDoringDetonation;
+pub mod omni_tetratetracosa_xliv;
+pub use omni_tetratetracosa_xliv::GrandOmniTetratetracosaEngineXLIV;
+pub use science::BirchSwinnertonDyerLeadingTerm;
+pub use science::FaltingsMordellArakelovEngine;
+pub use science::FontainePAdicHodgePeriodEngine;
+pub use science::GrothendieckLefschetzTraceFormula;
+pub use science::IwasawaClassNumberGrowth;
+pub use science::RothSchmidtDiophantineEngine;
+pub use science::SatoTateSemicircleEquidistribution;
+pub use science::VoevodskyMotivicBlochKato;
+pub use science::WilesTaylorModularityHecke;
+pub mod omni_pentatetracosa_xlv;
+pub use omni_pentatetracosa_xlv::GrandOmniPentatetracosaEngineXLV;
+pub use science::ArikanPolarChannelPolarization;
+pub use science::GallagerRandomCodingExponent;
+pub use science::GaussianRateDistortionEngine;
+pub use science::GuruswamiSudanListDecoder;
+pub use science::LinearNetworkCodingMaxFlow;
+pub use science::MacWilliamsSingletonMdsCode;
+pub use science::PolyanskiyFiniteBlocklengthRate;
+pub use science::ShannonHartleyWaterfilling;
+pub use science::SlepianWolfRateRegionEngine;
+pub mod omni_hexatetracosa_xlvi;
+pub use omni_hexatetracosa_xlvi::GrandOmniHexatetracosaEngineXLVI;
+pub use science::DworkGaussianDifferentialPrivacy;
+pub use science::FriReedSolomonProximityStark;
+pub use science::GentryFheNoiseGrowthEngine;
+pub use science::Groth16QapSnarkAnalyzer;
+pub use science::LllBkzLatticeReduction;
+pub use science::MironovRenyiDpAccountant;
+pub use science::RegevLweLatticeSecurity;
+pub use science::ShamirBgwThresholdMpc;
+pub use science::SumcheckInteractiveProof;
+pub mod omni_heptatetracosa_xlvii;
+pub use omni_heptatetracosa_xlvii::GrandOmniHeptatetracosaEngineXLVII;
+pub use science::AmesControlBarrierFunctionQp;
+pub use science::IsaacsDifferentialPursuitGame;
+pub use science::KalmanBucyRiccatiFilter;
+pub use science::LasryLionsLinearQuadraticMfg;
+pub use science::PontryaginMinimumTimeBangBang;
+pub use science::SontagControlLyapunovEngine;
+pub use science::WillemsDissipativityKypEngine;
+pub use science::ZakaiUnnormalizedFilteringSde;
+pub use science::ZamesDoyleHInfinityControl;
+pub mod omni_octatetracosa_xlviii;
+pub use omni_octatetracosa_xlviii::GrandOmniOctatetracosaEngineXLVIII;
+pub use science::BaezDolanCobordismHypothesis;
+pub use science::BhattScholzePrismaticEngine;
+pub use science::ClausenScholzeLiquidTensor;
+pub use science::FarguesFontaineCurveEngine;
+pub use science::GiraudGrothendieckToposEngine;
+pub use science::HomotopyTypeTheoryUnivalence;
+pub use science::LurieInfinityCategoryEngine;
+pub use science::MacLaneMonoidalCoherence;
+pub use science::ScholzePerfectoidTiltingEngine;
+pub mod omni_nonatetracosa_xlix;
+pub use omni_nonatetracosa_xlix::GrandOmniNonatetracosaEngineXLIX;
+pub use physics::AmplituhedronGrassmannianVolume;
+pub use physics::CelestialHolographyMellinAmplitude;
+pub use physics::HappyHolographicCodeBulkWedge;
+pub use physics::HolographicComplexityActionVolume;
+pub use physics::JackiwTeitelboimSchwarzianGravity;
+pub use physics::QuantumExtremalSurfaceIslandPage;
+pub use physics::SachdevYeKitaevMaximalChaos;
+pub use physics::StromingerSoftTheoremMemoryTriangle;
+pub use physics::SwamplandDistanceDeSitterBounds;
+pub mod omni_quincentennial_l;
+pub use omni_quincentennial_l::GrandOmniQuincentennialEngineL;
+pub mod millennium;
+pub use millennium::*;
+
+pub mod prelude {
+    pub use crate::crypto::{
+        FieldElement, LinearCombination, R1CSConstraint, ZkMlEngine, ZkMlProof,
+    };
+    pub use crate::hardware::{
+        MachZehnderInterferometer, PhotonicLinear, PhotonicMesh, SaturableAbsorber,
+    };
+    pub use crate::omni_singularity::{OmniTransSingularityEngine, OmniTransSingularityReport};
+    pub use crate::physics::{
+        ContactHamiltonianSystem, HamiltonianNeuralEngine, HeisenbergLieAlgebra, HeisenbergPoint,
+        HypoellipticDiffusion3D, LiePoissonState, LiePoissonSystem, RigidBodyInertia,
+        SolitonPhysics, SpatialGrid1D, SplitStepNlsEngine, divergence, helmholtz_pinn_residual,
+        laplacian, poisson_pinn_loss, spatial_gradient,
+    };
+    pub use crate::science::{
+        DeepONet, GromovWassersteinConfig, GromovWassersteinEngine, GromovWassersteinResult,
+        InfoNceEstimator, MineEstimator, MolecularGeometryDiffusion, OrientedSimplex,
+        PairformerBlock, PersistenceDiagram, PersistencePair, PersistentHomologyEngine,
+        SE3EquivariantLayer, SherringtonKirkpatrickModel, Simplex, SimplicialComplex, TapSolution,
+        TriangularMultiplicativeUpdate, TropicalMatrix, TropicalMonomial, TropicalPolynomial,
+        tropical_distance, wasserstein_distance,
+    };
+    pub use crate::universal_engine::{UniversalAGIConfig, UniversalAGIEngine, UniversalAGIReport};
+}

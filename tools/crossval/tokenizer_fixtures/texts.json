@@ -1,0 +1,32 @@
+{
+ "texts": [
+  "Hello, world! It's a test.",
+  "The quick brown fox jumps over the lazy dog.",
+  "naïve café résumé Zürich — déjà vu",
+  "日本語のテキストと中文文本 mixed 123456",
+  "def foo(x, y):\n    return x + y  # add\n\nprint(foo(1, 2))",
+  "Emoji 😀 👍🏽 $100, 50%, a+b=c #tag http://x.com/p?q=1",
+  "   leading and trailing   \n\t",
+  "ALL CAPS and MiXeD cAsE ﬁnance ① ㎏ Å",
+  "",
+  "a",
+  "don't stop; won't stop. I'll go, they've gone, we'd see, she's here, I'm there, you're ok",
+  "<|endoftext|> special [CLS] token [SEP] and </s> text <s>",
+  "1234567890 and 3.14159, 0xFF, 1e-5",
+  "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ ],
+ "pairs": [
+  [
+   "Hello, world!",
+   "How are you?"
+  ],
+  [
+   "a b c",
+   "d e f g"
+  ],
+  [
+   "naïve",
+   ""
+  ]
+ ]
+}

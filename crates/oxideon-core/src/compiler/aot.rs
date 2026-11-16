@@ -1,0 +1,349 @@
+//! Ahead-Of-Time (AOT) Code Generator and Multi-Backend Compiler.
+//!
+//! Emits self-contained C99 and safe Rust code from optimized SSA [`IrGraph`] representations,
+//! enabling zero-overhead deployment on microcontrollers, edge devices, and embedded hardware.
+
+use std::collections::HashMap;
+
+use crate::compiler::{IrGraph, IrOp, ValueId};
+use crate::error::{Error, Result};
+
+/// Target backend for Ahead-Of-Time compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AotTarget {
+    C99,
+    Rust,
+}
+
+/// AOT Compiler translating [`IrGraph`] to native code strings.
+pub struct AotCompiler;
+
+/// Ops the C99/Rust backends can emit (flat elementwise model: every buffer
+/// holds `in_0_len` elements, so all inputs must share one length).
+fn is_emittable(op: &IrOp) -> bool {
+    matches!(
+        op,
+        IrOp::Input { .. }
+            | IrOp::Add(..)
+            | IrOp::Sub(..)
+            | IrOp::Mul(..)
+            | IrOp::Div(..)
+            | IrOp::Relu(..)
+            | IrOp::Silu(..)
+            | IrOp::Tanh(..)
+            | IrOp::FusedFma(..)
+    )
+}
+
+fn op_operands(op: &IrOp) -> Vec<ValueId> {
+    match op {
+        IrOp::Input { .. } => vec![],
+        IrOp::ZeroLike { src }
+        | IrOp::OneLike { src }
+        | IrOp::Transpose2D(src)
+        | IrOp::Relu(src)
+        | IrOp::Silu(src)
+        | IrOp::Gelu(src)
+        | IrOp::Tanh(src)
+        | IrOp::Exp(src)
+        | IrOp::Ln(src)
+        | IrOp::Neg(src)
+        | IrOp::Square(src)
+        | IrOp::SumAll(src)
+        | IrOp::MeanAll(src) => vec![*src],
+        IrOp::Add(a, b)
+        | IrOp::Sub(a, b)
+        | IrOp::Mul(a, b)
+        | IrOp::Div(a, b)
+        | IrOp::Matmul(a, b) => {
+            vec![*a, *b]
+        }
+        IrOp::FusedFma(a, b, c) => vec![*a, *b, *c],
+        IrOp::FusedLinear { x, w, b }
+        | IrOp::FusedLinearRelu { x, w, b }
+        | IrOp::FusedLinearSilu { x, w, b }
+        | IrOp::FusedLinearGelu { x, w, b } => vec![*x, *w, *b],
+    }
+}
+
+fn check_fn_name(fn_name: &str) -> Result<()> {
+    let mut chars = fn_name.chars();
+    let head_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_');
+    if !head_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(Error::Msg(format!(
+            "AOT function name must be a C/Rust identifier, got {fn_name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the graph before emission: unique ids, operands defined by
+/// earlier nodes (declaration before use), inputs/outputs in range, and every
+/// op emittable (emitting a comment for an unsupported op would produce code
+/// that references undeclared variables).
+fn validate_graph(graph: &IrGraph) -> Result<()> {
+    if graph.num_inputs == 0 {
+        return Err(Error::Msg(
+            "AOT emission needs at least one graph input".into(),
+        ));
+    }
+    if graph.outputs.is_empty() {
+        return Err(Error::Msg(
+            "AOT emission needs at least one graph output".into(),
+        ));
+    }
+    let mut defined: HashMap<ValueId, usize> = HashMap::new();
+    for (pos, node) in graph.nodes.iter().enumerate() {
+        if defined.insert(node.id, pos).is_some() {
+            return Err(Error::Msg(format!(
+                "AOT emission: duplicate node id {}",
+                node.id
+            )));
+        }
+        if let IrOp::Input { index } = node.op {
+            if index >= graph.num_inputs {
+                return Err(Error::Msg(format!(
+                    "AOT emission: input index {index} out of range ({} inputs)",
+                    graph.num_inputs
+                )));
+            }
+        }
+        for dep in op_operands(&node.op) {
+            match defined.get(&dep) {
+                Some(&def_pos) if def_pos < pos => {}
+                _ => {
+                    return Err(Error::Msg(format!(
+                        "AOT emission: node {} uses undefined or forward-referenced value {dep}",
+                        node.id
+                    )));
+                }
+            }
+        }
+        if !is_emittable(&node.op) {
+            return Err(Error::Msg(format!(
+                "AOT emission: unsupported op {:?} on node {}",
+                node.op, node.id
+            )));
+        }
+    }
+    for &out in &graph.outputs {
+        if !defined.contains_key(&out) {
+            return Err(Error::Msg(format!(
+                "AOT emission: output id {out} is not defined by any node"
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl AotCompiler {
+    /// Emits a self-contained C99 function implementing the graph.
+    ///
+    /// Contract: every input holds the same number of elements (`in_0_len`);
+    /// each `out_j` buffer must hold at least `out_j_len` floats.
+    pub fn emit_c(graph: &IrGraph, fn_name: &str) -> Result<String> {
+        check_fn_name(fn_name)?;
+        validate_graph(graph)?;
+        let mut out = String::new();
+        out.push_str("/* Auto-generated by Oxideon AOT Compiler (v4.0.0)\n");
+        out.push_str(
+            "   Contract: all inputs hold in_0_len floats; each out_j holds out_j_len. */\n",
+        );
+        out.push_str("#include <math.h>\n#include <stdlib.h>\n#include <string.h>\n\n");
+
+        // Function signature
+        out.push_str(&format!("void {fn_name}(\n"));
+        for i in 0..graph.num_inputs {
+            out.push_str(&format!("    const float* in_{i}, size_t in_{i}_len,\n"));
+        }
+        for (j, _) in graph.outputs.iter().enumerate() {
+            let comma = if j + 1 < graph.outputs.len() { "," } else { "" };
+            out.push_str(&format!("    float* out_{j}, size_t out_{j}_len{comma}\n"));
+        }
+        out.push_str(") {\n");
+
+        // SSA Node execution; every malloc is null-checked and every temporary
+        // is freed before return (including on allocation failure).
+        let mut owned: Vec<ValueId> = Vec::new();
+        let emit_alloc = |out: &mut String, owned: &[ValueId], id: ValueId| {
+            out.push_str(&format!(
+                "    float* v_{id} = (float*)malloc(in_0_len * sizeof(float));\n    if (!v_{id}) {{"
+            ));
+            for prev in owned {
+                out.push_str(&format!(" free(v_{prev});"));
+            }
+            out.push_str(" return; }\n");
+        };
+        for node in &graph.nodes {
+            let id = node.id;
+            match &node.op {
+                IrOp::Input { index } => {
+                    out.push_str(&format!("    const float* v_{id} = in_{index};\n"));
+                }
+                IrOp::Add(a, b) => {
+                    out.push_str(&format!("    /* v_{id} = v_{a} + v_{b} */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) v_{id}[i] = v_{a}[i] + v_{b}[i];\n"
+                    ));
+                    owned.push(id);
+                }
+                IrOp::Sub(a, b) => {
+                    out.push_str(&format!("    /* v_{id} = v_{a} - v_{b} */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) v_{id}[i] = v_{a}[i] - v_{b}[i];\n"
+                    ));
+                    owned.push(id);
+                }
+                IrOp::Mul(a, b) => {
+                    out.push_str(&format!("    /* v_{id} = v_{a} * v_{b} */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) v_{id}[i] = v_{a}[i] * v_{b}[i];\n"
+                    ));
+                    owned.push(id);
+                }
+                IrOp::Div(a, b) => {
+                    out.push_str(&format!("    /* v_{id} = v_{a} / v_{b} */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) v_{id}[i] = v_{a}[i] / v_{b}[i];\n"
+                    ));
+                    owned.push(id);
+                }
+                IrOp::Relu(src) => {
+                    out.push_str(&format!("    /* v_{id} = relu(v_{src}) */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) v_{id}[i] = v_{src}[i] > 0.0f ? v_{src}[i] : 0.0f;\n"
+                    ));
+                    owned.push(id);
+                }
+                IrOp::Silu(src) => {
+                    out.push_str(&format!("    /* v_{id} = silu(v_{src}) */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) {{ float x = v_{src}[i]; v_{id}[i] = x / (1.0f + expf(-x)); }}\n"
+                    ));
+                    owned.push(id);
+                }
+                IrOp::Tanh(src) => {
+                    out.push_str(&format!("    /* v_{id} = tanh(v_{src}) */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) v_{id}[i] = tanhf(v_{src}[i]);\n"
+                    ));
+                    owned.push(id);
+                }
+                IrOp::FusedFma(a, b, c) => {
+                    out.push_str(&format!("    /* v_{id} = v_{a} * v_{b} + v_{c} (FMA) */\n"));
+                    emit_alloc(&mut out, &owned, id);
+                    out.push_str(&format!(
+                        "    for (size_t i = 0; i < in_0_len; ++i) v_{id}[i] = fmaf(v_{a}[i], v_{b}[i], v_{c}[i]);\n"
+                    ));
+                    owned.push(id);
+                }
+                op => {
+                    return Err(Error::Msg(format!(
+                        "AOT emit_c: unsupported op {op:?} on node {id}"
+                    )));
+                }
+            }
+        }
+
+        // Copy outputs
+        for (j, &out_id) in graph.outputs.iter().enumerate() {
+            out.push_str(&format!(
+                "    memcpy(out_{j}, v_{out_id}, out_{j}_len * sizeof(float));\n"
+            ));
+        }
+        for id in &owned {
+            out.push_str(&format!("    free(v_{id});\n"));
+        }
+
+        out.push_str("}\n");
+        Ok(out)
+    }
+
+    /// Emits a zero-dependency safe Rust function implementing the graph.
+    ///
+    /// Contract: every input holds the same number of elements (`in_0.len()`).
+    pub fn emit_rust(graph: &IrGraph, fn_name: &str) -> Result<String> {
+        check_fn_name(fn_name)?;
+        validate_graph(graph)?;
+        let mut out = String::new();
+        out.push_str("// Auto-generated by Oxideon AOT Compiler (v4.0.0)\n\n");
+
+        out.push_str(&format!("pub fn {fn_name}(\n"));
+        for i in 0..graph.num_inputs {
+            out.push_str(&format!("    in_{i}: &[f32],\n"));
+        }
+        out.push_str(") -> Vec<Vec<f32>> {\n");
+        out.push_str("    let n = in_0.len();\n");
+
+        for node in &graph.nodes {
+            let id = node.id;
+            match &node.op {
+                IrOp::Input { index } => {
+                    out.push_str(&format!("    let v_{id} = in_{index};\n"));
+                }
+                IrOp::Add(a, b) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = (0..n).map(|i| v_{a}[i] + v_{b}[i]).collect();\n"
+                    ));
+                }
+                IrOp::Sub(a, b) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = (0..n).map(|i| v_{a}[i] - v_{b}[i]).collect();\n"
+                    ));
+                }
+                IrOp::Mul(a, b) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = (0..n).map(|i| v_{a}[i] * v_{b}[i]).collect();\n"
+                    ));
+                }
+                IrOp::Div(a, b) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = (0..n).map(|i| v_{a}[i] / v_{b}[i]).collect();\n"
+                    ));
+                }
+                IrOp::Relu(src) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = v_{src}.iter().map(|&x| if x > 0.0 {{ x }} else {{ 0.0 }}).collect();\n"
+                    ));
+                }
+                IrOp::Silu(src) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = v_{src}.iter().map(|&x| x / (1.0 + (-x).exp())).collect();\n"
+                    ));
+                }
+                IrOp::Tanh(src) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = v_{src}.iter().map(|&x| x.tanh()).collect();\n"
+                    ));
+                }
+                IrOp::FusedFma(a, b, c) => {
+                    out.push_str(&format!(
+                        "    let v_{id}: Vec<f32> = (0..n).map(|i| v_{a}[i].mul_add(v_{b}[i], v_{c}[i])).collect();\n"
+                    ));
+                }
+                op => {
+                    return Err(Error::Msg(format!(
+                        "AOT emit_rust: unsupported op {op:?} on node {id}"
+                    )));
+                }
+            }
+        }
+
+        let ret_vars = graph
+            .outputs
+            .iter()
+            .map(|id| format!("v_{id}.to_vec()"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("    vec![{ret_vars}]\n"));
+        out.push_str("}\n");
+        Ok(out)
+    }
+}

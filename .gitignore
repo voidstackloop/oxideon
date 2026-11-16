@@ -1,0 +1,22 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.idea/
+.vscode/
+
+.venv/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.so
+*.pyd
+
+# Locally generated outputs (examples, tensorboard-style runs, test cache)
+/mini_models_out/
+runs/
+.pytest_cache/
+a.out
+*.tmp
+*.tmp.*
+*.bak.tmp

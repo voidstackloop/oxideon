@@ -1,0 +1,225 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello, how are you?"
+   }
+  ],
+  "gen": true
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello, how are you?"
+   }
+  ],
+  "gen": false
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a helpful assistant."
+   },
+   {
+    "role": "user",
+    "content": "What is 2+2?"
+   }
+  ],
+  "gen": true
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello! How can I help?"
+   },
+   {
+    "role": "user",
+    "content": "Tell me a joke."
+   }
+  ],
+  "gen": true
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Q1"
+   },
+   {
+    "role": "assistant",
+    "content": "A1"
+   },
+   {
+    "role": "user",
+    "content": "Q2"
+   },
+   {
+    "role": "assistant",
+    "content": "Sure."
+   }
+  ],
+  "gen": false
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "naïve café 日本語 😀 \"quotes\" and 'apostrophes'\nnewline <tag> {braces}"
+   }
+  ],
+  "gen": true
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "gen": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "The city name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "name": "get_weather",
+    "content": "{\"temp\": 20}"
+   }
+  ],
+  "gen": true,
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "  padded system  \n"
+   },
+   {
+    "role": "user",
+    "content": "  padded user  \n\n"
+   }
+  ],
+  "gen": true
+ },
+ {
+  "messages": [
+   {
+    "role": "assistant",
+    "content": "I start."
+   },
+   {
+    "role": "user",
+    "content": "Then me."
+   }
+  ],
+  "gen": true
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "describe this"
+     }
+    ]
+   }
+  ],
+  "gen": true
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "A"
+   },
+   {
+    "role": "user",
+    "content": "B"
+   }
+  ],
+  "gen": true
+ }
+]

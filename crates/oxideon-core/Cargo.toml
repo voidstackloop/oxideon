@@ -1,0 +1,31 @@
+[package]
+name = "oxideon-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Oxideon core: multi-dtype strided-view tensors, higher-order autograd, neural-network layers, optimizers and quantization"
+license.workspace = true
+keywords = ["deep-learning", "autograd", "neural-network", "tensor", "machine-learning"]
+categories = ["science", "mathematics"]
+
+[features]
+default = ["rayon", "fast-gemm"]
+rayon = ["dep:rayon", "gemm?/rayon"]
+# Matrix multiplication through the `gemm` crate (AVX2 / AVX-512 / NEON micro-kernels, blocked f32 and f64, multi-threaded
+# with `rayon`) instead of the in-house portable kernels; the in-house ones stay as the fallback and for tiny matrices.
+fast-gemm = ["dep:gemm"]
+# Adds the AVX-512 kernels to the `gemm` crate (picked at run time on CPUs that have them). Needs Rust 1.89 or newer, which is
+# why it is not on by default (the minimum supported version is 1.85).
+avx512 = ["fast-gemm", "gemm/x86-v4"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+gemm = { version = "0.19", optional = true, default-features = false, features = ["std"] }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1.18", features = ["derive"], optional = true }
+libm = "0.2"
+
+[lints]
+workspace = true

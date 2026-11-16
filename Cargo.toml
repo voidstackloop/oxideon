@@ -1,0 +1,72 @@
+[workspace]
+members = [".", "crates/oxideon-core", "crates/oxideon-engines"]
+default-members = [".", "crates/oxideon-core", "crates/oxideon-engines"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+oxideon-core = { path = "crates/oxideon-core", version = "0.0.1", default-features = false }
+oxideon-engines = { path = "crates/oxideon-engines", version = "0.0.1" }
+
+# Index loops are used throughout the numeric code; allow the lint workspace-wide instead of per file.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+uninlined_format_args = "allow"
+
+# `oxideon` is the facade: it re-exports `oxideon-core` (tensors, autograd, nn, ...) and `oxideon-engines`
+# (science / physics / crypto / synthesis-chain engines) and hosts the Python bindings.
+[package]
+name = "oxideon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "An advanced, multi-dtype, strided-view deep learning and tensor library in Rust"
+license.workspace = true
+readme = "README.md"
+keywords = ["deep-learning", "autograd", "neural-network", "tensor", "machine-learning"]
+categories = ["science", "mathematics"]
+
+[lib]
+name = "oxideon"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["rayon", "fast-gemm"]
+rayon = ["oxideon-core/rayon"]
+fast-gemm = ["oxideon-core/fast-gemm"]
+avx512 = ["oxideon-core/avx512"]
+wgpu = ["oxideon-core/wgpu"]
+python = ["dep:pyo3"]
+python-ext = ["python", "pyo3/extension-module"]
+
+[dependencies]
+oxideon-core.workspace = true
+oxideon-engines.workspace = true
+pyo3 = { version = "0.29", optional = true, features = ["abi3-py39"] }
+
+[lints]
+workspace = true
+
+[profile.release]
+opt-level = 3
+codegen-units = 16
+lto = "thin"
+
+# The engines are science / physics demonstrations, not hot tensor kernels. With overflow checks on, a huge user-supplied
+# integer is a panic (a `RuntimeError` through the Python wrappers' `guard`) instead of silently wrapping into a wrong answer.
+[profile.release.package.oxideon-engines]
+overflow-checks = true
+
+[profile.dev]
+opt-level = 0
+debug = 0
+
+# opt-level 1 cuts the heaviest test (test_mini_image_model) from ~56 s to ~12 s for ~4 s extra compile time.
+[profile.test]
+opt-level = 1
+debug = 0
