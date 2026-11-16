@@ -49,6 +49,19 @@ pub mod simd_x86 {
     pub fn silu_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
     #[inline]
     pub fn relu_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn add_bias_row_f32(_row: &mut [f32], _bias: &[f32]) -> bool { false }
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn adam_step_f32_slice(
+        _p: &mut [f32], _g: &[f32], _m: &mut [f32], _v: &mut [f32],
+        _lr: f32, _beta1: f32, _beta2: f32, _eps: f32, _weight_decay: f32,
+        _decoupled: bool, _inv_bc1: f32, _inv_bc2: f32,
+    ) -> bool { false }
+    #[inline]
+    pub fn layer_norm_row_bwd_f32(
+        _x: &[f32], _g: &[f32], _w: &[f32], _dx: &mut [f32], _dw: &mut [f32], _db: &mut [f32], _eps: f32,
+    ) -> bool { false }
 }
 pub mod cuda_driver;
 pub mod cuda_kernels;
@@ -304,6 +317,251 @@ impl Storage {
             }
         };
         Some(Self(Tracked::new(out_inner)))
+    }
+
+    /// Adds a 1D `F32` `bias` (`[cols]`) in-place across every row of a freshly-allocated contiguous
+    /// `[rows, cols]` CPU `F32` storage (returns `false` if not uniquely owned or incompatible).
+    pub(crate) fn try_add_bias_inplace_f32(&self, bias: &Self, bias_layout: &Layout, cols: usize) -> bool {
+        if cols == 0 || !bias_layout.is_contiguous() {
+            return false;
+        }
+        let mut g_dst = self.0.write().unwrap_or_else(|p| p.into_inner());
+        let g_bias = bias.0.read().unwrap_or_else(|p| p.into_inner());
+        let (StorageInner::Cpu(CpuStorage::F32(dst)), StorageInner::Cpu(CpuStorage::F32(bv))) = (&mut *g_dst, &*g_bias) else {
+            return false;
+        };
+        let Some(br) = bias_layout.contiguous_range_in(bv.len()) else {
+            return false;
+        };
+        let bs = &bv[br];
+        if bs.len() != cols || dst.len() % cols != 0 {
+            return false;
+        }
+        #[cfg(feature = "rayon")]
+        if dst.len() >= 16384 {
+            use rayon::prelude::*;
+            dst.par_chunks_mut(cols).for_each(|row| {
+                if !simd_x86::add_bias_row_f32(row, bs) {
+                    for (d, &b) in row.iter_mut().zip(bs) {
+                        *d += b;
+                    }
+                }
+            });
+            return true;
+        }
+        for row in dst.chunks_mut(cols) {
+            if !simd_x86::add_bias_row_f32(row, bs) {
+                for (d, &b) in row.iter_mut().zip(bs) {
+                    *d += b;
+                }
+            }
+        }
+        true
+    }
+
+    /// Single-pass fused Adam / AdamW parameter update on contiguous CPU `F32` storage.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_adam_step_f32(
+        &self,
+        p_layout: &Layout,
+        grad: &Self,
+        g_layout: &Layout,
+        m_stor: &Self,
+        v_stor: &Self,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        decoupled: bool,
+        bc1: f64,
+        bc2: f64,
+    ) -> bool {
+        if self.ptr_eq(m_stor) || self.ptr_eq(v_stor) || m_stor.ptr_eq(v_stor) {
+            return false;
+        }
+        let n = p_layout.numel();
+        if n == 0 || !p_layout.is_contiguous() || !g_layout.is_contiguous() || g_layout.numel() != n {
+            return false;
+        }
+        let mut gp = self.0.write().unwrap_or_else(|p| p.into_inner());
+        let gg = grad.0.read().unwrap_or_else(|p| p.into_inner());
+        let mut gm = m_stor.0.write().unwrap_or_else(|p| p.into_inner());
+        let mut gv = v_stor.0.write().unwrap_or_else(|p| p.into_inner());
+        let (
+            StorageInner::Cpu(CpuStorage::F32(pv)),
+            StorageInner::Cpu(CpuStorage::F32(gv_s)),
+            StorageInner::Cpu(CpuStorage::F32(mv)),
+            StorageInner::Cpu(CpuStorage::F32(vv)),
+        ) = (&mut *gp, &*gg, &mut *gm, &mut *gv)
+        else {
+            return false;
+        };
+        let Some(pr) = p_layout.contiguous_range_in(pv.len()) else { return false };
+        let Some(gr) = g_layout.contiguous_range_in(gv_s.len()) else { return false };
+        if mv.len() != n || vv.len() != n {
+            return false;
+        }
+        let ps = &mut pv[pr];
+        let gs = &gv_s[gr];
+        let (lr32, b1, b2, eps32, wd32, ibc1, ibc2) = (
+            lr as f32,
+            beta1 as f32,
+            beta2 as f32,
+            eps as f32,
+            weight_decay as f32,
+            (1.0 / bc1) as f32,
+            (1.0 / bc2) as f32,
+        );
+        let run_chunk = |p_c: &mut [f32], g_c: &[f32], m_c: &mut [f32], v_c: &mut [f32]| {
+            if !simd_x86::adam_step_f32_slice(p_c, g_c, m_c, v_c, lr32, b1, b2, eps32, wd32, decoupled, ibc1, ibc2) {
+                for (((p, &g), m), v) in p_c.iter_mut().zip(g_c).zip(m_c.iter_mut()).zip(v_c.iter_mut()) {
+                    let mut pv = *p;
+                    let mut gv = g;
+                    if wd32 != 0.0 {
+                        if decoupled {
+                            pv *= 1.0 - lr32 * wd32;
+                        } else {
+                            gv += pv * wd32;
+                        }
+                    }
+                    *m = b1 * *m + (1.0 - b1) * gv;
+                    *v = b2 * *v + (1.0 - b2) * gv * gv;
+                    *p = pv - lr32 * (*m * ibc1) / ((*v * ibc2).sqrt() + eps32);
+                }
+            }
+        };
+        #[cfg(feature = "rayon")]
+        if n >= 16384 {
+            use rayon::prelude::*;
+            ps.par_chunks_mut(8192)
+                .zip(gs.par_chunks(8192))
+                .zip(mv.par_chunks_mut(8192))
+                .zip(vv.par_chunks_mut(8192))
+                .for_each(|(((p_c, g_c), m_c), v_c)| run_chunk(p_c, g_c, m_c, v_c));
+            return true;
+        }
+        run_chunk(ps, gs, mv, vv);
+        true
+    }
+
+    /// Fused single-pass last-axis `LayerNorm` backward on contiguous CPU `F32` storage.
+    pub(crate) fn try_layer_norm_bwd_f32(
+        &self,
+        x_layout: &Layout,
+        grad: &Self,
+        g_layout: &Layout,
+        weight: &Self,
+        w_layout: &Layout,
+        eps: f64,
+    ) -> Option<(Self, Self, Self)> {
+        let d = w_layout.numel();
+        let total = x_layout.numel();
+        if d == 0 || total == 0 || total % d != 0 || x_layout.shape() != g_layout.shape() {
+            return None;
+        }
+        let gx = self.0.read().unwrap_or_else(|p| p.into_inner());
+        let gg = grad.0.read().unwrap_or_else(|p| p.into_inner());
+        let gw = weight.0.read().unwrap_or_else(|p| p.into_inner());
+        let (
+            StorageInner::Cpu(CpuStorage::F32(xv)),
+            StorageInner::Cpu(CpuStorage::F32(gv)),
+            StorageInner::Cpu(CpuStorage::F32(wv)),
+        ) = (&*gx, &*gg, &*gw)
+        else {
+            return None;
+        };
+        let xr = x_layout.contiguous_range_in(xv.len())?;
+        let gr = g_layout.contiguous_range_in(gv.len())?;
+        let wr = w_layout.contiguous_range_in(wv.len())?;
+        if wr.len() != d {
+            return None;
+        }
+        let xs = &xv[xr];
+        let gs = &gv[gr];
+        let ws = &wv[wr];
+        let mut dx = crate::pool::take::<f32>(total).unwrap_or_else(|| vec![0.0; total]);
+        let mut dw = vec![0.0f32; d];
+        let mut db = vec![0.0f32; d];
+        let eps32 = eps as f32;
+
+        #[cfg(feature = "rayon")]
+        if total >= 16384 {
+            use rayon::prelude::*;
+            let (dw_acc, db_acc) = xs
+                .par_chunks(d)
+                .zip(gs.par_chunks(d))
+                .zip(dx.par_chunks_mut(d))
+                .fold(
+                    || (vec![0.0f32; d], vec![0.0f32; d]),
+                    |(mut ldw, mut ldb), ((xr_s, gr_s), dx_s)| {
+                        if !simd_x86::layer_norm_row_bwd_f32(xr_s, gr_s, ws, dx_s, &mut ldw, &mut ldb, eps32) {
+                            let mean = xr_s.iter().sum::<f32>() / (d as f32);
+                            let var = xr_s.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / (d as f32);
+                            let inv_std = 1.0 / (var + eps32).sqrt();
+                            let mut s1 = 0.0f32;
+                            let mut s2 = 0.0f32;
+                            for i in 0..d {
+                                let xhat = (xr_s[i] - mean) * inv_std;
+                                let gxh = gr_s[i] * ws[i];
+                                s1 += gxh;
+                                s2 += gxh * xhat;
+                                ldw[i] += gr_s[i] * xhat;
+                                ldb[i] += gr_s[i];
+                            }
+                            let inv_n = 1.0 / (d as f32);
+                            for i in 0..d {
+                                let xhat = (xr_s[i] - mean) * inv_std;
+                                dx_s[i] = (gr_s[i] * ws[i] - s1 * inv_n - xhat * (s2 * inv_n)) * inv_std;
+                            }
+                        }
+                        (ldw, ldb)
+                    },
+                )
+                .reduce(
+                    || (vec![0.0f32; d], vec![0.0f32; d]),
+                    |(mut a_w, mut a_b), (b_w, b_b)| {
+                        for i in 0..d {
+                            a_w[i] += b_w[i];
+                            a_b[i] += b_b[i];
+                        }
+                        (a_w, a_b)
+                    },
+                );
+            return Some((
+                Self::new_cpu(CpuStorage::F32(dx)),
+                Self::new_cpu(CpuStorage::F32(dw_acc)),
+                Self::new_cpu(CpuStorage::F32(db_acc)),
+            ));
+        }
+
+        for ((xr_s, gr_s), dx_s) in xs.chunks(d).zip(gs.chunks(d)).zip(dx.chunks_mut(d)) {
+            if !simd_x86::layer_norm_row_bwd_f32(xr_s, gr_s, ws, dx_s, &mut dw, &mut db, eps32) {
+                let mean = xr_s.iter().sum::<f32>() / (d as f32);
+                let var = xr_s.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / (d as f32);
+                let inv_std = 1.0 / (var + eps32).sqrt();
+                let mut s1 = 0.0f32;
+                let mut s2 = 0.0f32;
+                for i in 0..d {
+                    let xhat = (xr_s[i] - mean) * inv_std;
+                    let gxh = gr_s[i] * ws[i];
+                    s1 += gxh;
+                    s2 += gxh * xhat;
+                    dw[i] += gr_s[i] * xhat;
+                    db[i] += gr_s[i];
+                }
+                let inv_n = 1.0 / (d as f32);
+                for i in 0..d {
+                    let xhat = (xr_s[i] - mean) * inv_std;
+                    dx_s[i] = (gr_s[i] * ws[i] - s1 * inv_n - xhat * (s2 * inv_n)) * inv_std;
+                }
+            }
+        }
+        Some((
+            Self::new_cpu(CpuStorage::F32(dx)),
+            Self::new_cpu(CpuStorage::F32(dw)),
+            Self::new_cpu(CpuStorage::F32(db)),
+        ))
     }
 
     pub fn new_cpu(s: CpuStorage) -> Self {

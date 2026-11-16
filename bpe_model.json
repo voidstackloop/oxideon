@@ -1,0 +1,428 @@
+{
+  "vocab": {
+    "<pad>": 0,
+    "<unk>": 1,
+    "<bos>": 2,
+    "<eos>": 3,
+    " ": 4,
+    "a": 5,
+    "c": 6,
+    "d": 7,
+    "e": 8,
+    "f": 9,
+    "g": 10,
+    "h": 11,
+    "i": 12,
+    "k": 13,
+    "l": 14,
+    "m": 15,
+    "n": 16,
+    "o": 17,
+    "p": 18,
+    "r": 19,
+    "s": 20,
+    "t": 21,
+    "u": 22,
+    "v": 23,
+    "w": 24,
+    "y": 25,
+    "z": 26,
+    "an": 27,
+    "en": 28,
+    "in": 29,
+    "th": 30,
+    "and": 31,
+    "py": 32,
+    "on": 33,
+    "gh": 34,
+    "ro": 35,
+    "ut": 36,
+    "ti": 37,
+    "de": 38,
+    "dee": 39,
+    "deep": 40,
+    "le": 41,
+    "lea": 42,
+    "lear": 43,
+    "learn": 44,
+    "learnin": 45,
+    "learning": 46,
+    "wi": 47,
+    "with": 48,
+    "ru": 49,
+    "rus": 50,
+    "rust": 51,
+    "pyth": 52,
+    "python": 53,
+    "hi": 54,
+    "high": 55,
+    "thro": 56,
+    "throu": 57,
+    "through": 58,
+    "throughp": 59,
+    "throughput": 60,
+    "inf": 61,
+    "infe": 62,
+    "infer": 63,
+    "inferen": 64,
+    "inferenc": 65,
+    "inference": 66,
+    "eng": 67,
+    "engin": 68,
+    "engine": 69,
+    "engines": 70,
+    "kv": 71,
+    "ca": 72,
+    "cac": 73,
+    "cach": 74,
+    "cache": 75,
+    "man": 76,
+    "mana": 77,
+    "manag": 78,
+    "manage": 79,
+    "managem": 80,
+    "managemen": 81,
+    "management": 82,
+    "ze": 83,
+    "zero": 84,
+    "co": 85,
+    "copy": 86,
+    "ten": 87,
+    "tens": 88,
+    "tenso": 89,
+    "tensor": 90,
+    "tensors": 91,
+    "aut": 92,
+    "auto": 93,
+    "autog": 94,
+    "autogr": 95,
+    "autogra": 96,
+    "autograd": 97,
+    "op": 98,
+    "opti": 99,
+    "optim": 100,
+    "optimi": 101,
+    "optimiz": 102,
+    "optimiza": 103,
+    "optimizati": 104,
+    "optimization": 105
+  },
+  "merges": [
+    [
+      "a",
+      "n"
+    ],
+    [
+      "e",
+      "n"
+    ],
+    [
+      "i",
+      "n"
+    ],
+    [
+      "t",
+      "h"
+    ],
+    [
+      "an",
+      "d"
+    ],
+    [
+      "p",
+      "y"
+    ],
+    [
+      "o",
+      "n"
+    ],
+    [
+      "g",
+      "h"
+    ],
+    [
+      "r",
+      "o"
+    ],
+    [
+      "u",
+      "t"
+    ],
+    [
+      "t",
+      "i"
+    ],
+    [
+      "d",
+      "e"
+    ],
+    [
+      "de",
+      "e"
+    ],
+    [
+      "dee",
+      "p"
+    ],
+    [
+      "l",
+      "e"
+    ],
+    [
+      "le",
+      "a"
+    ],
+    [
+      "lea",
+      "r"
+    ],
+    [
+      "lear",
+      "n"
+    ],
+    [
+      "learn",
+      "in"
+    ],
+    [
+      "learnin",
+      "g"
+    ],
+    [
+      "w",
+      "i"
+    ],
+    [
+      "wi",
+      "th"
+    ],
+    [
+      "r",
+      "u"
+    ],
+    [
+      "ru",
+      "s"
+    ],
+    [
+      "rus",
+      "t"
+    ],
+    [
+      "py",
+      "th"
+    ],
+    [
+      "pyth",
+      "on"
+    ],
+    [
+      "h",
+      "i"
+    ],
+    [
+      "hi",
+      "gh"
+    ],
+    [
+      "th",
+      "ro"
+    ],
+    [
+      "thro",
+      "u"
+    ],
+    [
+      "throu",
+      "gh"
+    ],
+    [
+      "through",
+      "p"
+    ],
+    [
+      "throughp",
+      "ut"
+    ],
+    [
+      "in",
+      "f"
+    ],
+    [
+      "inf",
+      "e"
+    ],
+    [
+      "infe",
+      "r"
+    ],
+    [
+      "infer",
+      "en"
+    ],
+    [
+      "inferen",
+      "c"
+    ],
+    [
+      "inferenc",
+      "e"
+    ],
+    [
+      "en",
+      "g"
+    ],
+    [
+      "eng",
+      "in"
+    ],
+    [
+      "engin",
+      "e"
+    ],
+    [
+      "engine",
+      "s"
+    ],
+    [
+      "k",
+      "v"
+    ],
+    [
+      "c",
+      "a"
+    ],
+    [
+      "ca",
+      "c"
+    ],
+    [
+      "cac",
+      "h"
+    ],
+    [
+      "cach",
+      "e"
+    ],
+    [
+      "m",
+      "an"
+    ],
+    [
+      "man",
+      "a"
+    ],
+    [
+      "mana",
+      "g"
+    ],
+    [
+      "manag",
+      "e"
+    ],
+    [
+      "manage",
+      "m"
+    ],
+    [
+      "managem",
+      "en"
+    ],
+    [
+      "managemen",
+      "t"
+    ],
+    [
+      "z",
+      "e"
+    ],
+    [
+      "ze",
+      "ro"
+    ],
+    [
+      "c",
+      "o"
+    ],
+    [
+      "co",
+      "py"
+    ],
+    [
+      "t",
+      "en"
+    ],
+    [
+      "ten",
+      "s"
+    ],
+    [
+      "tens",
+      "o"
+    ],
+    [
+      "tenso",
+      "r"
+    ],
+    [
+      "tensor",
+      "s"
+    ],
+    [
+      "a",
+      "ut"
+    ],
+    [
+      "aut",
+      "o"
+    ],
+    [
+      "auto",
+      "g"
+    ],
+    [
+      "autog",
+      "r"
+    ],
+    [
+      "autogr",
+      "a"
+    ],
+    [
+      "autogra",
+      "d"
+    ],
+    [
+      "o",
+      "p"
+    ],
+    [
+      "op",
+      "ti"
+    ],
+    [
+      "opti",
+      "m"
+    ],
+    [
+      "optim",
+      "i"
+    ],
+    [
+      "optimi",
+      "z"
+    ],
+    [
+      "optimiz",
+      "a"
+    ],
+    [
+      "optimiza",
+      "ti"
+    ],
+    [
+      "optimizati",
+      "on"
+    ]
+  ]
+}

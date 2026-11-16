@@ -355,6 +355,45 @@ impl Optimizer for Adam {
                 *t_slot += 1;
                 let bc1 = 1.0 - self.beta1.powi(*t_slot);
                 let bc2 = 1.0 - self.beta2.powi(*t_slot);
+                if !self.amsgrad
+                    && !self.maximize
+                    && p.dtype() == crate::dtype::DType::F32
+                    && g.dtype() == crate::dtype::DType::F32
+                    && p.device().is_cpu()
+                    && g.device().is_cpu()
+                {
+                    let m_buf = match m_slot {
+                        Some(m) => m,
+                        None => {
+                            *m_slot = Some(Tensor::zeros_f32(p.shape())?);
+                            m_slot.as_mut().unwrap()
+                        }
+                    };
+                    let v_buf = match v_slot {
+                        Some(v) => v,
+                        None => {
+                            *v_slot = Some(Tensor::zeros_f32(p.shape())?);
+                            v_slot.as_mut().unwrap()
+                        }
+                    };
+                    if p.storage().try_adam_step_f32(
+                        p.layout(),
+                        g.storage(),
+                        g.layout(),
+                        m_buf.storage(),
+                        v_buf.storage(),
+                        self.lr,
+                        self.beta1,
+                        self.beta2,
+                        self.eps,
+                        self.weight_decay,
+                        self.decoupled,
+                        bc1,
+                        bc2,
+                    ) {
+                        continue;
+                    }
+                }
                 let mut cur_p = p.clone();
                 if self.weight_decay != 0.0 {
                     if self.decoupled {

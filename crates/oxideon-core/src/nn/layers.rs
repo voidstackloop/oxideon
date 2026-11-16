@@ -104,7 +104,11 @@ impl Module for Linear {
                 let wt = self.weight.t()?;
                 let mm = x2.matmul(&wt)?;
                 if let Some(bias) = &self.bias {
-                    mm.add(bias)
+                    if mm.storage().try_add_bias_inplace_f32(bias.storage(), bias.layout(), self.out_features) {
+                        Ok(mm)
+                    } else {
+                        mm.add(bias)
+                    }
                 } else {
                     Ok(mm)
                 }
@@ -1029,6 +1033,27 @@ impl Module for LayerNorm {
             let b_saved = self.bias.clone();
             let eps = self.eps;
             let backward: crate::tensor::BackwardFn = Box::new(move |g: &Tensor| {
+                if !crate::tensor::is_grad_enabled()
+                    && let Some((dx_s, dw_s, db_s)) = x_saved.storage().try_layer_norm_bwd_f32(
+                        x_saved.layout(),
+                        g.storage(),
+                        g.layout(),
+                        w_saved.storage(),
+                        w_saved.layout(),
+                        eps,
+                    )
+                {
+                    let gx = x_saved
+                        .requires_grad()
+                        .then(|| Tensor::from_parts(dx_s, crate::layout::Layout::contiguous(x_saved.shape().to_vec()), false, None));
+                    let gw = w_saved
+                        .requires_grad()
+                        .then(|| Tensor::from_parts(dw_s, crate::layout::Layout::contiguous(w_saved.shape().to_vec()), false, None));
+                    let gb = b_saved
+                        .requires_grad()
+                        .then(|| Tensor::from_parts(db_s, crate::layout::Layout::contiguous(b_saved.shape().to_vec()), false, None));
+                    return Ok(vec![gx, gw, gb]);
+                }
                 let mu = x_saved.mean_axes(&[-1], true)?;
                 let centered = x_saved.sub(&mu)?;
                 let var = centered.square()?.mean_axes(&[-1], true)?;

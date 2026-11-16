@@ -245,10 +245,9 @@ fn conv2d_winograd_3x3_f32(
     let th = out_h.div_ceil(2);
     let tw = out_w.div_ceil(2);
     let tiles_per_img = th * tw;
-    let total_tiles = n * tiles_per_img;
     let l = out_h * out_w;
 
-    // 1. Filter transform U[16, c_out, c_in] = G g G^T
+    // 1. Filter transform U[16, c_out, c_in] = G g G^T (computed once across all batches)
     let u_stride = c_out * c_in;
     let mut u = vec![0.0f32; 16 * u_stride];
     for oc in 0..c_out {
@@ -273,130 +272,148 @@ fn conv2d_winograd_3x3_f32(
         }
     }
 
-    // 2. Input transform V[16, c_in, total_tiles] = B^T d B
-    let v_stride = c_in * total_tiles;
-    let mut v = crate::pool::take_f32(16 * v_stride).unwrap_or_else(|| vec![0.0; 16 * v_stride]);
+    // Process images in L3-resident micro-batches so V and M stay in cache.
+    let batch_chunk = 4.min(n.max(1));
+    let max_chunk_tiles = batch_chunk * tiles_per_img;
+    let mut v = crate::pool::take_f32(16 * c_in * max_chunk_tiles)
+        .unwrap_or_else(|| vec![0.0; 16 * c_in * max_chunk_tiles]);
+    let mut m = crate::pool::take_f32(16 * c_out * max_chunk_tiles)
+        .unwrap_or_else(|| vec![0.0; 16 * c_out * max_chunk_tiles]);
+
     let hw = h * w;
     let img_elems = c_in * hw;
-    let v_ptr = v.as_mut_ptr() as usize;
-    (0..n * c_in).into_par_iter().for_each(|bi| {
-        let b = bi / c_in;
-        let ic = bi % c_in;
-        let plane = &src[b * img_elems + ic * hw..b * img_elems + (ic + 1) * hw];
-        let v_base_ptr = v_ptr as *mut f32;
-        for ty in 0..th {
-            let iy0 = (ty * 2) as isize - ph as isize;
-            for tx in 0..tw {
-                let ix0 = (tx * 2) as isize - pw as isize;
-                let mut d = [[0.0f32; 4]; 4];
-                if iy0 >= 0 && (iy0 as usize) + 3 < h && ix0 >= 0 && (ix0 as usize) + 3 < w {
-                    let y0 = iy0 as usize;
-                    let x0 = ix0 as usize;
-                    for r in 0..4 {
-                        let row = &plane[(y0 + r) * w + x0..(y0 + r) * w + x0 + 4];
-                        d[r].copy_from_slice(row);
-                    }
-                } else {
-                    for r in 0..4 {
-                        let iy = iy0 + r as isize;
-                        if iy >= 0 && (iy as usize) < h {
-                            let row = &plane[iy as usize * w..iy as usize * w + w];
-                            for c in 0..4 {
-                                let ix = ix0 + c as isize;
-                                if ix >= 0 && (ix as usize) < w {
-                                    d[r][c] = row[ix as usize];
+    let out_img_elems = c_out * l;
+
+    for b0 in (0..n).step_by(batch_chunk) {
+        let batch_len = (n - b0).min(batch_chunk);
+        let chunk_tiles = batch_len * tiles_per_img;
+        let v_stride = c_in * chunk_tiles;
+        let m_stride = c_out * chunk_tiles;
+        let v_slice = &mut v[..16 * v_stride];
+        let m_slice_all = &mut m[..16 * m_stride];
+
+        // 2. Input transform V[16, c_in, chunk_tiles] = B^T d B
+        let src_chunk = &src[b0 * img_elems..(b0 + batch_len) * img_elems];
+        let v_ptr = v_slice.as_mut_ptr() as usize;
+        (0..batch_len * c_in).into_par_iter().for_each(|bi| {
+            let b = bi / c_in;
+            let ic = bi % c_in;
+            let plane = &src_chunk[b * img_elems + ic * hw..b * img_elems + (ic + 1) * hw];
+            let v_base_ptr = v_ptr as *mut f32;
+            for ty in 0..th {
+                let iy0 = (ty * 2) as isize - ph as isize;
+                for tx in 0..tw {
+                    let ix0 = (tx * 2) as isize - pw as isize;
+                    let mut d = [[0.0f32; 4]; 4];
+                    if iy0 >= 0 && (iy0 as usize) + 3 < h && ix0 >= 0 && (ix0 as usize) + 3 < w {
+                        let y0 = iy0 as usize;
+                        let x0 = ix0 as usize;
+                        for r in 0..4 {
+                            let row = &plane[(y0 + r) * w + x0..(y0 + r) * w + x0 + 4];
+                            d[r].copy_from_slice(row);
+                        }
+                    } else {
+                        for r in 0..4 {
+                            let iy = iy0 + r as isize;
+                            if iy >= 0 && (iy as usize) < h {
+                                let row = &plane[iy as usize * w..iy as usize * w + w];
+                                for c in 0..4 {
+                                    let ix = ix0 + c as isize;
+                                    if ix >= 0 && (ix as usize) < w {
+                                        d[r][c] = row[ix as usize];
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                let mut s = [[0.0f32; 4]; 4];
-                for c in 0..4 {
-                    s[0][c] = d[0][c] - d[2][c];
-                    s[1][c] = d[1][c] + d[2][c];
-                    s[2][c] = -d[1][c] + d[2][c];
-                    s[3][c] = d[1][c] - d[3][c];
-                }
-                let tile_idx = (b * th + ty) * tw + tx;
-                let col_off = ic * total_tiles + tile_idx;
-                for r in 0..4 {
-                    let (a0, a1, a2, a3) = (s[r][0], s[r][1], s[r][2], s[r][3]);
-                    unsafe {
-                        *v_base_ptr.add((r * 4) * v_stride + col_off) = a0 - a2;
-                        *v_base_ptr.add((r * 4 + 1) * v_stride + col_off) = a1 + a2;
-                        *v_base_ptr.add((r * 4 + 2) * v_stride + col_off) = -a1 + a2;
-                        *v_base_ptr.add((r * 4 + 3) * v_stride + col_off) = a1 - a3;
+                    let mut s = [[0.0f32; 4]; 4];
+                    for c in 0..4 {
+                        s[0][c] = d[0][c] - d[2][c];
+                        s[1][c] = d[1][c] + d[2][c];
+                        s[2][c] = -d[1][c] + d[2][c];
+                        s[3][c] = d[1][c] - d[3][c];
+                    }
+                    let tile_idx = (b * th + ty) * tw + tx;
+                    let col_off = ic * chunk_tiles + tile_idx;
+                    for r in 0..4 {
+                        let (a0, a1, a2, a3) = (s[r][0], s[r][1], s[r][2], s[r][3]);
+                        unsafe {
+                            *v_base_ptr.add((r * 4) * v_stride + col_off) = a0 - a2;
+                            *v_base_ptr.add((r * 4 + 1) * v_stride + col_off) = a1 + a2;
+                            *v_base_ptr.add((r * 4 + 2) * v_stride + col_off) = -a1 + a2;
+                            *v_base_ptr.add((r * 4 + 3) * v_stride + col_off) = a1 - a3;
+                        }
                     }
                 }
             }
-        }
-    });
-
-    // 3. 16 parallel GEMMs: M[p, c_out, total_tiles] = U[p, c_out, c_in] @ V[p, c_in, total_tiles]
-    let m_stride = c_out * total_tiles;
-    let mut m = crate::pool::take_f32(16 * m_stride).unwrap_or_else(|| vec![0.0; 16 * m_stride]);
-    m.par_chunks_mut(m_stride)
-        .enumerate()
-        .for_each(|(p, m_slice)| {
-            let up = &u[p * u_stride..(p + 1) * u_stride];
-            let vp = &v[p * v_stride..(p + 1) * v_stride];
-            crate::gemm::gemm_f32_strided_seq(
-                up,
-                0,
-                c_in as isize,
-                1,
-                vp,
-                0,
-                total_tiles as isize,
-                1,
-                m_slice,
-                c_out,
-                c_in,
-                total_tiles,
-            );
         });
-    crate::pool::give(v);
 
-    // 4. Inverse transform Y = A^T M A + bias -> out[n, c_out, out_h, out_w]
-    out.par_chunks_mut(l).enumerate().for_each(|(bo, o_plane)| {
-        let b = bo / c_out;
-        let oc = bo % c_out;
-        let bb = bias.map_or(0.0, |bv| bv[oc]);
-        for ty in 0..th {
-            let y0 = ty * 2;
-            let has_y1 = y0 + 1 < out_h;
-            for tx in 0..tw {
-                let x0 = tx * 2;
-                let has_x1 = x0 + 1 < out_w;
-                let tile_idx = (b * th + ty) * tw + tx;
-                let col_off = oc * total_tiles + tile_idx;
-                let mut mp = [0.0f32; 16];
-                for p in 0..16 {
-                    mp[p] = m[p * m_stride + col_off];
-                }
-                let mut t0 = [0.0f32; 4];
-                let mut t1 = [0.0f32; 4];
-                for c in 0..4 {
-                    t0[c] = mp[c] + mp[4 + c] + mp[8 + c];
-                    t1[c] = mp[4 + c] - mp[8 + c] - mp[12 + c];
-                }
-                let y00 = t0[0] + t0[1] + t0[2] + bb;
-                let y01 = t0[1] - t0[2] - t0[3] + bb;
-                let y10 = t1[0] + t1[1] + t1[2] + bb;
-                let y11 = t1[1] - t1[2] - t1[3] + bb;
-                o_plane[y0 * out_w + x0] = y00;
-                if has_x1 {
-                    o_plane[y0 * out_w + x0 + 1] = y01;
-                }
-                if has_y1 {
-                    o_plane[(y0 + 1) * out_w + x0] = y10;
+        // 3. 16 parallel GEMMs: M[p, c_out, chunk_tiles] = U[p, c_out, c_in] @ V[p, c_in, chunk_tiles]
+        m_slice_all
+            .par_chunks_mut(m_stride)
+            .enumerate()
+            .for_each(|(p, m_slice)| {
+                let up = &u[p * u_stride..(p + 1) * u_stride];
+                let vp = &v_slice[p * v_stride..(p + 1) * v_stride];
+                crate::gemm::gemm_f32_strided_seq(
+                    up,
+                    0,
+                    c_in as isize,
+                    1,
+                    vp,
+                    0,
+                    chunk_tiles as isize,
+                    1,
+                    m_slice,
+                    c_out,
+                    c_in,
+                    chunk_tiles,
+                );
+            });
+
+        // 4. Inverse transform Y = A^T M A + bias -> out_chunk[batch_len, c_out, out_h, out_w]
+        let out_chunk = &mut out[b0 * out_img_elems..(b0 + batch_len) * out_img_elems];
+        out_chunk.par_chunks_mut(l).enumerate().for_each(|(bo, o_plane)| {
+            let b = bo / c_out;
+            let oc = bo % c_out;
+            let bb = bias.map_or(0.0, |bv| bv[oc]);
+            for ty in 0..th {
+                let y0 = ty * 2;
+                let has_y1 = y0 + 1 < out_h;
+                for tx in 0..tw {
+                    let x0 = tx * 2;
+                    let has_x1 = x0 + 1 < out_w;
+                    let tile_idx = (b * th + ty) * tw + tx;
+                    let col_off = oc * chunk_tiles + tile_idx;
+                    let mut mp = [0.0f32; 16];
+                    for p in 0..16 {
+                        mp[p] = m_slice_all[p * m_stride + col_off];
+                    }
+                    let mut t0 = [0.0f32; 4];
+                    let mut t1 = [0.0f32; 4];
+                    for c in 0..4 {
+                        t0[c] = mp[c] + mp[4 + c] + mp[8 + c];
+                        t1[c] = mp[4 + c] - mp[8 + c] - mp[12 + c];
+                    }
+                    let y00 = t0[0] + t0[1] + t0[2] + bb;
+                    let y01 = t0[1] - t0[2] - t0[3] + bb;
+                    let y10 = t1[0] + t1[1] + t1[2] + bb;
+                    let y11 = t1[1] - t1[2] - t1[3] + bb;
+                    o_plane[y0 * out_w + x0] = y00;
                     if has_x1 {
-                        o_plane[(y0 + 1) * out_w + x0 + 1] = y11;
+                        o_plane[y0 * out_w + x0 + 1] = y01;
+                    }
+                    if has_y1 {
+                        o_plane[(y0 + 1) * out_w + x0] = y10;
+                        if has_x1 {
+                            o_plane[(y0 + 1) * out_w + x0 + 1] = y11;
+                        }
                     }
                 }
             }
-        }
-    });
+        });
+    }
+    crate::pool::give(v);
     crate::pool::give(m);
 }
 

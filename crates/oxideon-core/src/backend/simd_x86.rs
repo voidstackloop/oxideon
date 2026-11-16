@@ -1085,3 +1085,269 @@ pub fn relu_f32_slice(src: &[f32], dst: &mut [f32]) -> bool {
     }
     false
 }
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn add_bias_row_f32_avx2_impl(row: &mut [f32], bias: &[f32]) {
+    let n = row.len();
+    let rp = row.as_mut_ptr();
+    let bp = bias.as_ptr();
+    let mut i = 0usize;
+    while i + 16 <= n {
+        let r0 = unsafe { _mm256_loadu_ps(rp.add(i)) };
+        let b0 = unsafe { _mm256_loadu_ps(bp.add(i)) };
+        let r1 = unsafe { _mm256_loadu_ps(rp.add(i + 8)) };
+        let b1 = unsafe { _mm256_loadu_ps(bp.add(i + 8)) };
+        unsafe {
+            _mm256_storeu_ps(rp.add(i), _mm256_add_ps(r0, b0));
+            _mm256_storeu_ps(rp.add(i + 8), _mm256_add_ps(r1, b1));
+        }
+        i += 16;
+    }
+    while i + 8 <= n {
+        let r0 = unsafe { _mm256_loadu_ps(rp.add(i)) };
+        let b0 = unsafe { _mm256_loadu_ps(bp.add(i)) };
+        unsafe { _mm256_storeu_ps(rp.add(i), _mm256_add_ps(r0, b0)) };
+        i += 8;
+    }
+    while i < n {
+        unsafe { *rp.add(i) += *bp.add(i) };
+        i += 1;
+    }
+}
+
+pub fn add_bias_row_f32(row: &mut [f32], bias: &[f32]) -> bool {
+    debug_assert_eq!(row.len(), bias.len());
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        unsafe { add_bias_row_f32_avx2_impl(row, bias) };
+        return true;
+    }
+    false
+}
+
+/// Single-pass fused Adam / AdamW parameter update in AVX2+FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn adam_step_f32_avx2_impl(
+    p: &mut [f32],
+    g: &[f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    decoupled: bool,
+    inv_bc1: f32,
+    inv_bc2: f32,
+) {
+    let n = p.len();
+    let pp = p.as_mut_ptr();
+    let gp = g.as_ptr();
+    let mp = m.as_mut_ptr();
+    let vp = v.as_mut_ptr();
+
+    let vb1 = _mm256_set1_ps(beta1);
+    let v1mb1 = _mm256_set1_ps(1.0 - beta1);
+    let vb2 = _mm256_set1_ps(beta2);
+    let v1mb2 = _mm256_set1_ps(1.0 - beta2);
+    let v_inv_bc1 = _mm256_set1_ps(inv_bc1);
+    let v_inv_bc2 = _mm256_set1_ps(inv_bc2);
+    let v_lr = _mm256_set1_ps(lr);
+    let v_eps = _mm256_set1_ps(eps);
+    let v_wd = _mm256_set1_ps(weight_decay);
+    let v_decay = _mm256_set1_ps(1.0 - lr * weight_decay);
+
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let mut pv = unsafe { _mm256_loadu_ps(pp.add(i)) };
+        let mut gv = unsafe { _mm256_loadu_ps(gp.add(i)) };
+        if weight_decay != 0.0 {
+            if decoupled {
+                pv = _mm256_mul_ps(pv, v_decay);
+            } else {
+                gv = _mm256_fmadd_ps(pv, v_wd, gv);
+            }
+        }
+        let mv = unsafe { _mm256_loadu_ps(mp.add(i)) };
+        let vv = unsafe { _mm256_loadu_ps(vp.add(i)) };
+        let m_new = _mm256_fmadd_ps(vb1, mv, _mm256_mul_ps(v1mb1, gv));
+        let g2 = _mm256_mul_ps(gv, gv);
+        let v_new = _mm256_fmadd_ps(vb2, vv, _mm256_mul_ps(v1mb2, g2));
+        unsafe {
+            _mm256_storeu_ps(mp.add(i), m_new);
+            _mm256_storeu_ps(vp.add(i), v_new);
+        }
+        let m_hat = _mm256_mul_ps(m_new, v_inv_bc1);
+        let v_hat = _mm256_mul_ps(v_new, v_inv_bc2);
+        let denom = _mm256_add_ps(_mm256_sqrt_ps(v_hat), v_eps);
+        let step = _mm256_mul_ps(_mm256_div_ps(m_hat, denom), v_lr);
+        unsafe { _mm256_storeu_ps(pp.add(i), _mm256_sub_ps(pv, step)) };
+        i += 8;
+    }
+    while i < n {
+        let mut pv = unsafe { *pp.add(i) };
+        let mut gv = unsafe { *gp.add(i) };
+        if weight_decay != 0.0 {
+            if decoupled {
+                pv *= 1.0 - lr * weight_decay;
+            } else {
+                gv += pv * weight_decay;
+            }
+        }
+        let m_new = beta1 * unsafe { *mp.add(i) } + (1.0 - beta1) * gv;
+        let v_new = beta2 * unsafe { *vp.add(i) } + (1.0 - beta2) * gv * gv;
+        unsafe {
+            *mp.add(i) = m_new;
+            *vp.add(i) = v_new;
+            *pp.add(i) = pv - lr * (m_new * inv_bc1) / ((v_new * inv_bc2).sqrt() + eps);
+        }
+        i += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn adam_step_f32_slice(
+    p: &mut [f32],
+    g: &[f32],
+    m: &mut [f32],
+    v: &mut [f32],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    decoupled: bool,
+    inv_bc1: f32,
+    inv_bc2: f32,
+) -> bool {
+    debug_assert_eq!(p.len(), g.len());
+    debug_assert_eq!(p.len(), m.len());
+    debug_assert_eq!(p.len(), v.len());
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        unsafe {
+            adam_step_f32_avx2_impl(p, g, m, v, lr, beta1, beta2, eps, weight_decay, decoupled, inv_bc1, inv_bc2);
+        }
+        return true;
+    }
+    false
+}
+
+/// Fused single-row LayerNorm backward (`dx`, accumulating `dw` & `db` into thread-local buffers).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn layer_norm_row_bwd_f32_avx2_impl(
+    x: &[f32],
+    g: &[f32],
+    w: &[f32],
+    dx: &mut [f32],
+    dw: &mut [f32],
+    db: &mut [f32],
+    eps: f32,
+) {
+    let n = x.len();
+    let xp = x.as_ptr();
+    let gp = g.as_ptr();
+    let wp = w.as_ptr();
+    let dxp = dx.as_mut_ptr();
+    let dwp = dw.as_mut_ptr();
+    let dbp = db.as_mut_ptr();
+
+    let mean = unsafe { sum_f32_avx2_impl(x) } / (n as f32);
+    let vmean = _mm256_set1_ps(mean);
+
+    let mut vvar = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let d = _mm256_sub_ps(unsafe { _mm256_loadu_ps(xp.add(i)) }, vmean);
+        vvar = _mm256_fmadd_ps(d, d, vvar);
+        i += 8;
+    }
+    let mut var_sum = unsafe { hsum256_ps(vvar) };
+    while i < n {
+        let d = unsafe { *xp.add(i) } - mean;
+        var_sum += d * d;
+        i += 1;
+    }
+    let inv_std = 1.0f32 / (var_sum / (n as f32) + eps).sqrt();
+    let vinv = _mm256_set1_ps(inv_std);
+
+    // Pass 2: compute sum1 = sum(g * w) and sum2 = sum(g * w * x_hat), plus accumulate dw & db
+    let mut vs1 = _mm256_setzero_ps();
+    let mut vs2 = _mm256_setzero_ps();
+    i = 0;
+    while i + 8 <= n {
+        let xv = unsafe { _mm256_loadu_ps(xp.add(i)) };
+        let gv = unsafe { _mm256_loadu_ps(gp.add(i)) };
+        let wv = unsafe { _mm256_loadu_ps(wp.add(i)) };
+        let xhat = _mm256_mul_ps(_mm256_sub_ps(xv, vmean), vinv);
+        let gxhat = _mm256_mul_ps(gv, wv);
+        vs1 = _mm256_add_ps(vs1, gxhat);
+        vs2 = _mm256_fmadd_ps(gxhat, xhat, vs2);
+        let cur_dw = unsafe { _mm256_loadu_ps(dwp.add(i)) };
+        let cur_db = unsafe { _mm256_loadu_ps(dbp.add(i)) };
+        unsafe {
+            _mm256_storeu_ps(dwp.add(i), _mm256_fmadd_ps(gv, xhat, cur_dw));
+            _mm256_storeu_ps(dbp.add(i), _mm256_add_ps(cur_db, gv));
+        }
+        i += 8;
+    }
+    let mut s1 = unsafe { hsum256_ps(vs1) };
+    let mut s2 = unsafe { hsum256_ps(vs2) };
+    while i < n {
+        let xhat = (unsafe { *xp.add(i) } - mean) * inv_std;
+        let gv = unsafe { *gp.add(i) };
+        let gxhat = gv * unsafe { *wp.add(i) };
+        s1 += gxhat;
+        s2 += gxhat * xhat;
+        unsafe {
+            *dwp.add(i) += gv * xhat;
+            *dbp.add(i) += gv;
+        }
+        i += 1;
+    }
+
+    // Pass 3: dx = inv_std * (g * w - (s1 + x_hat * s2) / n)
+    let inv_n = 1.0f32 / (n as f32);
+    let vm1 = _mm256_set1_ps(s1 * inv_n);
+    let vm2 = _mm256_set1_ps(s2 * inv_n);
+    i = 0;
+    while i + 8 <= n {
+        let xv = unsafe { _mm256_loadu_ps(xp.add(i)) };
+        let gv = unsafe { _mm256_loadu_ps(gp.add(i)) };
+        let wv = unsafe { _mm256_loadu_ps(wp.add(i)) };
+        let xhat = _mm256_mul_ps(_mm256_sub_ps(xv, vmean), vinv);
+        let gxhat = _mm256_mul_ps(gv, wv);
+        let sub = _mm256_fmadd_ps(xhat, vm2, vm1);
+        let dxv = _mm256_mul_ps(_mm256_sub_ps(gxhat, sub), vinv);
+        unsafe { _mm256_storeu_ps(dxp.add(i), dxv) };
+        i += 8;
+    }
+    while i < n {
+        let xhat = (unsafe { *xp.add(i) } - mean) * inv_std;
+        let gxhat = unsafe { *gp.add(i) * *wp.add(i) };
+        unsafe { *dxp.add(i) = (gxhat - s1 * inv_n - xhat * (s2 * inv_n)) * inv_std };
+        i += 1;
+    }
+}
+
+pub fn layer_norm_row_bwd_f32(
+    x: &[f32],
+    g: &[f32],
+    w: &[f32],
+    dx: &mut [f32],
+    dw: &mut [f32],
+    db: &mut [f32],
+    eps: f32,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        unsafe { layer_norm_row_bwd_f32_avx2_impl(x, g, w, dx, dw, db, eps) };
+        return true;
+    }
+    false
+}
