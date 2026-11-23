@@ -4,14 +4,14 @@ default-members = [".", "crates/oxideon-core", "crates/oxideon-engines"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-oxideon-core = { path = "crates/oxideon-core", version = "0.0.1", default-features = false }
-oxideon-engines = { path = "crates/oxideon-engines", version = "0.0.1" }
+oxideon-core = { path = "crates/oxideon-core", version = "0.1.0", default-features = false }
+oxideon-engines = { path = "crates/oxideon-engines", version = "0.1.0" }
 
 # Index loops are used throughout the numeric code; allow the lint workspace-wide instead of per file.
 [workspace.lints.clippy]

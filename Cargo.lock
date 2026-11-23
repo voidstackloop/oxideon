@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "oxideon"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "oxideon-core",
  "oxideon-engines",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "oxideon-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "bytemuck",
  "gemm",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "oxideon-engines"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "oxideon-core",
 ]

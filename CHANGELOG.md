@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 - 2026-11-23
 
 ### Speed (accuracy unchanged unless noted)
 - Balanced `gelu` 150 -> 135 us per 1M elements (PyTorch 111 us): the tail exponent `poly - z^2` is never positive, so it uses an `exp` without the
@@ -1010,10 +1010,9 @@
   loops, and an exact all-dtype roundtrip test (f32/f64/i32/i64/u8/bool/f16/bf16, huge i64, strided views) pins the
   behavior (`test_save_load_roundtrip_all_dtypes_exact`).
 
-## 0.1.0
+## 0.0.1
 
-First semver version. Earlier numbers (`v1.0.0` … `v1000.0.0`) were **engine milestones**, not crate releases: the crate was never
-published at those versions (see [docs/ENGINES_CATALOG.md](docs/ENGINES_CATALOG.md)).
+First semver version.
 
 ### Changed
 - Split into a workspace: `oxideon-core` (tensors, autograd, nn, ...), `oxideon-engines` (science / physics / crypto-demo /
