@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Oxideon core: multi-dtype strided-view tensors, higher-order autograd, neural-network layers, optimizers and quantization"
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
 keywords = ["deep-learning", "autograd", "neural-network", "tensor", "machine-learning"]
 categories = ["science", "mathematics"]
 
