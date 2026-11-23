@@ -68,8 +68,8 @@ run with `cargo run --release --example <name>`.
 
 | Example | What it shows | Run |
 |---|---|---|
-| `python_millennial_showcase.py` | Tensors, higher-order autograd, v100→v1000 centennial cascade | `python3 examples/python_millennial_showcase.py` |
-| `python_quincentennial_showcase.py` | Tensors, autograd, v100→v500 cascade, quantization validation | `python3 examples/python_quincentennial_showcase.py` |
+| `python_millennial_showcase.py` | Tensors, higher-order autograd, engines 100→1000 centennial cascade | `python3 examples/python_millennial_showcase.py` |
+| `python_quincentennial_showcase.py` | Tensors, autograd, engines 100→500 cascade, quantization validation | `python3 examples/python_quincentennial_showcase.py` |
 
 ## Rust
 
@@ -103,8 +103,8 @@ run with `cargo run --release --example <name>`.
 
 | Example | What it shows | Run |
 |---|---|---|
-| `millennial_singularity` | v1000 apex synthesis + coupled autograd | `cargo run --release --example millennial_singularity` |
-| `quincentennial_singularity` | v500 synthesis + coupled autograd | `cargo run --release --example quincentennial_singularity` |
+| `millennial_singularity` | engine 1000 apex synthesis + coupled autograd | `cargo run --release --example millennial_singularity` |
+| `quincentennial_singularity` | engine 500 synthesis + coupled autograd | `cargo run --release --example quincentennial_singularity` |
 | `gpu_matmul_bench` | CPU vs wgpu square matmul (GFLOP/s + numerics check) | `cargo run --release --features wgpu --example gpu_matmul_bench` |
 
 ### Browser

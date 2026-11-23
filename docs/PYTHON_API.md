@@ -382,11 +382,11 @@ See [SCIENTIFIC_AI_MODULES.md](SCIENTIFIC_AI_MODULES.md) for full scientific doc
 
 Provides access to all 100 decadal milestone synthesis engines:
 
-| Engine Class | Milestone | Output Type |
+| Engine Class | Engine no. | Output Type |
 |---|---|---|
-| `GrandCentennialSingularityEngineX` | v100.0.0 | `GrandCentennialSingularityReportX` |
-| `GrandBicentennialSingularityEngineXX` | v200.0.0 | `float` invariant |
-| `GrandOmniMillennialEngineC` | v1000.0.0 | `float` Millennial Invariant |
+| `GrandCentennialSingularityEngineX` | 100 | `GrandCentennialSingularityReportX` |
+| `GrandBicentennialSingularityEngineXX` | 200 | `float` invariant |
+| `GrandOmniMillennialEngineC` | 1000 | `float` Millennial Invariant |
 
 ```python
 import oxideon as ox

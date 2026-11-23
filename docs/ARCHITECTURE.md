@@ -1,6 +1,6 @@
 # Oxideon Architecture & System Design
 
-**Crate version:** `0.1.0` · **Engine milestones:** v1 – v1000 (The Millennial Singularity Apex, see [ENGINES_CATALOG.md](ENGINES_CATALOG.md))  
+**Crate version:** `0.1.0` · **Engines:** 1,000 (The Millennial Singularity Apex, see [ENGINES_CATALOG.md](ENGINES_CATALOG.md))  
 **Edition:** Rust 2024 (1.85+) | **Python ABI:** CPython `abi3` ($\ge 3.9$)  
 **Core Features:** Zero-Copy Strided Views, Higher-Order Autograd, Symbolic Graph Compiler, Autonomous LLM Quantization, Paged Attention & Speculative Decoding, Cloud Native Storage Streaming, 100 Decadal Milestone Syntheses, and Zero-GIL PyO3 Concurrency.
 
@@ -89,23 +89,23 @@ Supported precision modes:
 
 ---
 
-## 5. The Millennial Singularity Architecture (v1.0.0 – v1000.0.0)
+## 5. The Millennial Singularity Architecture
 
-Oxideon's 1,000 versions are structured as a 100-tier hierarchical decadal pyramid culminating in `GrandOmniMillennialEngineC`:
+Oxideon's 1,000 engines are structured as a 100-tier hierarchical decadal pyramid culminating in `GrandOmniMillennialEngineC`:
 
 ```mermaid
 graph TD
-    L100["GrandOmniMillennialEngineC (v1000.0.0)"]
-    L90["GrandOmniNonacentennialEngineXC (v900.0.0)"]
-    L80["GrandOmniOctacentennialEngineLXXX (v800.0.0)"]
-    L70["GrandOmniHeptacentennialEngineLXX (v700.0.0)"]
-    L60["GrandOmniHexacentennialEngineLX (v600.0.0)"]
-    L50["GrandOmniQuincentennialEngineL (v500.0.0)"]
-    L40["GrandOmniQuadricentennialEngineXL (v400.0.0)"]
-    L30["GrandOmniTricentennialEngineXXX (v300.0.0)"]
-    L20["GrandBicentennialSingularityEngineXX (v200.0.0)"]
-    L10["GrandCentennialSingularityEngineX (v100.0.0)"]
-    L1["GrandOmniEngine (v10.0.0)"]
+    L100["GrandOmniMillennialEngineC"]
+    L90["GrandOmniNonacentennialEngineXC"]
+    L80["GrandOmniOctacentennialEngineLXXX"]
+    L70["GrandOmniHeptacentennialEngineLXX"]
+    L60["GrandOmniHexacentennialEngineLX"]
+    L50["GrandOmniQuincentennialEngineL"]
+    L40["GrandOmniQuadricentennialEngineXL"]
+    L30["GrandOmniTricentennialEngineXXX"]
+    L20["GrandBicentennialSingularityEngineXX"]
+    L10["GrandCentennialSingularityEngineX"]
+    L1["GrandOmniEngine"]
     
     L100 --> L90
     L90 -.-> L80
@@ -283,4 +283,4 @@ For detailed guides, refer to the following specialized manuals:
 - [Benchmarks & Performance Analysis](BENCHMARKS.md): Detailed complexity proofs, microbenchmarks, and empirical speedups.
 - [Numerical Accuracy vs PyTorch](NUMERICAL_ACCURACY.md): worst/mean float32 error against a float64 reference, the matmul precision modes, and how to reproduce.
 - [Getting Started & Hands-on Tutorial](TUTORIAL.md): Step-by-step developer tutorial from tensor basics to foundation models.
-- [Engines Catalog & Milestone Taxonomy](ENGINES_CATALOG.md): Complete list of all 1,000 engine milestones across 100 decadal eras.
+- [Engines Catalog & Milestone Taxonomy](ENGINES_CATALOG.md): Complete list of all 1,000 engines across 100 decadal eras.

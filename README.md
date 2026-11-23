@@ -4,6 +4,9 @@
 
 **A fast, Hackable Deep Learning & Tensor Library in Rust — with a PyTorch-friendly Python API.**
 
+[![Browser demo](https://img.shields.io/badge/browser%20demo-try%20it%20(simulated%20UI)-brightgreen.svg)](https://voidstackloop.github.io/oxideon/)
+[![Portfolio](https://img.shields.io/badge/portfolio-voidstackloop-blueviolet.svg)](https://github.com/voidstackloop/portfolio)
+
 [![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](https://github.com/voidstackloop/oxideon/releases/tag/v0.1.0)
 [![Python](https://img.shields.io/badge/python-3.9%20%E2%80%93%203.13%20(abi3)-blue.svg)](pyproject.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20(1.85%2B)-orange.svg)](https://www.rust-lang.org)
