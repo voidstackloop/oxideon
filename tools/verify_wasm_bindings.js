@@ -3,7 +3,7 @@
 //   wasm-bindgen target/wasm32-unknown-unknown/release/oxideon.wasm --target nodejs --out-dir out
 //   node tools/verify_wasm_bindings.js out
 const path = require("path");
-const { WasmTensor, WasmInferenceSession } = require(path.resolve(process.argv[2], "oxideon.js"));
+const { WasmTensor, WasmInferenceSession, WasmMlpTrainer } = require(path.resolve(process.argv[2], "oxideon.js"));
 let ok = true;
 const check = (name, cond) => { console.log(`${cond ? "OK  " : "FAIL"} ${name}`); ok = ok && !!cond; };
 const near = (a, b, tol = 1e-5) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) <= tol * (1 + Math.abs(b[i])));
@@ -31,5 +31,13 @@ try { a.matmul(a); } catch (e) { threw = e instanceof Error && /shape|matmul/i.t
 check("errors become JS exceptions with a message", threw);
 const s = new WasmInferenceSession();
 check("WasmInferenceSession", typeof s.has_webgpu() === "boolean");
-[a, b, x, s].forEach((o) => o.free());
+const ax = WasmTensor.from_f32_array(new Float32Array([2, -1]), new Uint32Array([1, 2]));
+ax.set_requires_grad(true);
+const al = ax.mul(ax).mean();
+al.backward();
+check("autograd backward", near(Array.from(ax.grad().to_f32_vec()), [2, -1]));
+const tr = new WasmMlpTrainer(8, 0.05);
+const res = tr.train_steps(new Float32Array([0, 0, 1, 1, 1, 0, 0, 1]), new Uint32Array([0, 0, 1, 1]), 5);
+check("WasmMlpTrainer", res.length === 2 && Number.isFinite(res[0]));
+[a, b, x, s, ax, al, tr].forEach((o) => o.free());
 process.exit(ok ? 0 : 1);

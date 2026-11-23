@@ -8,6 +8,8 @@
 [![Portfolio](https://img.shields.io/badge/portfolio-voidstackloop-blueviolet.svg)](https://github.com/voidstackloop/portfolio)
 
 [![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](https://github.com/voidstackloop/oxideon/releases/tag/v0.1.0)
+[![PyPI](https://img.shields.io/pypi/v/oxideon.svg)](https://pypi.org/project/oxideon/)
+[![crates.io](https://img.shields.io/crates/v/oxideon.svg)](https://crates.io/crates/oxideon)
 [![Python](https://img.shields.io/badge/python-3.9%20%E2%80%93%203.13%20(abi3)-blue.svg)](pyproject.toml)
 [![Rust](https://img.shields.io/badge/rust-2024%20(1.85%2B)-orange.svg)](https://www.rust-lang.org)
 [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen.svg)]()
@@ -57,9 +59,30 @@ pip install maturin numpy pytest
 maturin develop --release
 ```
 
-### Use from Rust
+### Use from Rust (crates.io)
 
-Add `oxideon-core` to your `Cargo.toml` or run the built-in tests and examples directly:
+All three workspace crates are published on [crates.io](https://crates.io):
+
+- **[`oxideon`](https://crates.io/crates/oxideon)** — facade crate re-exporting both `oxideon-core` and `oxideon-engines`
+- **[`oxideon-core`](https://crates.io/crates/oxideon-core)** — tensors, autograd, layers, optimizers, quantization, serialization, and backends
+- **[`oxideon-engines`](https://crates.io/crates/oxideon-engines)** — science, physics, and simulation engines built on `oxideon-core`
+
+```bash
+cargo add oxideon          # full facade crate (oxideon-core + oxideon-engines)
+# or pick only what you need:
+cargo add oxideon-core
+cargo add oxideon-engines
+```
+
+```toml
+[dependencies]
+oxideon = "0.1"
+# or individually:
+oxideon-core = "0.1"
+oxideon-engines = "0.1"
+```
+
+Run the built-in tests and examples from source:
 
 ```bash
 cargo test -p oxideon-core --lib
