@@ -248,6 +248,7 @@ cargo build --release --example accuracy_dump
 python benchmarks/accuracy_vs_pytorch.py                   # all 40 cases, worst + mean, x better, verdict
 python benchmarks/accuracy_vs_pytorch.py matmul_512 tanh   # selected cases
 OXIDEON_PRECISION=highest python benchmarks/accuracy_vs_pytorch.py matmul_512 matmul_k8192   # default is balanced
+cargo build --release --example core_ops_bench && python benchmarks/core_ops_bench_compare.py   # time and error per operation, side by side
 ```
 
 Needs `numpy` and `torch`. Inputs are seeded, so the numbers reproduce on the same machine; the `exp`/`sigmoid`/`tanh` vector paths

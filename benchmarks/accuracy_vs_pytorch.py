@@ -184,8 +184,21 @@ case("mse", {"a": f32(rng.standard_normal(2_000_000) + 100), "b": f32(rng.standa
      lambda i: (lambda d: ((d ** 2).mean(), (d ** 2).mean()))(i["a"].astype(np.float64) - i["b"].astype(np.float64)))
 
 
-def main():
-    only = set(sys.argv[1:])
+def better(t, o):
+    """How many times smaller oxideon's error is than torch's (> 1 = oxideon more accurate)."""
+    if t < 1e-3 and o < 1e-3:
+        return float("nan")  # both exact to the last bit: nothing to compare
+    return t / o if o > 0 else float("inf")
+
+
+def verdict_of(bw, bm):
+    both = [x for x in (bw, bm) if x == x]
+    lo = min(both) if both else float("nan")
+    return "exact" if not both else ">=2x" if lo >= 2 else ">=1.5x" if lo >= 1.5 else "better" if lo > 1.05 else "tie" if lo >= 0.95 else "WORSE"
+
+
+def measure(only=()):
+    """Runs the cases (all, or the names in `only`); returns {name: (worst_ox, worst_torch, x_better, mean_ox, mean_torch, x_better, verdict)}."""
     work = Path(tempfile.mkdtemp(prefix="oxideon_accuracy_"))
     manifest = []
     selected = {k: v for k, v in cases.items() if not only or k in only}
@@ -196,18 +209,7 @@ def main():
             manifest.append(f"{name} {iname} {','.join(map(str, arr.shape))} {fn}")
     (work / "manifest.txt").write_text("\n".join(manifest))
     subprocess.run([str(EXE), str(work)], check=True, stdout=subprocess.DEVNULL)
-
-    def better(t, o):
-        """How many times smaller oxideon's error is than torch's (> 1 = oxideon more accurate)."""
-        if t < 1e-3 and o < 1e-3:
-            return float("nan")  # both exact to the last bit: nothing to compare
-        return t / o if o > 0 else float("inf")
-
-    def fmt(x):
-        return "  tie" if x != x else "  inf" if x == float("inf") else f"{x:5.2f}"
-
-    print(f"{'case':20} | {'worst: oxideon':>14} {'torch':>10} {'x better':>9} | {'mean: oxideon':>13} {'torch':>10} {'x better':>9} | verdict")
-    rows = []
+    rows = {}
     for name, (inputs, torch_fn, ref_fn) in selected.items():
         ref, scale = ref_fn(inputs)
         ref = np.asarray(ref, dtype=np.float64)
@@ -218,14 +220,22 @@ def main():
         e_ox, e_th = np.abs(ox - ref) / scale / EPS, np.abs(th - ref) / scale / EPS
         wo, wt, mo, mt = e_ox.max(), e_th.max(), e_ox.mean(), e_th.mean()
         bw, bm = better(wt, wo), better(mt, mo)
-        both = [x for x in (bw, bm) if x == x]
-        lo = min(both) if both else float("nan")
-        verdict = "exact" if not both else ">=2x" if lo >= 2 else ">=1.5x" if lo >= 1.5 else "better" if lo > 1.05 else "tie" if lo >= 0.95 else "WORSE"
-        rows.append((name, verdict))
+        rows[name] = (wo, wt, bw, mo, mt, bm, verdict_of(bw, bm))
+    return rows
+
+
+def fmt(x):
+    return "  tie" if x != x else "  inf" if x == float("inf") else f"{x:5.2f}"
+
+
+def main():
+    rows = measure(set(sys.argv[1:]))
+    print(f"{'case':20} | {'worst: oxideon':>14} {'torch':>10} {'x better':>9} | {'mean: oxideon':>13} {'torch':>10} {'x better':>9} | verdict")
+    for name, (wo, wt, bw, mo, mt, bm, verdict) in rows.items():
         print(f"{name:20} | {wo:14.4f} {wt:10.4f} {fmt(bw):>9} | {mo:13.5f} {mt:10.5f} {fmt(bm):>9} | {verdict}")
     print()
     for v in ("exact", ">=2x", ">=1.5x", "better", "tie", "WORSE"):
-        names = [n for n, x in rows if x == v]
+        names = [n for n, r in rows.items() if r[6] == v]
         if names:
             print(f"{v:>7} ({len(names)}): {', '.join(names)}")
     print("\nverdict =the smaller of the two 'x better' figures (worst and mean); tie = within 5%; exact = both below 0.001 half-ulps.")
