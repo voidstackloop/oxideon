@@ -196,12 +196,12 @@ fn max_diff(a: &[u8], b: &[u8]) -> i32 {
 fn grayscale_round_trip_with_and_without_restart_intervals() {
     for (w, h) in [(8, 8), (21, 13), (50, 33)] {
         let img = pattern(w, h, 0);
-        let plain = encode(&[img.clone()], w, h, &[(1, 1)], 0, &[1], None);
+        let plain = encode(std::slice::from_ref(&img), w, h, &[(1, 1)], 0, &[1], None);
         let (px, dw, dh, c) = decode_jpeg(&plain).unwrap();
         assert_eq!((dw, dh, c), (w, h, 1));
         assert!(max_diff(&px, &img) <= 2, "{w}x{h} grayscale round trip");
         for ri in [1usize, 2, 3, 5] {
-            let rst = encode(&[img.clone()], w, h, &[(1, 1)], ri, &[1], None);
+            let rst = encode(std::slice::from_ref(&img), w, h, &[(1, 1)], ri, &[1], None);
             assert_eq!(decode_jpeg(&rst).unwrap().0, px, "{w}x{h} restart interval {ri} must decode identically");
         }
     }

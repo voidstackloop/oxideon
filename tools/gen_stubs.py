@@ -535,6 +535,8 @@ def emit_class(name, cls, table, stats):
                 ignore = "  # type: ignore[override]" if name == "Tensor" and member in ("__eq__", "__ne__") else ""
                 body.append(f"    def {member}{sig}: ...{ignore}")
             continue
+        if member.startswith("_") and member.endswith("_"):
+            continue  # CPython Enum/internal sunder hooks vary across Python versions
         raw = inspect.getattr_static(cls, member)
         ptypes, ret = types_of(member)
         if isinstance(raw, staticmethod):
