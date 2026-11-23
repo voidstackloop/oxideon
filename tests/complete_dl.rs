@@ -752,7 +752,8 @@ fn test_graph_muon_lbfgs_ode_cfm_speculative_kan_and_trainer() -> Result<()> {
     assert!(profile.graph_stats.estimated_flops > 0);
     let dot = export_graphviz_dot(&[lin.forward(&x_g)?]);
     assert!(dot.contains("digraph OxideonAutograd"));
-    assert!(dot.contains("matmul"));
+    // Linear records one fused "linear" node on the CPU fast path, a matmul chain elsewhere
+    assert!(dot.contains("linear") || dot.contains("matmul"));
 
     // 2. Muon (Newton-Schulz Orthogonalized Momentum) & L-BFGS Quasi-Newton
     let g_mat = Tensor::randn(&[4, 6])?;

@@ -79,7 +79,21 @@ fn f32_unary_contiguous(a: &[f32], op: UnaryOp) -> Vec<f32> {
         UnaryOp::Rsqrt => arm!(UnaryOp::Rsqrt),
         UnaryOp::Sin => arm!(UnaryOp::Sin),
         UnaryOp::Cos => arm!(UnaryOp::Cos),
-        UnaryOp::Tanh => arm!(UnaryOp::Tanh),
+        UnaryOp::Tanh => {
+            if super::simd_x86::has_avx2_fma() {
+                let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+                #[cfg(feature = "rayon")]
+                if a.len() >= 16384 {
+                    out.par_chunks_mut(8192).zip(a.par_chunks(8192)).for_each(|(o, s)| {
+                        super::simd_x86::tanh_f32_slice(s, o);
+                    });
+                    return out;
+                }
+                super::simd_x86::tanh_f32_slice(a, &mut out);
+                return out;
+            }
+            arm!(UnaryOp::Tanh)
+        }
         UnaryOp::Sigmoid => {
             if super::simd_x86::has_avx2_fma() {
                 let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
@@ -114,14 +128,16 @@ fn f32_unary_contiguous(a: &[f32], op: UnaryOp) -> Vec<f32> {
         UnaryOp::Gelu => {
             if super::simd_x86::has_avx2_fma() {
                 let mut out = crate::pool::take::<f32>(a.len()).unwrap_or_else(|| vec![0.0; a.len()]);
+                // the mode is read once for the whole tensor, so a concurrent `set_precision_mode` cannot mix two error levels in one result
+                let fast = crate::gemm::precision_mode() == crate::gemm::PrecisionMode::Fastest;
                 #[cfg(feature = "rayon")]
                 if a.len() >= 16384 {
                     out.par_chunks_mut(8192).zip(a.par_chunks(8192)).for_each(|(o, s)| {
-                        super::simd_x86::gelu_f32_slice(s, o);
+                        super::simd_x86::gelu_f32_slice(s, o, fast);
                     });
                     return out;
                 }
-                super::simd_x86::gelu_f32_slice(a, &mut out);
+                super::simd_x86::gelu_f32_slice(a, &mut out, fast);
                 return out;
             }
             arm!(UnaryOp::Gelu)
@@ -157,6 +173,327 @@ fn f32_unary_contiguous(a: &[f32], op: UnaryOp) -> Vec<f32> {
     }
 }
 
+/// Columns per task of a reduction over leading axes: 256 at most (a block's accumulators stay in L1), narrower when the matrix is
+/// so slim that 256-wide blocks would leave most cores idle (1024 columns would otherwise make only four tasks).
+fn leading_block(outer: usize) -> usize {
+    #[cfg(feature = "rayon")]
+    let threads = rayon::current_num_threads();
+    #[cfg(not(feature = "rayon"))]
+    let threads = 1usize;
+    ((outer / (2 * threads).max(1)) / 16 * 16).clamp(64, 256).min(outer).max(1)
+}
+
+/// [`add_f32_into_f64`] over a whole matrix, in parallel when it is large.
+pub(crate) fn add_f32_into_f64_par(acc: &mut [f64], row: &[f32]) {
+    #[cfg(feature = "rayon")]
+    if acc.len() >= 1 << 16 {
+        acc.par_chunks_mut(1 << 14).zip(row.par_chunks(1 << 14)).for_each(|(a, r)| add_f32_into_f64(a, r));
+        return;
+    }
+    add_f32_into_f64(acc, row);
+}
+
+/// `acc[j] += row[j]` with the `f32` row converted to `f64`: a sum over many rows accumulates without the rounding of a long `f32` run.
+#[inline]
+fn add_f32_into_f64(acc: &mut [f64], row: &[f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if super::simd_x86::has_avx2_fma() {
+        // SAFETY: AVX2 was detected.
+        unsafe { add_f32_into_f64_avx2(acc, row) };
+        return;
+    }
+    for (a, &v) in acc.iter_mut().zip(row) {
+        *a += v as f64;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn add_f32_into_f64_avx2(acc: &mut [f64], row: &[f32]) {
+    use std::arch::x86_64::*;
+    let n = acc.len().min(row.len());
+    let (ap, rp) = (acc.as_mut_ptr(), row.as_ptr());
+    let mut i = 0usize;
+    while i + 4 <= n {
+        // SAFETY: i + 4 <= n for both slices.
+        unsafe { _mm256_storeu_pd(ap.add(i), _mm256_add_pd(_mm256_loadu_pd(ap.add(i)), _mm256_cvtps_pd(_mm_loadu_ps(rp.add(i))))) };
+        i += 4;
+    }
+    while i < n {
+        unsafe { *ap.add(i) += *rp.add(i) as f64 };
+        i += 1;
+    }
+}
+
+/// Mean of an `f32` slice accumulated in `f64`: no rounding of a long `f32` running sum, so a row such as `1000 + noise` keeps its
+/// mean to the last bit instead of to a few thousand ulps.
+pub(crate) fn mean_f64(x: &[f32]) -> f64 {
+    if x.is_empty() {
+        return 0.0;
+    }
+    sum_f64_of_f32(x) / x.len() as f64
+}
+
+/// `sum(((x - hi) - lo)^2)` over a row, in `f32` lanes (eight partial sums, vectorized where AVX2 is available).
+pub(crate) fn centered_sumsq(x: &[f32], hi: f32, lo: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::simd_x86::has_avx2_fma() {
+        // SAFETY: AVX2 and FMA were detected.
+        return unsafe { centered_sumsq_avx2(x, hi, lo) };
+    }
+    let mut acc = [0.0f32; 8];
+    let mut chunks = x.chunks_exact(8);
+    for c in &mut chunks {
+        for k in 0..8 {
+            let d = (c[k] - hi) - lo;
+            acc[k] += d * d;
+        }
+    }
+    let tail: f32 = chunks.remainder().iter().map(|&v| ((v - hi) - lo) * ((v - hi) - lo)).sum();
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn centered_sumsq_avx2(x: &[f32], hi: f32, lo: f32) -> f32 {
+    use std::arch::x86_64::*;
+    let (n, p) = (x.len(), x.as_ptr());
+    let (vhi, vlo) = (_mm256_set1_ps(hi), _mm256_set1_ps(lo));
+    let (mut a0, mut a1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+    let mut i = 0usize;
+    while i + 16 <= n {
+        // SAFETY: i + 16 <= n.
+        let d0 = _mm256_sub_ps(_mm256_sub_ps(unsafe { _mm256_loadu_ps(p.add(i)) }, vhi), vlo);
+        let d1 = _mm256_sub_ps(_mm256_sub_ps(unsafe { _mm256_loadu_ps(p.add(i + 8)) }, vhi), vlo);
+        a0 = _mm256_fmadd_ps(d0, d0, a0);
+        a1 = _mm256_fmadd_ps(d1, d1, a1);
+        i += 16;
+    }
+    if i + 8 <= n {
+        // SAFETY: i + 8 <= n.
+        let d0 = _mm256_sub_ps(_mm256_sub_ps(unsafe { _mm256_loadu_ps(p.add(i)) }, vhi), vlo);
+        a0 = _mm256_fmadd_ps(d0, d0, a0);
+        i += 8;
+    }
+    let mut lanes = [0.0f32; 8];
+    // SAFETY: `lanes` holds eight f32.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), _mm256_add_ps(a0, a1)) };
+    let mut total = ((lanes[0] + lanes[4]) + (lanes[1] + lanes[5])) + ((lanes[2] + lanes[6]) + (lanes[3] + lanes[7]));
+    while i < n {
+        let d = (unsafe { *p.add(i) } - hi) - lo;
+        total += d * d;
+        i += 1;
+    }
+    total
+}
+
+/// Sum of an `f32` slice accumulated in `f64` (vectorized with AVX2 where available).
+pub(crate) fn sum_f64_of_f32(x: &[f32]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if super::simd_x86::has_avx2_fma() {
+        // SAFETY: AVX2 was detected.
+        return unsafe { sum_f64_avx2(x) };
+    }
+    let mut acc = [0.0f64; 4];
+    let mut chunks = x.chunks_exact(4);
+    for c in &mut chunks {
+        for k in 0..4 {
+            acc[k] += c[k] as f64;
+        }
+    }
+    let tail: f64 = chunks.remainder().iter().map(|&v| v as f64).sum();
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + tail
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sum_f64_avx2(x: &[f32]) -> f64 {
+    use std::arch::x86_64::*;
+    let (n, p) = (x.len(), x.as_ptr());
+    let mut i = 0usize;
+    let mut acc = [_mm256_setzero_pd(); 4];
+    while i + 16 <= n {
+        for (k, a) in acc.iter_mut().enumerate() {
+            // SAFETY: i + 16 <= n.
+            *a = _mm256_add_pd(*a, _mm256_cvtps_pd(unsafe { _mm_loadu_ps(p.add(i + 4 * k)) }));
+        }
+        i += 16;
+    }
+    let sum4 = _mm256_add_pd(_mm256_add_pd(acc[0], acc[1]), _mm256_add_pd(acc[2], acc[3]));
+    let mut lanes = [0.0f64; 4];
+    // SAFETY: `lanes` holds four f64.
+    unsafe { _mm256_storeu_pd(lanes.as_mut_ptr(), sum4) };
+    let mut total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    while i < n {
+        total += unsafe { *p.add(i) } as f64;
+        i += 1;
+    }
+    total
+}
+
+/// `sum(a[i] * b[i])` with the products and the sum carried out in `f64` (one rounding of the final result instead of one per
+/// product and one per addition).
+pub(crate) fn dot_f64_of_f32(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    #[cfg(feature = "rayon")]
+    if n >= 65536 {
+        return a.par_chunks(16384).zip(b.par_chunks(16384)).map(|(x, y)| dot_f64_chunk(x, y)).sum::<f64>();
+    }
+    dot_f64_chunk(a, b)
+}
+
+fn dot_f64_chunk(a: &[f32], b: &[f32]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if super::simd_x86::has_avx2_fma() {
+        // SAFETY: AVX2 and FMA were detected; both slices have the same length.
+        return unsafe { dot_f64_avx2(a, b) };
+    }
+    let mut acc = [0.0f64; 4];
+    let mut ca = a.chunks_exact(4);
+    let mut cb = b.chunks_exact(4);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        for k in 0..4 {
+            acc[k] += x[k] as f64 * y[k] as f64;
+        }
+    }
+    let tail: f64 = ca.remainder().iter().zip(cb.remainder()).map(|(&x, &y)| x as f64 * y as f64).sum();
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + tail
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f64_avx2(a: &[f32], b: &[f32]) -> f64 {
+    use std::arch::x86_64::*;
+    let (n, ap, bp) = (a.len().min(b.len()), a.as_ptr(), b.as_ptr());
+    let mut i = 0usize;
+    let mut acc = [_mm256_setzero_pd(); 4];
+    while i + 16 <= n {
+        for (k, s) in acc.iter_mut().enumerate() {
+            // SAFETY: i + 16 <= n for both slices.
+            let (x, y) = unsafe { (_mm256_cvtps_pd(_mm_loadu_ps(ap.add(i + 4 * k))), _mm256_cvtps_pd(_mm_loadu_ps(bp.add(i + 4 * k)))) };
+            *s = _mm256_fmadd_pd(x, y, *s);
+        }
+        i += 16;
+    }
+    let sum4 = _mm256_add_pd(_mm256_add_pd(acc[0], acc[1]), _mm256_add_pd(acc[2], acc[3]));
+    let mut lanes = [0.0f64; 4];
+    // SAFETY: `lanes` holds four f64.
+    unsafe { _mm256_storeu_pd(lanes.as_mut_ptr(), sum4) };
+    let mut total = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    while i < n {
+        total += unsafe { *ap.add(i) as f64 * *bp.add(i) as f64 };
+        i += 1;
+    }
+    total
+}
+
+/// `acc[j] += a * x[j]` with the `f32` row widened to `f64` (the building block of a skinny matrix product that never materializes
+/// an `f64` copy of the right-hand matrix).
+pub(crate) fn axpy_f64_of_f32(acc: &mut [f64], x: &[f32], a: f64) {
+    #[cfg(target_arch = "x86_64")]
+    if super::simd_x86::has_avx2_fma() {
+        // SAFETY: AVX2 and FMA were detected.
+        unsafe { axpy_f64_avx2(acc, x, a) };
+        return;
+    }
+    for (d, &v) in acc.iter_mut().zip(x) {
+        *d += a * v as f64;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_f64_avx2(acc: &mut [f64], x: &[f32], a: f64) {
+    use std::arch::x86_64::*;
+    let n = acc.len().min(x.len());
+    let (dp, xp) = (acc.as_mut_ptr(), x.as_ptr());
+    let av = _mm256_set1_pd(a);
+    let mut i = 0usize;
+    while i + 4 <= n {
+        // SAFETY: i + 4 <= n for both slices.
+        unsafe { _mm256_storeu_pd(dp.add(i), _mm256_fmadd_pd(av, _mm256_cvtps_pd(_mm_loadu_ps(xp.add(i))), _mm256_loadu_pd(dp.add(i)))) };
+        i += 4;
+    }
+    while i < n {
+        unsafe { *dp.add(i) += a * *xp.add(i) as f64 };
+        i += 1;
+    }
+}
+
+/// The mean of a row as an unevaluated sum `hi + lo` of two `f32`s. `(x - hi) - lo` then centers a value with the accuracy of
+/// the `f64` mean: `x - hi` is exact for values near the mean and `lo` carries what `f32` cannot hold of the mean.
+pub(crate) fn center_split(x: &[f32]) -> (f32, f32) {
+    let m = mean_f64(x);
+    let hi = m as f32;
+    (hi, (m - hi as f64) as f32)
+}
+
+/// `a op row` / `row op a` for a contiguous full-shape operand and a `[.., cols]` row broadcast over the leading dimensions
+/// (a bias add, a per-feature scale): one vectorized slice kernel per row, rows in parallel. `None` when the layouts are
+/// anything else, for the operation, or when no vector kernel exists on this machine.
+fn f32_row_broadcast(a: &[f32], la: &Layout, b: &[f32], lb: &Layout, op: BinaryOp) -> Option<Vec<f32>> {
+    let nd = la.ndim();
+    if nd < 2 || lb.ndim() != nd || la.shape() != lb.shape() {
+        return None;
+    }
+    // the vector kernels of this architecture (the x86 stubs do nothing on ARM and vice versa)
+    #[cfg(target_arch = "aarch64")]
+    use super::simd_arm as lanes;
+    #[cfg(not(target_arch = "aarch64"))]
+    use super::simd_x86 as lanes;
+    let simd: fn(&[f32], &[f32], &mut [f32]) -> bool = match op {
+        BinaryOp::Add => lanes::add_f32_slice,
+        BinaryOp::Sub => lanes::sub_f32_slice,
+        BinaryOp::Mul => lanes::mul_f32_slice,
+        BinaryOp::Div => lanes::div_f32_slice,
+        _ => return None,
+    };
+    #[cfg(target_arch = "aarch64")]
+    let available = lanes::has_neon();
+    #[cfg(not(target_arch = "aarch64"))]
+    let available = lanes::has_avx2_fma();
+    if !available {
+        return None;
+    }
+    let cols = *la.shape().last()?;
+    let total: usize = la.shape().iter().product();
+    if cols < 8 || total < 4096 {
+        return None;
+    }
+    let is_row = |l: &Layout| l.strides()[..nd - 1].iter().all(|&s| s == 0) && l.strides()[nd - 1] == 1;
+    // (full operand, its range, row operand slice, the full operand is the left one)
+    let (full, row, full_is_lhs): (&[f32], &[f32], bool) = if let Some(r) = la.contiguous_range_in(a.len())
+        && is_row(lb)
+        && lb.offset() + cols <= b.len()
+    {
+        (&a[r], &b[lb.offset()..lb.offset() + cols], true)
+    } else if let Some(r) = lb.contiguous_range_in(b.len())
+        && is_row(la)
+        && la.offset() + cols <= a.len()
+    {
+        (&b[r], &a[la.offset()..la.offset() + cols], false)
+    } else {
+        return None;
+    };
+    let mut out = crate::pool::take::<f32>(total).unwrap_or_else(|| vec![0.0; total]);
+    // a kernel that declines a row leaves it unwritten, so any refusal abandons the whole fast path
+    let declined = std::sync::atomic::AtomicBool::new(false);
+    let kernel = |(o, f): (&mut [f32], &[f32])| {
+        let handled = if full_is_lhs { simd(f, row, o) } else { simd(row, f, o) };
+        if !handled {
+            declined.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    #[cfg(feature = "rayon")]
+    if total >= 16384 {
+        out.par_chunks_mut(cols).zip(full.par_chunks(cols)).with_min_len((16384 / cols).max(1)).for_each(kernel);
+        return (!declined.load(std::sync::atomic::Ordering::Relaxed)).then_some(out);
+    }
+    out.chunks_mut(cols).zip(full.chunks(cols)).for_each(kernel);
+    (!declined.load(std::sync::atomic::Ordering::Relaxed)).then_some(out)
+}
+
 /// Contiguous `f32` binary operation, one vectorized loop per operation (see [`f32_unary_contiguous`]).
 fn f32_binary_contiguous(a: &[f32], b: &[f32], op: BinaryOp) -> Vec<f32> {
     macro_rules! arm {
@@ -186,11 +523,17 @@ fn f32_binary_contiguous(a: &[f32], b: &[f32], op: BinaryOp) -> Vec<f32> {
             if super::simd_x86::has_avx2_fma() {
                 simd_bin!(super::simd_x86::add_f32_slice);
             }
+            if cfg!(target_arch = "aarch64") {
+                simd_bin!(super::simd_arm::add_f32_slice);
+            }
             arm!(BinaryOp::Add)
         }
         BinaryOp::Sub => {
             if super::simd_x86::has_avx2_fma() {
                 simd_bin!(super::simd_x86::sub_f32_slice);
+            }
+            if cfg!(target_arch = "aarch64") {
+                simd_bin!(super::simd_arm::sub_f32_slice);
             }
             arm!(BinaryOp::Sub)
         }
@@ -198,11 +541,17 @@ fn f32_binary_contiguous(a: &[f32], b: &[f32], op: BinaryOp) -> Vec<f32> {
             if super::simd_x86::has_avx2_fma() {
                 simd_bin!(super::simd_x86::mul_f32_slice);
             }
+            if cfg!(target_arch = "aarch64") {
+                simd_bin!(super::simd_arm::mul_f32_slice);
+            }
             arm!(BinaryOp::Mul)
         }
         BinaryOp::Div => {
             if super::simd_x86::has_avx2_fma() {
                 simd_bin!(super::simd_x86::div_f32_slice);
+            }
+            if cfg!(target_arch = "aarch64") {
+                simd_bin!(super::simd_arm::div_f32_slice);
             }
             arm!(BinaryOp::Div)
         }
@@ -390,6 +739,17 @@ fn int_pow_kernel(base: i64, exp: i64) -> i64 {
     result
 }
 
+/// Which unary op [`CpuStorage::unary_backward_f32`] differentiates, and whether its derivative is a function of the op's
+/// input or of its output.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UnaryBwd {
+    TanhFromOutput,
+    SigmoidFromOutput,
+    ExpFromOutput,
+    ReluFromInput,
+    SquareFromInput,
+}
+
 impl CpuStorage {
     pub fn dtype(&self) -> DType {
         match self {
@@ -437,6 +797,13 @@ impl CpuStorage {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Detaches the buffer from its `Vec` without freeing it (the storage then holds an empty `U8` vector). Used for storage
+    /// that aliases foreign memory.
+    pub(crate) fn forget_buffer(&mut self) {
+        let old = std::mem::replace(self, Self::U8(Vec::new()));
+        std::mem::forget(old);
     }
 
     /// Raw pointer to the start of the underlying CPU buffer (never reallocates while pinned).
@@ -869,6 +1236,58 @@ impl CpuStorage {
     /// Fused single-pass last-axis softmax on contiguous `F32`/`F64` buffers when all rows are finite.
     /// Returns `None` on non-contiguous layouts, unsupported dtypes, or non-finite inputs (`+inf`/`NaN`)
     /// so the general path handles IEEE-754 edge cases identically.
+    /// Fused last-axis `log_softmax` on contiguous `F32` storage: `(x - max) - ln(sum(exp(x - max)))` in two passes per row
+    /// instead of the eight tensor operations of the composed form. `None` (use the composed path) for any non-finite
+    /// element, other dtypes or non-contiguous layouts.
+    pub fn log_softmax_last_axis(&self, layout: &Layout) -> Option<Self> {
+        let Self::F32(v) = self else { return None };
+        let cols = *layout.shape().last()?;
+        if cols == 0 {
+            return None;
+        }
+        let total: usize = layout.shape().iter().product();
+        let src = &v[layout.contiguous_range_in(v.len())?];
+        let non_finite = |c: &[f32]| c.iter().fold(false, |bad, x| bad | (x.to_bits() & 0x7f80_0000 == 0x7f80_0000));
+        #[cfg(feature = "rayon")]
+        let bad = if total >= 16384 { src.par_chunks(EW_CHUNK).any(non_finite) } else { non_finite(src) };
+        #[cfg(not(feature = "rayon"))]
+        let bad = non_finite(src);
+        if bad {
+            return None;
+        }
+        let mut out = crate::pool::take::<f32>(total).unwrap_or_else(|| vec![0.0; total]);
+        let row_fn = |(src_row, dst_row): (&[f32], &mut [f32])| {
+            let m = src_row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+            // ln(sum exp(x - m)) with the elements equal to the maximum counted separately: their terms are exactly 1, so the
+            // rest (`tail`) is summed on its own in f64 and a dominant element gives ln(1 + tail) = ln_1p(tail) instead of the
+            // ln of a rounded 1.00001, which has lost most of its digits
+            let (mut tail, mut at_max) = (0.0f64, 0usize);
+            for (d, &x) in dst_row.iter_mut().zip(src_row) {
+                if x < m {
+                    tail += fast_exp_f32(x - m) as f64;
+                } else {
+                    at_max += 1;
+                }
+                *d = x;
+            }
+            let ln_sum = if at_max == 1 { tail.ln_1p() } else { (at_max as f64 + tail).ln() };
+            // (x - m) is exact in f64, so the output is rounded once
+            for d in dst_row.iter_mut() {
+                *d = ((*d as f64 - m as f64) - ln_sum) as f32;
+            }
+        };
+        #[cfg(feature = "rayon")]
+        if total >= 16384 {
+            let block = cols * (EW_CHUNK / cols).max(1);
+            src.par_chunks(block)
+                .zip(out.par_chunks_mut(block))
+                .for_each(|(s, d)| s.chunks(cols).zip(d.chunks_mut(cols)).for_each(row_fn));
+            return Some(Self::F32(out));
+        }
+        src.chunks(cols).zip(out.chunks_mut(cols)).for_each(row_fn);
+        Some(Self::F32(out))
+    }
+
     pub fn softmax_last_axis(&self, layout: &Layout) -> Option<Self> {
         let shape = layout.shape();
         let cols = *shape.last()?;
@@ -999,26 +1418,22 @@ impl CpuStorage {
                     if super::simd_x86::layer_norm_row_f32(src_row, ws, bs, dst_row, eps as f32) {
                         return;
                     }
-                    let mut sum = 0.0f64;
-                    for &x in src_row {
-                        sum += x as f64;
-                    }
-                    let mean = sum / (d as f64);
+                    let (hi, lo) = center_split(src_row);
                     let mut var_sum = 0.0f64;
                     for &x in src_row {
-                        let diff = (x as f64) - mean;
+                        let diff = ((x - hi) - lo) as f64;
                         var_sum += diff * diff;
                     }
-                    let inv_std = 1.0 / (var_sum / (d as f64) + eps).sqrt();
-                    let mean32 = mean as f32;
-                    let inv32 = inv_std as f32;
+                    let inv32 = (1.0 / (var_sum / (d as f64) + eps).sqrt()) as f32;
                     for ((dst, &x), (&w, &b)) in dst_row.iter_mut().zip(src_row).zip(ws.iter().zip(bs)) {
-                        *dst = (x - mean32) * inv32 * w + b;
+                        *dst = ((x - hi) - lo) * inv32 * w + b;
                     }
                 };
                 #[cfg(feature = "rayon")]
                 if total >= 16384 {
-                    src.par_chunks(d).zip(out.par_chunks_mut(d)).for_each(row_fn);
+                    // blocks of rows (about 16K elements): a task per row is mostly scheduling for the usual 256-4096 wide rows
+                    let block = d * (16384 / d).max(1);
+                    src.par_chunks(block).zip(out.par_chunks_mut(block)).for_each(|(s, o)| s.chunks(d).zip(o.chunks_mut(d)).for_each(row_fn));
                     return Some(Self::F32(out));
                 }
                 src.chunks(d).zip(out.chunks_mut(d)).for_each(row_fn);
@@ -1066,6 +1481,47 @@ impl CpuStorage {
             }
             _ => None,
         }
+    }
+
+    /// Fused single-pass backward of a unary op on `F32` storage: `out = g * f(a)`, where `a` is the op's input or output
+    /// (see [`UnaryBwd`]). `g` may also be a broadcast scalar (all strides 0), which is what `sum().backward()` hands down.
+    pub(crate) fn unary_backward_f32(&self, g_layout: &Layout, a: &Self, a_layout: &Layout, kind: UnaryBwd) -> Option<Self> {
+        let total = g_layout.numel();
+        if total == 0 || g_layout.shape() != a_layout.shape() {
+            return None;
+        }
+        let (Self::F32(gv), Self::F32(av)) = (self, a) else { return None };
+        let a_s = &av[a_layout.contiguous_range_in(av.len())?];
+        let scalar_g = g_layout.strides().iter().all(|&s| s == 0).then(|| gv.get(g_layout.offset()).copied()).flatten();
+        let g_s: &[f32] = match scalar_g {
+            Some(_) => &[],
+            None => &gv[g_layout.contiguous_range_in(gv.len())?],
+        };
+        let mut out = crate::pool::take::<f32>(total).unwrap_or_else(|| vec![0.0; total]);
+        fn pass(out: &mut [f32], g_s: &[f32], scalar_g: Option<f32>, a_s: &[f32], f: impl Fn(f32) -> f32 + Sync) {
+            const CHUNK: usize = 8192;
+            let body = |(i, dst): (usize, &mut [f32])| {
+                let a_c = &a_s[i * CHUNK..i * CHUNK + dst.len()];
+                match scalar_g {
+                    Some(g) => dst.iter_mut().zip(a_c).for_each(|(o, &a)| *o = g * f(a)),
+                    None => dst.iter_mut().zip(&g_s[i * CHUNK..i * CHUNK + a_c.len()]).zip(a_c).for_each(|((o, &g), &a)| *o = g * f(a)),
+                }
+            };
+            #[cfg(feature = "rayon")]
+            if out.len() >= 16384 {
+                out.par_chunks_mut(CHUNK).enumerate().for_each(body);
+                return;
+            }
+            out.chunks_mut(CHUNK).enumerate().for_each(body);
+        }
+        match kind {
+            UnaryBwd::TanhFromOutput => pass(&mut out, g_s, scalar_g, a_s, |y| 1.0 - y * y),
+            UnaryBwd::SigmoidFromOutput => pass(&mut out, g_s, scalar_g, a_s, |y| y * (1.0 - y)),
+            UnaryBwd::ExpFromOutput => pass(&mut out, g_s, scalar_g, a_s, |y| y),
+            UnaryBwd::ReluFromInput => pass(&mut out, g_s, scalar_g, a_s, |x| if x > 0.0 { 1.0 } else { 0.0 }),
+            UnaryBwd::SquareFromInput => pass(&mut out, g_s, scalar_g, a_s, |x| 2.0 * x),
+        }
+        Some(Self::F32(out))
     }
 
     pub fn unary_op(&self, layout: &Layout, op: UnaryOp) -> Result<Self> {
@@ -1505,6 +1961,9 @@ impl CpuStorage {
             (Self::F32(a), Self::F32(b)) => {
                 if let (Some(ra), Some(rb)) = (lhs_l.contiguous_range_in(a.len()), rhs_l.contiguous_range_in(b.len())) {
                     return Ok(Self::F32(f32_binary_contiguous(&a[ra], &b[rb], op)));
+                }
+                if let Some(out) = f32_row_broadcast(a, lhs_l, b, rhs_l, op) {
+                    return Ok(Self::F32(out));
                 }
                 run_bin!(F32, a, b, |x: f32, y: f32| eval_bin_f32(x, y, op))
             }
@@ -2105,7 +2564,7 @@ impl CpuStorage {
                     };
                     #[cfg(feature = "rayon")]
                     if n >= 65536 {
-                        let group = (EW_CHUNK / inner).max(1);
+                        let group = (8 * EW_CHUNK / inner).max(1);
                         out.par_chunks_mut(inner * group).enumerate().for_each(|(gi, block)| block.chunks_mut(inner).enumerate().for_each(|(j, d)| copy((gi * group + j, d))));
                     } else {
                         out.chunks_mut(inner).enumerate().for_each(copy);
@@ -2911,7 +3370,7 @@ impl CpuStorage {
             if is_leading {
                 match self {
                     Self::F32(v) => {
-                        let block_size = 256.min(outer).max(1);
+                        let block_size = leading_block(outer);
                         if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
                             let mut out = vec![0i64; outer];
                             let run_chunk = |b_idx: usize, chunk: &mut [i64]| {
@@ -2947,53 +3406,16 @@ impl CpuStorage {
                             let c_start = b_idx * block_size;
                             let w = chunk.len();
                             match op {
-                                ReduceOp::Sum => {
-                                    if super::simd_x86::has_avx2_fma() {
-                                        chunk.fill(0.0);
-                                        for r in 0..inner {
-                                            let row_offset = range.start + r * outer + c_start;
-                                            let row_slice = &v[row_offset..row_offset + w];
-                                            super::simd_x86::add_into_f32_slice(chunk, row_slice);
-                                        }
-                                    } else {
-                                        let mut acc = vec![0.0f64; w];
-                                        for r in 0..inner {
-                                            let row_offset = range.start + r * outer + c_start;
-                                            let row_slice = &v[row_offset..row_offset + w];
-                                            for (a, &val) in acc.iter_mut().zip(row_slice) {
-                                                *a += val as f64;
-                                            }
-                                        }
-                                        for (dst, sum) in chunk.iter_mut().zip(acc) {
-                                            *dst = sum as f32;
-                                        }
+                                ReduceOp::Sum | ReduceOp::Mean => {
+                                    // f64 accumulators: summing 1000 rows in f32 loses several bits (and far more with a common offset)
+                                    let mut acc = vec![0.0f64; w];
+                                    for r in 0..inner {
+                                        let row_offset = range.start + r * outer + c_start;
+                                        add_f32_into_f64(&mut acc, &v[row_offset..row_offset + w]);
                                     }
-                                }
-                                ReduceOp::Mean => {
-                                    if super::simd_x86::has_avx2_fma() {
-                                        chunk.fill(0.0);
-                                        for r in 0..inner {
-                                            let row_offset = range.start + r * outer + c_start;
-                                            let row_slice = &v[row_offset..row_offset + w];
-                                            super::simd_x86::add_into_f32_slice(chunk, row_slice);
-                                        }
-                                        let inv = 1.0f32 / (inner as f32);
-                                        for d in chunk.iter_mut() {
-                                            *d *= inv;
-                                        }
-                                    } else {
-                                        let mut acc = vec![0.0f64; w];
-                                        for r in 0..inner {
-                                            let row_offset = range.start + r * outer + c_start;
-                                            let row_slice = &v[row_offset..row_offset + w];
-                                            for (a, &val) in acc.iter_mut().zip(row_slice) {
-                                                *a += val as f64;
-                                            }
-                                        }
-                                        let denom = inner as f64;
-                                        for (dst, sum) in chunk.iter_mut().zip(acc) {
-                                            *dst = (sum / denom) as f32;
-                                        }
+                                    let denom = if op == ReduceOp::Mean { inner as f64 } else { 1.0 };
+                                    for (dst, sum) in chunk.iter_mut().zip(acc) {
+                                        *dst = (sum / denom) as f32;
                                     }
                                 }
                                 ReduceOp::Max => {
@@ -3043,7 +3465,7 @@ impl CpuStorage {
                         return Ok(Self::F32(out));
                     }
                     Self::F64(v) => {
-                        let block_size = 256.min(outer).max(1);
+                        let block_size = leading_block(outer);
                         if matches!(op, ReduceOp::ArgMax | ReduceOp::ArgMin) {
                             let mut out = vec![0i64; outer];
                             let run_chunk = |b_idx: usize, chunk: &mut [i64]| {
@@ -3559,14 +3981,15 @@ pub(crate) fn eval_unary_f32(x: f32, op: UnaryOp) -> f32 {
             if x > 0.0 {
                 x
             } else {
-                (alpha as f32) * (x.exp() - 1.0)
+                (alpha as f32) * x.exp_m1()
             }
         }
         UnaryOp::Softplus => {
             if x > 20.0 {
                 x
             } else {
-                x.exp().ln_1p()
+                // f64 inside: a rounded f32 exp(x) puts up to a full ulp of error into ln(1 + exp(x))
+                ((x as f64).exp().ln_1p()) as f32
             }
         }
         UnaryOp::Square => x * x,
@@ -3574,7 +3997,7 @@ pub(crate) fn eval_unary_f32(x: f32, op: UnaryOp) -> f32 {
         UnaryOp::Floor => x.floor(),
         UnaryOp::Ceil => x.ceil(),
         UnaryOp::Round => x.round_ties_even(), // half to even, like torch.round / numpy.round / WGSL round
-        UnaryOp::Erf => libm::erff(x),
+        UnaryOp::Erf => libm::erf(x as f64) as f32 /* double precision, then one rounding: erff alone is ~1.3 half-ulps */,
         UnaryOp::Powf(p) => x.powf(p as f32),
         UnaryOp::AddScalar(s) => x + (s as f32),
         UnaryOp::MulScalar(s) => x * (s as f32),
@@ -3633,7 +4056,7 @@ pub(crate) fn eval_unary_f64(x: f64, op: UnaryOp) -> f64 {
             if x > 0.0 {
                 x
             } else {
-                alpha * (x.exp() - 1.0)
+                alpha * x.exp_m1()
             }
         }
         UnaryOp::Softplus => {
@@ -3665,29 +4088,17 @@ pub(crate) fn eval_unary_f64(x: f64, op: UnaryOp) -> f64 {
 
 #[cfg(feature = "rayon")]
 fn reduce_slice_f32(slice: &[f32], op: ReduceOp) -> f32 {
+    // sums and means accumulate in f64 (the final rounding to f32 is then the only rounding of the result)
+    let sum_f64 = || -> f64 {
+        if slice.len() >= 65536 {
+            slice.par_chunks(16384).map(sum_f64_of_f32).sum::<f64>()
+        } else {
+            sum_f64_of_f32(slice)
+        }
+    };
     match op {
-        ReduceOp::Sum => {
-            if let Some(s) = if slice.len() >= 65536 && super::simd_x86::has_avx2_fma() {
-                Some(slice.par_chunks(16384).map(|c| super::simd_x86::sum_f32_slice(c).unwrap()).sum::<f32>())
-            } else {
-                super::simd_x86::sum_f32_slice(slice)
-            } {
-                return s;
-            }
-            if slice.len() >= 16384 {
-                slice.par_iter().map(|&x| x as f64).sum::<f64>() as f32
-            } else {
-                slice.iter().map(|&x| x as f64).sum::<f64>() as f32
-            }
-        }
-        ReduceOp::Mean => {
-            let sum: f64 = if slice.len() >= 16384 {
-                slice.par_iter().map(|&x| x as f64).sum::<f64>()
-            } else {
-                slice.iter().map(|&x| x as f64).sum::<f64>()
-            };
-            (sum / slice.len() as f64) as f32
-        }
+        ReduceOp::Sum => sum_f64() as f32,
+        ReduceOp::Mean => (sum_f64() / slice.len() as f64) as f32,
         ReduceOp::Max => {
             if slice.len() >= 16384 {
                 slice.par_iter().copied().reduce(|| f32::NEG_INFINITY, NanProp::nmax)

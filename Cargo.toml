@@ -41,6 +41,7 @@ rayon = ["oxideon-core/rayon"]
 fast-gemm = ["oxideon-core/fast-gemm"]
 avx512 = ["oxideon-core/avx512"]
 wgpu = ["oxideon-core/wgpu"]
+wasm = ["oxideon-core/wasm"]
 python = ["dep:pyo3"]
 python-ext = ["python", "pyo3/extension-module"]
 

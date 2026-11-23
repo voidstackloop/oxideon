@@ -18,31 +18,32 @@
 </head>
 <body>
     <div class="container">
-        <span class="badge">Oxideon v1.0.0 WebAssembly Engine</span>
+        <span class="badge">Oxideon (simulated demo)</span>
         <h1>In-Browser LLM & Neural Inference</h1>
-        <p>100% Zero-install client-side inference powered by Rust compiled to WebAssembly with WebGPU acceleration.</p>
+        <p>Layout mock-up of a client-side inference page for Rust compiled to WebAssembly with WebGPU acceleration.</p>
+        <p><strong>Simulated:</strong> this page does not load oxideon or any model. The answer is canned and the timing is a fixed delay, so the numbers below say nothing about real performance.</p>
         
         <label for="prompt">Prompt Input:</label>
         <textarea id="prompt">Explain the difference between PagedAttention and standard multi-head attention in one sentence.</textarea>
         
-        <button id="runBtn" onclick="runInference()">Generate (WebGPU / Wasm)</button>
+        <button id="runBtn" onclick="runInference()">Show canned answer</button>
         
         <div class="output" id="output">Output will stream here...</div>
-        <div class="meta" id="metrics">Backend: Initializing WebGPU hardware adapter...</div>
+        <div class="meta" id="metrics">Backend: none (simulated)</div>
     </div>
 
     <script type="module">
         window.runInference = async function() {
             const out = document.getElementById("output");
             const metrics = document.getElementById("metrics");
-            out.textContent = "Processing tokens on client WebGPU...";
+            out.textContent = "Simulating...";
             
             const start = performance.now();
             // Simulate Wasm generation step
             setTimeout(() => {
                 const elapsed = (performance.now() - start).toFixed(2);
                 out.textContent = "PagedAttention partitions the KV cache into fixed-size physical blocks (like OS virtual memory pages), eliminating fragmentation and enabling zero-copy prefix sharing.";
-                metrics.textContent = `Completed in ${elapsed} ms | Tokens: 28 | Throughput: ${(28 / (elapsed / 1000)).toFixed(1)} tok/s | Hardware: WebGPU Active`;
+                metrics.textContent = `Simulated: ${elapsed} ms fixed delay | 28 canned tokens | WebGPU available in this browser: ${"gpu" in navigator ? "yes" : "no"}`;
             }, 120);
         };
     </script>

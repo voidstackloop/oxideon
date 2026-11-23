@@ -557,6 +557,11 @@ mod tests {
         t.to_vec::<f32>().unwrap()
     }
     const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/serialize/testdata");
+    /// The fixture directory: `OXIDEON_TESTDATA` when set (a test binary run elsewhere, e.g. cross-compiled and run in a container), else the
+    /// compile-time path of this checkout.
+    fn dir() -> String {
+        std::env::var("OXIDEON_TESTDATA").unwrap_or_else(|_| DIR.to_string())
+    }
 
     #[test]
     fn round_trips_every_dtype() {
@@ -584,30 +589,30 @@ mod tests {
 
     #[test]
     fn reads_files_written_by_numpy() {
-        let f = load_npy(format!("{DIR}/fortran_i32.npy")).unwrap();
+        let f = load_npy(format!("{}/fortran_i32.npy", dir())).unwrap();
         assert_eq!(f.shape(), [2, 3]);
         assert_eq!(f.to_vec::<i32>().unwrap(), vec![0, 1, 2, 3, 4, 5]); // arange(6).reshape(2, 3), stored column-major
-        let be = load_npy(format!("{DIR}/big_endian_f4.npy")).unwrap();
+        let be = load_npy(format!("{}/big_endian_f4.npy", dir())).unwrap();
         assert_eq!(v32(&be), vec![0.0, 1.0, 2.0, 3.0]);
-        let i16s = load_npy(format!("{DIR}/int16.npy")).unwrap();
+        let i16s = load_npy(format!("{}/int16.npy", dir())).unwrap();
         assert_eq!((i16s.dtype(), i16s.to_vec::<i32>().unwrap()), (DType::I16, vec![-3, 7, 300]));
     }
 
     #[test]
     fn reads_stored_and_deflated_archives() {
         for file in ["sample_stored.npz", "sample_deflated.npz"] {
-            let z = load_npz(format!("{DIR}/{file}")).unwrap();
+            let z = load_npz(format!("{}/{file}", dir())).unwrap();
             assert_eq!(v32(&z["a"]), (0..12).map(|i| i as f32).collect::<Vec<_>>(), "{file}");
             assert_eq!(z["a"].shape(), [3, 4]);
             assert_eq!(z["b"].to_vec::<i64>().unwrap(), vec![0, 3, 6, 9, 12]);
             assert_eq!(z["c"].to_vec::<bool>().unwrap(), vec![true, false, true]);
         }
-        let stored = load_npz(format!("{DIR}/sample_stored.npz")).unwrap();
+        let stored = load_npz(format!("{}/sample_stored.npz", dir())).unwrap();
         assert_eq!(stored["d"].shape(), Vec::<usize>::new());
         assert_eq!(stored["d"].to_vec::<f64>().unwrap(), vec![2.5]);
         assert_eq!(stored["u8"].to_vec::<u8>().unwrap(), (0..7).collect::<Vec<u8>>());
         assert_eq!(stored["h"].to_vec::<f64>().unwrap(), vec![0.0, 0.25, 0.5, 0.75]);
-        let big = &load_npz(format!("{DIR}/sample_deflated.npz")).unwrap()["big"];
+        let big = &load_npz(format!("{}/sample_deflated.npz", dir())).unwrap()["big"];
         assert_eq!(big.shape(), [5000]);
         let v = v32(big);
         assert!(v.iter().enumerate().all(|(i, &x)| x == (i % 100) as f32));

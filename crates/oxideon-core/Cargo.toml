@@ -18,6 +18,9 @@ fast-gemm = ["dep:gemm"]
 # why it is not on by default (the minimum supported version is 1.85).
 avx512 = ["fast-gemm", "gemm/x86-v4"]
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# JavaScript bindings (`WasmTensor`, `WasmInferenceSession`) through `wasm-bindgen`; build the root crate for
+# `wasm32-unknown-unknown` with `--no-default-features --features wasm`.
+wasm = ["dep:wasm-bindgen"]
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
@@ -26,6 +29,7 @@ wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1.18", features = ["derive"], optional = true }
 libm = "0.2"
+wasm-bindgen = { version = "0.2", optional = true }
 
 [lints]
 workspace = true

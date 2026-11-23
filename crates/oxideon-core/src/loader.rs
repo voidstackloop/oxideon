@@ -320,6 +320,13 @@ fn read_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()
         }
         Ok(())
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = f; // `&File` implements `Read` and `Seek`
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(buf)
+    }
 }
 
 struct NpyFile {

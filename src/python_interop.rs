@@ -483,6 +483,22 @@ pub fn from_polars_impl(py: Python<'_>, df: &Bound<'_, PyAny>, device: &str) -> 
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "python")]
+/// Imports any object that speaks the DLPack protocol (`__dlpack__`: NumPy >= 1.22, PyTorch, JAX, CuPy, ...) or a raw
+/// `"dltensor"` capsule. CPU data is **not copied**: the tensor aliases the producer's memory (writes through either side are
+/// visible to the other) and the producer's buffer lives until the last handle to the tensor is dropped.
+#[pyfunction]
+#[pyo3(name = "from_dlpack", signature = (ext_tensor, device="cpu"))]
+pub fn py_from_dlpack(py: Python<'_>, ext_tensor: &Bound<'_, PyAny>, device: &str) -> PyResult<PyTensor> {
+    let capsule = if ext_tensor.hasattr("__dlpack__")? { ext_tensor.call_method0("__dlpack__")? } else { ext_tensor.clone() };
+    let t = PyTensor::from_dlpack_capsule(&capsule)?;
+    if device == "cpu" {
+        Ok(t)
+    } else {
+        t.to_device(py, pyo3::types::PyString::new(py, device).into_any())
+    }
+}
+
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(name = "from_numpy", signature = (array, device="cpu"))]
 pub fn py_from_numpy(py: Python<'_>, array: &Bound<'_, PyAny>, device: &str) -> PyResult<PyTensor> {
@@ -582,6 +598,7 @@ pub fn py_to_polars<'py>(
 #[cfg(feature = "python")]
 pub fn register_interop_functions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_from_numpy, m)?)?;
+    m.add_function(wrap_pyfunction!(py_from_dlpack, m)?)?;
     m.add_function(wrap_pyfunction!(py_to_numpy, m)?)?;
     m.add_function(wrap_pyfunction!(py_from_torch, m)?)?;
     m.add_function(wrap_pyfunction!(py_to_torch, m)?)?;

@@ -36,6 +36,9 @@ pub fn scaled_dot_product_attention(
     let (l, e) = (q.shape()[q.ndim() - 2], q.shape()[q.ndim() - 1]);
     let s = k.shape()[k.ndim() - 2];
     let scale = scale.unwrap_or_else(|| 1.0 / (e as f64).sqrt());
+    if let Some(out) = attention_fused_cuda(q, k, v, attn_mask, is_causal, scale)? {
+        return Ok(out);
+    }
     let mut scores = q.matmul(&k.transpose(-2, -1)?)?.mul_scalar(scale)?;
     if is_causal {
         let keep: Vec<bool> = (0..l * s).map(|ix| ix % s <= ix / s).collect();
@@ -50,6 +53,62 @@ pub fn scaled_dot_product_attention(
         };
     }
     scores.softmax(-1)?.matmul(v)
+}
+
+/// The fused CUDA attention kernel for inference (no gradient needed, 2-4 dimensional inputs with equal leading dimensions,
+/// head dimension up to 128). `None` sends the call down the composed path, which also handles training.
+fn attention_fused_cuda(q: &Tensor, k: &Tensor, v: &Tensor, attn_mask: Option<&Tensor>, is_causal: bool, scale: f64) -> Result<Option<Tensor>> {
+    use crate::backend::cuda_ops::AttnDims;
+    use crate::dtype::DType;
+    if !matches!(q.device(), crate::device::Device::Cuda(_)) || k.device() != q.device() || v.device() != q.device() {
+        return Ok(None);
+    }
+    let needs_grad = crate::tensor::is_grad_enabled() && (q.requires_grad() || k.requires_grad() || v.requires_grad());
+    let nd = q.ndim();
+    if needs_grad || nd > 4 || k.ndim() != nd || v.ndim() != nd || k.dtype() != q.dtype() || v.dtype() != q.dtype() || !matches!(q.dtype(), DType::F32 | DType::F64 | DType::F16 | DType::BF16) {
+        return Ok(None);
+    }
+    let lead = &q.shape()[..nd - 2];
+    if k.shape()[..nd - 2] != *lead || v.shape()[..nd - 2] != *lead || k.shape()[nd - 2] != v.shape()[nd - 2] || k.shape()[nd - 1] != q.shape()[nd - 1] {
+        return Ok(None);
+    }
+    let (l, d, s, dv) = (q.shape()[nd - 2], q.shape()[nd - 1], k.shape()[nd - 2], v.shape()[nd - 1]);
+    let (bh, h) = match lead.len() {
+        0 => (1, 1),
+        1 => (lead[0], 1),
+        _ => (lead[0] * lead[1], lead[1]),
+    };
+    // The kernel is a scalar one (no tensor cores): it wins when the queries are few (decoding, short prefill: one launch
+    // instead of a matmul / softmax / matmul chain) or when the [L, S] scores per head would not fit in memory. A long
+    // square attention is faster as the composed path, whose matrix products run on the matmul / tensor-core kernels.
+    let score_bytes = bh.saturating_mul(l).saturating_mul(s).saturating_mul(q.dtype().size_in_bytes());
+    if !(l <= 64 || score_bytes > (1 << 28) || crate::backend::cuda_ops::fused_attention_always()) {
+        return Ok(None);
+    }
+    // an additive mask in the query dtype (a boolean one becomes 0 / -inf), broadcast to [lead.., L, S]
+    let mut target = lead.to_vec();
+    target.extend([l, s]);
+    let mask = match attn_mask {
+        None => None,
+        Some(m) => {
+            let additive = if m.dtype() == DType::Bool {
+                let zeros = m.zeros_like()?.to_dtype(q.dtype())?;
+                Tensor::where_cond(m, &zeros, &zeros.full_like(f64::NEG_INFINITY)?)?
+            } else {
+                m.to_dtype(q.dtype())?
+            };
+            match additive.broadcast_to(&target) {
+                Ok(b) => Some(b),
+                Err(_) => return Ok(None),
+            }
+        }
+    };
+    let (qc, kc, vc) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
+    let dims = AttnDims { bh, h, l, s, d, dv };
+    let storage = crate::backend::Storage::cuda_attention((qc.storage(), qc.layout()), (kc.storage(), kc.layout()), (vc.storage(), vc.layout()), mask.as_ref().map(|m| (m.storage(), m.layout())), is_causal, scale, dims)?;
+    let mut out_shape = lead.to_vec();
+    out_shape.extend([l, dv]);
+    Ok(storage.map(|st| Tensor::from_storage(st, crate::layout::Layout::contiguous(out_shape))))
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -101,8 +160,7 @@ pub fn layer_norm(
 fn layer_norm_composed(x: &Tensor, normalized_shape: &[usize], weight: Option<&Tensor>, bias: Option<&Tensor>, eps: f64) -> Result<Tensor> {
     let k = normalized_shape.len();
     let axes: Vec<isize> = (x.ndim() - k..x.ndim()).map(|a| a as isize).collect();
-    let mean = x.mean_axes(&axes, true)?;
-    let centered = x.sub(&mean)?;
+    let (centered, _) = x.centered_by_mean(&axes)?;
     let var = centered.square()?.mean_axes(&axes, true)?;
     let y = centered.mul(&var.add_scalar(eps)?.rsqrt()?)?;
     affine(y, weight, bias, normalized_shape)
@@ -140,17 +198,18 @@ fn layer_norm_last_f32(x: &Tensor, weight: Option<&Tensor>, bias: Option<&Tensor
         let src = &v[range];
         let eps = eps as f32;
         let row = |xr: &[f32], o: &mut [f32], h: &mut [f32], rs: &mut f32| {
-            let mean = xr.iter().sum::<f32>() / d as f32;
-            let var = xr.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+            // the mean as hi + lo, accumulated in f64, so a large common offset in the row does not eat the signal
+            let (hi, lo) = crate::backend::cpu::center_split(xr);
+            let var = crate::backend::cpu::centered_sumsq(xr, hi, lo) / d as f32;
             let r = 1.0 / (var + eps).sqrt();
             *rs = r;
             match (&w, &b) {
-                (Some(w), Some(b)) => o.iter_mut().zip(xr).zip(w.iter().zip(b)).for_each(|((o, &v), (&w, &b))| *o = (v - mean) * r * w + b),
-                (Some(w), None) => o.iter_mut().zip(xr).zip(w).for_each(|((o, &v), &w)| *o = (v - mean) * r * w),
-                (None, Some(b)) => o.iter_mut().zip(xr).zip(b).for_each(|((o, &v), &b)| *o = (v - mean) * r + b),
-                (None, None) => o.iter_mut().zip(xr).for_each(|(o, &v)| *o = (v - mean) * r),
+                (Some(w), Some(b)) => o.iter_mut().zip(xr).zip(w.iter().zip(b)).for_each(|((o, &v), (&w, &b))| *o = ((v - hi) - lo) * r * w + b),
+                (Some(w), None) => o.iter_mut().zip(xr).zip(w).for_each(|((o, &v), &w)| *o = ((v - hi) - lo) * r * w),
+                (None, Some(b)) => o.iter_mut().zip(xr).zip(b).for_each(|((o, &v), &b)| *o = ((v - hi) - lo) * r + b),
+                (None, None) => o.iter_mut().zip(xr).for_each(|(o, &v)| *o = ((v - hi) - lo) * r),
             }
-            h.iter_mut().zip(xr).for_each(|(h, &v)| *h = (v - mean) * r); // no-op when `h` is empty
+            h.iter_mut().zip(xr).for_each(|(h, &v)| *h = ((v - hi) - lo) * r); // no-op when `h` is empty
         };
         // rows are grouped so each parallel task handles about 8K elements
         let group = (8192 / d).max(1);
@@ -230,8 +289,7 @@ pub fn group_norm(
         return Err(Error::Msg(format!("group_norm: {c} channels are not divisible by {groups} groups")));
     }
     let grouped = x.reshape(&[n, groups, x.numel() / (n * groups).max(1)])?;
-    let mean = grouped.mean_axis(-1, true)?;
-    let centered = grouped.sub(&mean)?;
+    let (centered, _) = grouped.centered_by_mean(&[-1])?;
     let var = centered.square()?.mean_axis(-1, true)?;
     let y = centered.mul(&var.add_scalar(eps)?.rsqrt()?)?.reshape(x.shape())?;
     let mut shape = vec![1; x.ndim()];
@@ -269,11 +327,13 @@ pub fn batch_norm(
     shape[1] = c;
     let axes: Vec<isize> = (0..x.ndim() as isize).filter(|&a| a != 1).collect();
     let stats = running_mean.zip(running_var);
+    let mut batch_centered: Option<Tensor> = None;
     let (mean, var) = if let (false, Some((rm_, rv_))) = (training, stats) {
         (rm_.reshape(&shape)?, rv_.reshape(&shape)?)
     } else {
-        let mean = x.mean_axes(&axes, true)?;
-        let var = x.sub(&mean)?.square()?.mean_axes(&axes, true)?;
+        let (centered, mean) = x.centered_by_mean(&axes)?;
+        let var = centered.square()?.mean_axes(&axes, true)?;
+        batch_centered = Some(centered);
         if training {
             let count = (x.numel() / c.max(1)) as f64;
             if count <= 1.0 {
@@ -293,7 +353,11 @@ pub fn batch_norm(
         }
         (mean, var)
     };
-    let y = x.sub(&mean)?.mul(&var.add_scalar(eps)?.rsqrt()?)?;
+    let centered = match batch_centered {
+        Some(c) => c,
+        None => x.sub(&mean)?,
+    };
+    let y = centered.mul(&var.add_scalar(eps)?.rsqrt()?)?;
     affine(y, weight, bias, &shape)
 }
 

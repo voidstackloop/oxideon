@@ -15,6 +15,8 @@ use crate::error::{Error, Result};
 use crate::nn::{Linear, Module};
 use crate::tensor::Tensor;
 
+pub mod int8_kernels;
+
 /// Block quantization scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantScheme {

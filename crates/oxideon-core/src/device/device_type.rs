@@ -85,7 +85,7 @@ pub struct DeviceProperties {
     pub name: String,
     pub device_type: DeviceType,
     pub index: Option<usize>,
-    pub total_memory_bytes: usize,
+    pub total_memory_bytes: u64,
     pub is_unified_memory: bool,
     pub compute_capability: Option<(u32, u32)>,
     pub peak_fp32_tflops: f64,

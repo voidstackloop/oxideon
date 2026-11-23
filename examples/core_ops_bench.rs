@@ -1,8 +1,8 @@
-//! Wall-time of common CPU tensor operations (best of several runs, microseconds). `tools/core_ops_bench_torch.py` prints
+//! Wall-time of common CPU tensor operations (best of several runs, microseconds). `benchmarks/core_ops_bench_torch.py` prints
 //! the same table for PyTorch so the two can be compared on one machine.
 //!
 //! `cargo run --release --example core_ops_bench [names]`. Laptops throttle a process after a few seconds of load, which
-//! distorts the later rows of one long run: `tools/core_ops_bench_compare.py` runs every benchmark in its own process.
+//! distorts the later rows of one long run: `benchmarks/core_ops_bench_compare.py` runs every benchmark in its own process.
 
 use oxideon::nn::functional_ext::layer_norm;
 use oxideon::prelude::*;
@@ -33,6 +33,10 @@ fn bench(name: &str, mut f: impl FnMut()) {
 }
 
 fn main() -> Result<()> {
+    // the precision mode comes from OXIDEON_PRECISION (fastest|balanced|highest, default balanced)
+    if let Some(d) = std::env::var("OXI_KCHUNK").ok().and_then(|v| v.parse().ok()) {
+        oxideon_core::gemm::set_k_chunk(d);
+    }
     let a = rnd(&[1024, 1024], 0.0);
     let b = rnd(&[1024, 1024], 1.0);
     let row = rnd(&[1024], 2.0);
@@ -42,6 +46,7 @@ fn main() -> Result<()> {
     let seq = rnd(&[32, 128, 256], 6.0);
     let (g, bb) = (rnd(&[256], 7.0), rnd(&[256], 8.0));
     let m = rnd(&[512, 512], 9.0);
+    let (lk_a, lk_b) = (rnd(&[256, 4096], 10.0), rnd(&[4096, 256], 11.0));
     let idx = Tensor::from_slice(&(0..4096).map(|i| (i * 7 % 1024) as i64).collect::<Vec<_>>(), &[4096])?;
 
     bench("add 1M", || drop(a.add(&b).unwrap()));
@@ -61,7 +66,10 @@ fn main() -> Result<()> {
     bench("add transposed 1M", || drop(a.transpose(0, 1).unwrap().add(&b).unwrap()));
     bench("matmul 512", || drop(m.matmul(&m).unwrap()));
     bench("matmul 1024", || drop(a.matmul(&b).unwrap()));
+    bench("matmul 256x4096x256", || drop(lk_a.matmul(&lk_b).unwrap()));
     bench("conv2d 8x16x64x64 k3", || drop(img.conv2d(&w, None, (1, 1), (1, 1), (1, 1)).unwrap()));
+    let (img64, w64) = (rnd(&[4, 64, 56, 56], 12.0), rnd(&[64, 64, 3, 3], 13.0));
+    bench("conv2d 4x64x56x56 k3", || drop(img64.conv2d(&w64, None, (1, 1), (1, 1), (1, 1)).unwrap()));
     bench("max_pool2d", || drop(img.max_pool2d((2, 2), (2, 2), (0, 0)).unwrap()));
     bench("layer_norm 32x128x256", || drop(layer_norm(&seq, &[256], Some(&g), Some(&bb), 1e-5).unwrap()));
     bench("index_select 4096 rows", || drop(a.index_select(0, &idx).unwrap()));

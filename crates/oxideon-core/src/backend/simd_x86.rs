@@ -33,16 +33,23 @@ unsafe fn exp_ps_avx2(x: __m256) -> __m256 {
 
     // Match `x.max(-150.0).min(89.0)` (clamp finite range; NaN restored at end)
     let xc = _mm256_min_ps(_mm256_max_ps(x, lo_bound), hi_bound);
-    let n = _mm256_sub_ps(_mm256_add_ps(_mm256_mul_ps(xc, log2e), round), round);
-    let r = _mm256_sub_ps(_mm256_sub_ps(xc, _mm256_mul_ps(n, c1)), _mm256_mul_ps(n, c2));
+    // fused multiply-adds shorten the dependent chain (the function is compiled with FMA enabled)
+    let n = _mm256_sub_ps(_mm256_fmadd_ps(xc, log2e, round), round);
+    let r = _mm256_fnmadd_ps(n, c2, _mm256_fnmadd_ps(n, c1, xc));
 
-    let mut p = _mm256_set1_ps(1.987_569_1e-4);
-    p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.398_2e-3));
-    p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(8.333_452e-3));
-    p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(4.166_579_6e-2));
-    p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.666_666_5e-1));
-    p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(5.0e-1));
-    let y = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(p, r), r), r), _mm256_set1_ps(1.0));
+    // Estrin form of the degree-5 polynomial (a shorter dependency chain than Horner, same coefficients)
+    let r2 = _mm256_mul_ps(r, r);
+    let r4 = _mm256_mul_ps(r2, r2);
+    let e0 = _mm256_fmadd_ps(_mm256_set1_ps(1.666_666_5e-1), r, _mm256_set1_ps(5.0e-1));
+    let e1 = _mm256_fmadd_ps(_mm256_set1_ps(8.333_452e-3), r, _mm256_set1_ps(4.166_579_6e-2));
+    let e2 = _mm256_fmadd_ps(_mm256_set1_ps(1.987_569_1e-4), r, _mm256_set1_ps(1.398_2e-3));
+    let p = _mm256_fmadd_ps(e2, r4, _mm256_fmadd_ps(e1, r2, e0));
+    // 1 + r + r^2 p with a single final rounding: `1 + r` is split into its rounded sum and the exact residual (|r| < 1) instead
+    // of letting the rounding of `1 + r` add half an ulp to the result
+    let one = _mm256_set1_ps(1.0);
+    let s1 = _mm256_add_ps(r, one);
+    let resid = _mm256_sub_ps(r, _mm256_sub_ps(s1, one));
+    let y = _mm256_add_ps(s1, _mm256_fmadd_ps(_mm256_mul_ps(p, r), r, resid));
 
     let ni = _mm256_cvttps_epi32(n);
     let n1 = _mm256_srai_epi32(ni, 1);
@@ -53,6 +60,126 @@ unsafe fn exp_ps_avx2(x: __m256) -> __m256 {
 
     let isnan = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
     _mm256_blendv_ps(out, x, isnan)
+}
+
+/// [`exp_ps_avx2`] for arguments that are never positive (the gelu tail exponent `poly - z^2`): no upper clamp, and no NaN restore, so
+/// a NaN argument gives a finite value here and the caller must let the NaN come from elsewhere (`x * cdf` does).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn exp_nonpos_ps_avx2(x: __m256) -> __m256 {
+    let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+    let c1 = _mm256_set1_ps(0.693_359_4);
+    let c2 = _mm256_set1_ps(-2.121_944_4e-4);
+    let round = _mm256_set1_ps(12_582_912.0);
+    let bias = _mm256_set1_epi32(127);
+    let xc = _mm256_max_ps(x, _mm256_set1_ps(-150.0));
+    let n = _mm256_sub_ps(_mm256_fmadd_ps(xc, log2e, round), round);
+    let r = _mm256_fnmadd_ps(n, c2, _mm256_fnmadd_ps(n, c1, xc));
+    let r2 = _mm256_mul_ps(r, r);
+    let r4 = _mm256_mul_ps(r2, r2);
+    let e0 = _mm256_fmadd_ps(_mm256_set1_ps(1.666_666_5e-1), r, _mm256_set1_ps(5.0e-1));
+    let e1 = _mm256_fmadd_ps(_mm256_set1_ps(8.333_452e-3), r, _mm256_set1_ps(4.166_579_6e-2));
+    let e2 = _mm256_fmadd_ps(_mm256_set1_ps(1.987_569_1e-4), r, _mm256_set1_ps(1.398_2e-3));
+    let p = _mm256_fmadd_ps(e2, r4, _mm256_fmadd_ps(e1, r2, e0));
+    let one = _mm256_set1_ps(1.0);
+    let s1 = _mm256_add_ps(r, one);
+    let resid = _mm256_sub_ps(r, _mm256_sub_ps(s1, one));
+    let y = _mm256_add_ps(s1, _mm256_fmadd_ps(_mm256_mul_ps(p, r), r, resid));
+    let ni = _mm256_cvttps_epi32(n);
+    let n1 = _mm256_srai_epi32(ni, 1);
+    let n2 = _mm256_sub_epi32(ni, n1);
+    let sc1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n1, bias), 23));
+    let sc2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n2, bias), 23));
+    _mm256_mul_ps(_mm256_mul_ps(y, sc1), sc2)
+}
+
+/// `e^x` as an unevaluated sum `hi + lo` of two `f32` lanes (`hi` is the correctly rounded value up to the last bit, `lo` what the
+/// rounding left behind), for callers that divide or subtract it and would otherwise add its half-ulp error to their own. Valid
+/// where the result is a normal number (`-87 < x < 88`); outside it `lo` is meaningless.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn exp_hilo_ps_avx2(x: __m256) -> (__m256, __m256) {
+    let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+    let c1 = _mm256_set1_ps(0.693_359_4);
+    let c2 = _mm256_set1_ps(-2.121_944_4e-4);
+    let round = _mm256_set1_ps(12_582_912.0);
+    let bias = _mm256_set1_epi32(127);
+    let xc = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-87.0)), _mm256_set1_ps(88.0));
+    let n = _mm256_sub_ps(_mm256_fmadd_ps(xc, log2e, round), round);
+    // r = rh + rl: the reduced argument as a pair, so the reduction itself adds no rounding error
+    let r1 = _mm256_fnmadd_ps(n, c1, xc);
+    let rh = _mm256_fnmadd_ps(n, c2, r1);
+    let rl = _mm256_fnmadd_ps(n, c2, _mm256_sub_ps(r1, rh)); // exact: (r1 - rh) - n*c2
+    // e^rh = 1 + rh + rh^2/2 + rh^3 * q(rh); the leading terms are kept as exact pairs, only the (small) rh^3 term is rounded
+    let mut q = _mm256_set1_ps(1.989_925_4e-4);
+    q = _mm256_fmadd_ps(q, rh, _mm256_set1_ps(1.392_615_1e-3));
+    q = _mm256_fmadd_ps(q, rh, _mm256_set1_ps(8.333_301e-3));
+    q = _mm256_fmadd_ps(q, rh, _mm256_set1_ps(4.166_655_6e-2));
+    q = _mm256_fmadd_ps(q, rh, _mm256_set1_ps(1.666_666_7e-1));
+    let one = _mm256_set1_ps(1.0);
+    let r2h = _mm256_mul_ps(rh, rh);
+    let r2l = _mm256_fmsub_ps(rh, rh, r2h);
+    let half = _mm256_set1_ps(0.5);
+    let s1 = _mm256_add_ps(rh, one);
+    let e1 = _mm256_sub_ps(rh, _mm256_sub_ps(s1, one)); // exact: s1 + e1 == 1 + rh (the rounding error of the sum; |1| >= |rh|)
+    let h2 = _mm256_mul_ps(half, r2h);
+    let y1 = _mm256_add_ps(s1, h2);
+    let e2 = _mm256_sub_ps(h2, _mm256_sub_ps(y1, s1)); // Fast2Sum: |s1| >= |h2|
+    let c3 = _mm256_mul_ps(_mm256_mul_ps(r2h, rh), q);
+    // everything below the f32 grid of y1: rounding of s1 and h2, the low half of rh^2/2, the low part of r, and the cubic term
+    let small = _mm256_add_ps(
+        _mm256_add_ps(_mm256_add_ps(e1, e2), _mm256_fmadd_ps(half, r2l, _mm256_mul_ps(rl, s1))),
+        c3,
+    );
+    let y = _mm256_add_ps(y1, small);
+    let ylo = _mm256_add_ps(_mm256_sub_ps(y1, y), small); // Fast2Sum: |y1| >= |small|
+    let ni = _mm256_cvttps_epi32(n);
+    let n1 = _mm256_srai_epi32(ni, 1);
+    let n2 = _mm256_sub_epi32(ni, n1);
+    let sc1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n1, bias), 23));
+    let sc2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n2, bias), 23));
+    (_mm256_mul_ps(_mm256_mul_ps(y, sc1), sc2), _mm256_mul_ps(_mm256_mul_ps(ylo, sc1), sc2))
+}
+
+/// `num / (1 + e)` for `e = eh + el` and a numerator `num` (itself exact), as `(q, corr)` with `q + corr` correct to well below a
+/// half-ulp: one quotient, then a correction from the exact residual that also carries the rounding error of `1 + eh` and `el`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn div_one_plus_hilo(num: __m256, eh: __m256, el: __m256) -> (__m256, __m256) {
+    let one = _mm256_set1_ps(1.0);
+    let d = _mm256_add_ps(one, eh);
+    let d_lo = _mm256_add_ps(_mm256_sub_ps(eh, _mm256_sub_ps(d, one)), el); // 1 + eh + el = d + d_lo
+    let inv = _mm256_div_ps(one, d);
+    let q0 = _mm256_mul_ps(num, inv);
+    let resid = _mm256_fnmadd_ps(q0, d_lo, _mm256_fnmadd_ps(q0, d, num)); // num - q0 * (d + d_lo)
+    (q0, _mm256_mul_ps(resid, inv))
+}
+
+/// sigmoid as `(hi, lo)` with `hi` the nearest `f32` to `hi + lo` (about 0.5 ulp from the true value in the worst case).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn sigmoid_hilo_ps_avx2(x: __m256) -> (__m256, __m256) {
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let neg_abs = _mm256_xor_ps(_mm256_and_ps(x, abs_mask), _mm256_set1_ps(-0.0));
+    let (eh0, el0) = unsafe { exp_hilo_ps_avx2(neg_abs) };
+    // below -87 the exponential is subnormal: the plain kernel (whose clamp reaches the subnormal range) takes over, without a low part
+    let deep = _mm256_cmp_ps(neg_abs, _mm256_set1_ps(-87.0), _CMP_LT_OQ);
+    let eh = _mm256_blendv_ps(eh0, unsafe { exp_ps_avx2(neg_abs) }, deep);
+    let el = _mm256_andnot_ps(deep, el0);
+    let one = _mm256_set1_ps(1.0);
+    // x >= 0: 1 / (1 + e^-x); x < 0: e^x / (1 + e^x) with the numerator e = eh + el carried as two terms
+    let is_neg = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+    let (q0, c0) = unsafe { div_one_plus_hilo(_mm256_blendv_ps(one, eh, is_neg), eh, el) };
+    // the low half of a negative-side numerator: el / (1 + e), to first order el * inv
+    let inv = _mm256_div_ps(one, _mm256_add_ps(one, eh));
+    let c = _mm256_add_ps(c0, _mm256_and_ps(_mm256_mul_ps(el, inv), is_neg));
+    let hi = _mm256_add_ps(q0, c);
+    let lo = _mm256_add_ps(_mm256_sub_ps(q0, hi), c);
+    (hi, lo)
 }
 
 /// Vectorized standard normal CDF `0.5 * erfc(-x / sqrt(2))` on 8 `f32` lanes.
@@ -67,26 +194,27 @@ unsafe fn norm_cdf_ps_avx2(x: __m256) -> __m256 {
 
     let half = _mm256_set1_ps(0.5);
     let one = _mm256_set1_ps(1.0);
-    let two = _mm256_set1_ps(2.0);
     let t = _mm256_div_ps(one, _mm256_fmadd_ps(half, z, one));
 
-    let mut poly = _mm256_set1_ps(0.170_872_77);
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(-0.822_152_26));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(1.488_515_9));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(-1.135_204));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(0.278_868_07));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(-0.186_288_06));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(0.096_784_18));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(0.374_091_96));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(1.000_023_7));
-    poly = _mm256_fmadd_ps(poly, t, _mm256_set1_ps(-1.265_512_2));
+    // degree-9 polynomial in t, Estrin form: the same coefficients as a Horner chain, but a dependency chain of about half the length
+    let t2 = _mm256_mul_ps(t, t);
+    let t4 = _mm256_mul_ps(t2, t2);
+    let t8 = _mm256_mul_ps(t4, t4);
+    let pair = |hi: f32, lo: f32| _mm256_fmadd_ps(_mm256_set1_ps(hi), t, _mm256_set1_ps(lo));
+    let q0 = pair(1.000_023_7, -1.265_512_2);
+    let q1 = pair(0.096_784_18, 0.374_091_96);
+    let q2 = pair(0.278_868_07, -0.186_288_06);
+    let q3 = pair(1.488_515_9, -1.135_204);
+    let q4 = pair(0.170_872_77, -0.822_152_26);
+    let r0 = _mm256_fmadd_ps(q1, t2, q0);
+    let r1 = _mm256_fmadd_ps(q3, t2, q2);
+    let poly = _mm256_fmadd_ps(q4, t8, _mm256_fmadd_ps(r1, t4, r0));
 
     let arg = _mm256_fnmadd_ps(z, z, poly);
-    let erfc_abs = _mm256_mul_ps(t, unsafe { exp_ps_avx2(arg) });
-    let neg_erfc = _mm256_sub_ps(two, erfc_abs);
+    // the cdf is half of erfc: the 0.5 goes into the factor `t` (a power-of-two scaling, so exact) that is ready long before the exponential
+    let h = _mm256_mul_ps(_mm256_mul_ps(half, t), unsafe { exp_nonpos_ps_avx2(arg) });
     let u_neg = _mm256_cmp_ps(u, _mm256_setzero_ps(), _CMP_LT_OQ);
-    let erfc = _mm256_blendv_ps(erfc_abs, neg_erfc, u_neg);
-    _mm256_mul_ps(half, erfc)
+    _mm256_blendv_ps(h, _mm256_sub_ps(one, h), u_neg)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -108,6 +236,56 @@ unsafe fn exp_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
     }
 }
 
+/// Standard normal CDF for `PrecisionMode::Fastest`: the five-term Abramowitz-Stegun erfc (absolute error about 1.5e-7) instead of the
+/// degree-9 fit with relative accuracy in the tails.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn norm_cdf_fast_ps_avx2(x: __m256) -> __m256 {
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let u = _mm256_mul_ps(x, _mm256_set1_ps(-std::f32::consts::FRAC_1_SQRT_2));
+    let z = _mm256_and_ps(u, abs_mask);
+    let one = _mm256_set1_ps(1.0);
+    let t = _mm256_div_ps(one, _mm256_fmadd_ps(_mm256_set1_ps(0.327_591_1), z, one));
+    let mut p = _mm256_set1_ps(1.061_405_4);
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-1.453_152));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(1.421_413_8));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-0.284_496_74));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0.254_829_6));
+    let e = unsafe { exp_nonpos_ps_avx2(_mm256_xor_ps(_mm256_mul_ps(z, z), _mm256_set1_ps(-0.0))) };
+    let erfc_abs = _mm256_mul_ps(_mm256_mul_ps(p, t), e);
+    let neg = _mm256_sub_ps(_mm256_set1_ps(2.0), erfc_abs);
+    let erfc = _mm256_blendv_ps(erfc_abs, neg, _mm256_cmp_ps(u, _mm256_setzero_ps(), _CMP_LT_OQ));
+    _mm256_mul_ps(_mm256_set1_ps(0.5), erfc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gelu_fast_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
+    let n = src.len();
+    let mut i = 0usize;
+    let (sp, dp) = (src.as_ptr(), dst.as_mut_ptr());
+    while i + 16 <= n {
+        let (x0, x1) = unsafe { (_mm256_loadu_ps(sp.add(i)), _mm256_loadu_ps(sp.add(i + 8))) };
+        let (c0, c1) = unsafe { (norm_cdf_fast_ps_avx2(x0), norm_cdf_fast_ps_avx2(x1)) };
+        unsafe {
+            _mm256_storeu_ps(dp.add(i), _mm256_mul_ps(x0, c0));
+            _mm256_storeu_ps(dp.add(i + 8), _mm256_mul_ps(x1, c1));
+        }
+        i += 16;
+    }
+    while i + 8 <= n {
+        let x = unsafe { _mm256_loadu_ps(sp.add(i)) };
+        unsafe { _mm256_storeu_ps(dp.add(i), _mm256_mul_ps(x, norm_cdf_fast_ps_avx2(x))) };
+        i += 8;
+    }
+    while i < n {
+        let x = unsafe { *sp.add(i) };
+        unsafe { *dp.add(i) = x * super::cpu::fast_norm_cdf_f32(x) };
+        i += 1;
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn gelu_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
@@ -115,6 +293,15 @@ unsafe fn gelu_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
     let mut i = 0usize;
     let sp = src.as_ptr();
     let dp = dst.as_mut_ptr();
+    while i + 16 <= n {
+        let (x0, x1) = unsafe { (_mm256_loadu_ps(sp.add(i)), _mm256_loadu_ps(sp.add(i + 8))) };
+        let (c0, c1) = unsafe { (norm_cdf_ps_avx2(x0), norm_cdf_ps_avx2(x1)) };
+        unsafe {
+            _mm256_storeu_ps(dp.add(i), _mm256_mul_ps(x0, c0));
+            _mm256_storeu_ps(dp.add(i + 8), _mm256_mul_ps(x1, c1));
+        }
+        i += 16;
+    }
     while i + 8 <= n {
         let x = unsafe { _mm256_loadu_ps(sp.add(i)) };
         let cdf = unsafe { norm_cdf_ps_avx2(x) };
@@ -243,7 +430,13 @@ unsafe fn softmax_row_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
     i = 0;
     while i + 8 <= n {
         let x = unsafe { _mm256_loadu_ps(sp.add(i)) };
-        let e = unsafe { exp_ps_avx2(_mm256_sub_ps(x, vm)) };
+        // x - m rounds; its exact rounding error (TwoSum) scales the result: exp(x - m) = exp(d) (1 + err). Without it the
+        // relative error of a probability grows with |x - m| (about |x - m| half-ulps, i.e. dozens for logits spread over 100)
+        let d = _mm256_sub_ps(x, vm);
+        let bb = _mm256_sub_ps(d, x);
+        let err = _mm256_add_ps(_mm256_sub_ps(x, _mm256_sub_ps(d, bb)), _mm256_sub_ps(_mm256_setzero_ps(), _mm256_add_ps(vm, bb)));
+        let e0 = unsafe { exp_ps_avx2(d) };
+        let e = _mm256_fmadd_ps(e0, err, e0);
         unsafe { _mm256_storeu_ps(dp.add(i), e) };
         vsum = _mm256_add_ps(vsum, e);
         i += 8;
@@ -279,29 +472,29 @@ unsafe fn layer_norm_row_f32_avx2_impl(src: &[f32], w: &[f32], b: &[f32], dst: &
     let bp = b.as_ptr();
     let dp = dst.as_mut_ptr();
 
-    let sum = unsafe { sum_f32_avx2_impl(src) };
-    let mean = sum / (n as f32);
-    let vmean = _mm256_set1_ps(mean);
+    // the mean as hi + lo (accumulated in f64): centring a row such as 1000 + noise would otherwise lose the noise
+    let (hi, lo) = super::cpu::center_split(src);
+    let (vhi, vlo) = (_mm256_set1_ps(hi), _mm256_set1_ps(lo));
 
     let mut vvar0 = _mm256_setzero_ps();
     let mut vvar1 = _mm256_setzero_ps();
     let mut i = 0usize;
     while i + 16 <= n {
-        let d0 = _mm256_sub_ps(unsafe { _mm256_loadu_ps(sp.add(i)) }, vmean);
-        let d1 = _mm256_sub_ps(unsafe { _mm256_loadu_ps(sp.add(i + 8)) }, vmean);
+        let d0 = _mm256_sub_ps(_mm256_sub_ps(unsafe { _mm256_loadu_ps(sp.add(i)) }, vhi), vlo);
+        let d1 = _mm256_sub_ps(_mm256_sub_ps(unsafe { _mm256_loadu_ps(sp.add(i + 8)) }, vhi), vlo);
         vvar0 = _mm256_fmadd_ps(d0, d0, vvar0);
         vvar1 = _mm256_fmadd_ps(d1, d1, vvar1);
         i += 16;
     }
     vvar0 = _mm256_add_ps(vvar0, vvar1);
     while i + 8 <= n {
-        let d0 = _mm256_sub_ps(unsafe { _mm256_loadu_ps(sp.add(i)) }, vmean);
+        let d0 = _mm256_sub_ps(_mm256_sub_ps(unsafe { _mm256_loadu_ps(sp.add(i)) }, vhi), vlo);
         vvar0 = _mm256_fmadd_ps(d0, d0, vvar0);
         i += 8;
     }
     let mut var_sum = unsafe { hsum256_ps(vvar0) };
     while i < n {
-        let d = unsafe { *sp.add(i) } - mean;
+        let d = (unsafe { *sp.add(i) } - hi) - lo;
         var_sum += d * d;
         i += 1;
     }
@@ -313,7 +506,7 @@ unsafe fn layer_norm_row_f32_avx2_impl(src: &[f32], w: &[f32], b: &[f32], dst: &
         let x = unsafe { _mm256_loadu_ps(sp.add(i)) };
         let wv = unsafe { _mm256_loadu_ps(wp.add(i)) };
         let bv = unsafe { _mm256_loadu_ps(bp.add(i)) };
-        let xhat = _mm256_mul_ps(_mm256_sub_ps(x, vmean), vinv);
+        let xhat = _mm256_mul_ps(_mm256_sub_ps(_mm256_sub_ps(x, vhi), vlo), vinv);
         let out = _mm256_fmadd_ps(xhat, wv, bv);
         unsafe { _mm256_storeu_ps(dp.add(i), out) };
         i += 8;
@@ -322,7 +515,7 @@ unsafe fn layer_norm_row_f32_avx2_impl(src: &[f32], w: &[f32], b: &[f32], dst: &
         let x = unsafe { *sp.add(i) };
         let wv = unsafe { *wp.add(i) };
         let bv = unsafe { *bp.add(i) };
-        unsafe { *dp.add(i) = (x - mean) * inv_std * wv + bv };
+        unsafe { *dp.add(i) = ((x - hi) - lo) * inv_std * wv + bv };
         i += 1;
     }
 }
@@ -334,14 +527,24 @@ pub fn exp_f32_slice(src: &[f32], dst: &mut [f32]) -> bool {
         unsafe { exp_f32_avx2_impl(src, dst) };
         return true;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return super::simd_arm::exp_f32_slice(src, dst);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     false
 }
 
-pub fn gelu_f32_slice(src: &[f32], dst: &mut [f32]) -> bool {
+/// GELU forward; `fast` selects the cheaper five-term erfc used by `PrecisionMode::Fastest` (the caller reads the mode once per tensor).
+pub fn gelu_f32_slice(src: &[f32], dst: &mut [f32], fast: bool) -> bool {
     debug_assert_eq!(src.len(), dst.len());
     #[cfg(target_arch = "x86_64")]
     if has_avx2_fma() {
-        unsafe { gelu_f32_avx2_impl(src, dst) };
+        if fast {
+            unsafe { gelu_fast_f32_avx2_impl(src, dst) };
+        } else {
+            unsafe { gelu_f32_avx2_impl(src, dst) };
+        }
         return true;
     }
     false
@@ -363,6 +566,11 @@ pub fn sum_f32_slice(src: &[f32]) -> Option<f32> {
     if has_avx2_fma() {
         return Some(unsafe { sum_f32_avx2_impl(src) });
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return super::simd_arm::sum_f32_slice(src);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     None
 }
 
@@ -983,17 +1191,9 @@ impl_bin_avx2!(div_f32_avx2_impl, div_f32_slice, _mm256_div_ps, /);
 #[target_feature(enable = "avx2,fma")]
 #[inline]
 unsafe fn sigmoid_ps_avx2(x: __m256) -> __m256 {
-    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
-    let neg_abs = _mm256_xor_ps(_mm256_and_ps(x, abs_mask), _mm256_set1_ps(-0.0));
-    let e = unsafe { exp_ps_avx2(neg_abs) };
-    let one = _mm256_set1_ps(1.0);
-    let denom = _mm256_add_ps(one, e);
-    let pos = _mm256_div_ps(one, denom);
-    let neg = _mm256_mul_ps(e, pos);
-    let is_neg = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
-    let res = _mm256_blendv_ps(pos, neg, is_neg);
+    let (hi, _) = unsafe { sigmoid_hilo_ps_avx2(x) };
     let isnan = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
-    _mm256_blendv_ps(res, x, isnan)
+    _mm256_blendv_ps(hi, x, isnan)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1023,8 +1223,14 @@ unsafe fn silu_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
     let mut i = 0usize;
     while i + 8 <= n {
         let x = unsafe { _mm256_loadu_ps(sp.add(i)) };
-        let s = unsafe { sigmoid_ps_avx2(x) };
-        unsafe { _mm256_storeu_ps(dp.add(i), _mm256_mul_ps(x, s)) };
+        let (sh, sl) = unsafe { sigmoid_hilo_ps_avx2(x) };
+        // x * (sh + sl) with one rounding: the product's rounding error is recovered by an FMA
+        let t = _mm256_mul_ps(x, sh);
+        let terr = _mm256_fmsub_ps(x, sh, t);
+        let r = _mm256_add_ps(t, _mm256_fmadd_ps(x, sl, terr));
+        // an infinite input makes the FMA residual NaN; the plain product (inf, or NaN for a NaN input) is the answer there
+        let bad = _mm256_cmp_ps(r, r, _CMP_UNORD_Q);
+        unsafe { _mm256_storeu_ps(dp.add(i), _mm256_blendv_ps(r, t, bad)) };
         i += 8;
     }
     while i < n {
@@ -1056,6 +1262,77 @@ unsafe fn relu_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh_ps_avx2(x: __m256) -> __m256 {
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+    let ax = _mm256_and_ps(x, abs_mask);
+    let sign = _mm256_andnot_ps(abs_mask, x);
+    // |x| < 1/4: x + x^3 * Q(x^2), Q a degree-4 fit of (tanh(x)/x - 1)/x^2 on x^2 in [0, 1/16] (relative error 0.011 float32 half-ulps)
+    let x2 = _mm256_mul_ps(x, x);
+    let mut p = _mm256_set1_ps(-8.324_3e-3);
+    for c in [2.184_04e-2, -5.396_761e-2, 1.333_333_3e-1, -3.333_333_4e-1] {
+        p = _mm256_fmadd_ps(p, x2, _mm256_set1_ps(c));
+    }
+    let small = _mm256_fmadd_ps(x, _mm256_mul_ps(x2, p), x);
+    // |x| >= 1/4: (E - 1) / (E + 1) with E = e^(2|x|) carried as a hi/lo pair. Numerator and denominator are formed with TwoSum so
+    // neither loses bits, and the quotient is corrected by its residual, so the result is rounded once. The clamp makes E finite
+    // and the result exactly 1 where tanh rounds to 1.
+    let z = _mm256_min_ps(ax, _mm256_set1_ps(9.1));
+    let (eh, el) = unsafe { exp_hilo_ps_avx2(_mm256_add_ps(z, z)) };
+    let one = _mm256_set1_ps(1.0);
+    let neg_one = _mm256_set1_ps(-1.0);
+    let two_sum = |a: __m256, b: __m256| {
+        let s = _mm256_add_ps(a, b);
+        let bb = _mm256_sub_ps(s, a);
+        (s, _mm256_add_ps(_mm256_sub_ps(a, _mm256_sub_ps(s, bb)), _mm256_sub_ps(b, bb)))
+    };
+    let (n_hi, n_e) = two_sum(eh, neg_one);
+    let (d_hi, d_e) = two_sum(eh, one);
+    let n_lo = _mm256_add_ps(n_e, el);
+    let d_lo = _mm256_add_ps(d_e, el);
+    let inv = _mm256_div_ps(one, d_hi);
+    let q0 = _mm256_mul_ps(n_hi, inv);
+    let resid = _mm256_fnmadd_ps(q0, d_lo, _mm256_add_ps(_mm256_fnmadd_ps(q0, d_hi, n_hi), n_lo));
+    let large = _mm256_or_ps(_mm256_fmadd_ps(resid, inv, q0), sign);
+    let is_small = _mm256_cmp_ps(ax, _mm256_set1_ps(0.25), _CMP_LT_OQ);
+    let isnan = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
+    _mm256_blendv_ps(_mm256_blendv_ps(large, small, is_small), x, isnan)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh_f32_avx2_impl(src: &[f32], dst: &mut [f32]) {
+    let n = src.len();
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let x = unsafe { _mm256_loadu_ps(sp.add(i)) };
+        unsafe { _mm256_storeu_ps(dp.add(i), tanh_ps_avx2(x)) };
+        i += 8;
+    }
+    while i < n {
+        unsafe { *dp.add(i) = (*sp.add(i)).tanh() };
+        i += 1;
+    }
+}
+
+pub fn tanh_f32_slice(src: &[f32], dst: &mut [f32]) -> bool {
+    debug_assert_eq!(src.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        unsafe { tanh_f32_avx2_impl(src, dst) };
+        return true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return super::simd_arm::tanh_f32_slice(src, dst);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    false
+}
+
 pub fn sigmoid_f32_slice(src: &[f32], dst: &mut [f32]) -> bool {
     debug_assert_eq!(src.len(), dst.len());
     #[cfg(target_arch = "x86_64")]
@@ -1083,6 +1360,11 @@ pub fn relu_f32_slice(src: &[f32], dst: &mut [f32]) -> bool {
         unsafe { relu_f32_avx2_impl(src, dst) };
         return true;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return super::simd_arm::relu_f32_slice(src, dst);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     false
 }
 
@@ -1257,19 +1539,19 @@ unsafe fn layer_norm_row_bwd_f32_avx2_impl(
     let dwp = dw.as_mut_ptr();
     let dbp = db.as_mut_ptr();
 
-    let mean = unsafe { sum_f32_avx2_impl(x) } / (n as f32);
-    let vmean = _mm256_set1_ps(mean);
+    let (hi, lo) = super::cpu::center_split(x);
+    let (vhi, vlo) = (_mm256_set1_ps(hi), _mm256_set1_ps(lo));
 
     let mut vvar = _mm256_setzero_ps();
     let mut i = 0usize;
     while i + 8 <= n {
-        let d = _mm256_sub_ps(unsafe { _mm256_loadu_ps(xp.add(i)) }, vmean);
+        let d = _mm256_sub_ps(_mm256_sub_ps(unsafe { _mm256_loadu_ps(xp.add(i)) }, vhi), vlo);
         vvar = _mm256_fmadd_ps(d, d, vvar);
         i += 8;
     }
     let mut var_sum = unsafe { hsum256_ps(vvar) };
     while i < n {
-        let d = unsafe { *xp.add(i) } - mean;
+        let d = (unsafe { *xp.add(i) } - hi) - lo;
         var_sum += d * d;
         i += 1;
     }
@@ -1284,7 +1566,7 @@ unsafe fn layer_norm_row_bwd_f32_avx2_impl(
         let xv = unsafe { _mm256_loadu_ps(xp.add(i)) };
         let gv = unsafe { _mm256_loadu_ps(gp.add(i)) };
         let wv = unsafe { _mm256_loadu_ps(wp.add(i)) };
-        let xhat = _mm256_mul_ps(_mm256_sub_ps(xv, vmean), vinv);
+        let xhat = _mm256_mul_ps(_mm256_sub_ps(_mm256_sub_ps(xv, vhi), vlo), vinv);
         let gxhat = _mm256_mul_ps(gv, wv);
         vs1 = _mm256_add_ps(vs1, gxhat);
         vs2 = _mm256_fmadd_ps(gxhat, xhat, vs2);
@@ -1299,7 +1581,7 @@ unsafe fn layer_norm_row_bwd_f32_avx2_impl(
     let mut s1 = unsafe { hsum256_ps(vs1) };
     let mut s2 = unsafe { hsum256_ps(vs2) };
     while i < n {
-        let xhat = (unsafe { *xp.add(i) } - mean) * inv_std;
+        let xhat = ((unsafe { *xp.add(i) } - hi) - lo) * inv_std;
         let gv = unsafe { *gp.add(i) };
         let gxhat = gv * unsafe { *wp.add(i) };
         s1 += gxhat;
@@ -1320,7 +1602,7 @@ unsafe fn layer_norm_row_bwd_f32_avx2_impl(
         let xv = unsafe { _mm256_loadu_ps(xp.add(i)) };
         let gv = unsafe { _mm256_loadu_ps(gp.add(i)) };
         let wv = unsafe { _mm256_loadu_ps(wp.add(i)) };
-        let xhat = _mm256_mul_ps(_mm256_sub_ps(xv, vmean), vinv);
+        let xhat = _mm256_mul_ps(_mm256_sub_ps(_mm256_sub_ps(xv, vhi), vlo), vinv);
         let gxhat = _mm256_mul_ps(gv, wv);
         let sub = _mm256_fmadd_ps(xhat, vm2, vm1);
         let dxv = _mm256_mul_ps(_mm256_sub_ps(gxhat, sub), vinv);
@@ -1328,7 +1610,7 @@ unsafe fn layer_norm_row_bwd_f32_avx2_impl(
         i += 8;
     }
     while i < n {
-        let xhat = (unsafe { *xp.add(i) } - mean) * inv_std;
+        let xhat = ((unsafe { *xp.add(i) } - hi) - lo) * inv_std;
         let gxhat = unsafe { *gp.add(i) * *wp.add(i) };
         unsafe { *dxp.add(i) = (gxhat - s1 * inv_n - xhat * (s2 * inv_n)) * inv_std };
         i += 1;
@@ -1350,4 +1632,39 @@ pub fn layer_norm_row_bwd_f32(
         return true;
     }
     false
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+/// The `(hi, lo)` exponential feeds sigmoid/silu/tanh: `hi + lo` must be within a few hundredths of an ulp of the true value.
+mod exp_hilo_tests {
+    use super::*;
+    #[test]
+    fn exp_hilo_pair_is_accurate() {
+        if !has_avx2_fma() {
+            return;
+        }
+        for (lo, hi) in [(0.5f32, 1.0f32), (1.0, 2.0), (2.0, 4.0), (4.0, 9.0)] {
+            let mut worst = 0f64;
+            let mut mean = 0f64;
+            let n = 20000;
+            for i in 0..n {
+                let x = lo + (hi - lo) * (i as f32) / (n as f32);
+                let (h, l) = unsafe {
+                    let (h, l) = exp_hilo_ps_avx2(_mm256_set1_ps(x));
+                    let mut a = [0f32; 8];
+                    let mut b = [0f32; 8];
+                    _mm256_storeu_ps(a.as_mut_ptr(), h);
+                    _mm256_storeu_ps(b.as_mut_ptr(), l);
+                    (a[0], b[0])
+                };
+                let r = (x as f64).exp();
+                let ulp = (h.to_bits() as i64 - 1) as u32;
+                let ulp = (h - f32::from_bits(ulp)) as f64;
+                let e = ((h as f64 + l as f64) - r).abs() / ulp;
+                worst = worst.max(e);
+                mean += e / n as f64;
+            }
+            assert!(worst < 0.06, "exp_hilo [{lo},{hi}): worst {worst:.4} ulp(hi), mean {mean:.4}");
+        }
+    }
 }

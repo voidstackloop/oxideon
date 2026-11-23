@@ -862,20 +862,17 @@ impl CudaStorage {
     }
 
     pub fn from_cpu(cpu: &CpuStorage, device_index: usize) -> Result<Self> {
-        match cpu {
-            CpuStorage::F32(v) => Self::from_f32_slice(device_index, v),
-            other => Err(Error::Msg(format!(
-                "CudaStorage currently supports F32 tensors, got {:?}",
-                other.dtype()
-            ))),
-        }
+        Self::from_cpu_any(cpu, device_index)
     }
 
     pub fn to_cpu(&self) -> Result<CpuStorage> {
-        Ok(CpuStorage::F32(self.to_f32_vec()?))
+        self.to_cpu_any()
     }
 
     pub fn unary_op(&self, layout: &Layout, op: UnaryOp) -> Result<Self> {
+        if let Some(out) = self.unary_gpu(layout, op)? {
+            return Ok(out);
+        }
         let op_code = match op {
             UnaryOp::Neg => Some(0),
             UnaryOp::Abs => Some(1),
@@ -890,6 +887,7 @@ impl CudaStorage {
             _ => None,
         };
         if let Some(code) = op_code
+            && self.dtype == DType::F32
             && let Some(range) = layout.contiguous_range_in(self.len)
             && range.start == 0
             && range.len() == self.len
@@ -899,14 +897,13 @@ impl CudaStorage {
             return Ok(out);
         }
         let cpu_out = self.to_cpu()?.unary_op(layout, op)?;
-        if cpu_out.dtype() == DType::F32 {
-            Self::from_cpu(&cpu_out, self.device_index)
-        } else {
-            Err(Error::Msg("CudaStorage::unary_op produced non-F32 output".into()))
-        }
+        Self::from_cpu(&cpu_out, self.device_index)
     }
 
     pub fn binary_op(&self, lhs_l: &Layout, rhs: &Self, rhs_l: &Layout, op: BinaryOp) -> Result<Self> {
+        if let Some(out) = self.binary_gpu(lhs_l, rhs, rhs_l, op)? {
+            return Ok(out);
+        }
         let op_code = match op {
             BinaryOp::Add => Some(0),
             BinaryOp::Sub => Some(1),
@@ -917,6 +914,8 @@ impl CudaStorage {
             _ => None,
         };
         if let Some(code) = op_code
+            && self.dtype == DType::F32
+            && rhs.dtype == DType::F32
             && lhs_l.shape() == rhs_l.shape()
             && let Some(ra) = lhs_l.contiguous_range_in(self.len)
             && let Some(rb) = rhs_l.contiguous_range_in(rhs.len)
@@ -934,6 +933,9 @@ impl CudaStorage {
     }
 
     pub fn matmul(&self, lhs_l: &Layout, rhs: &Self, rhs_l: &Layout) -> Result<(Self, Vec<usize>)> {
+        if let Some(out) = self.matmul_gpu(lhs_l, rhs, rhs_l)? {
+            return Ok(out);
+        }
         let (ar, br) = (lhs_l.ndim(), rhs_l.ndim());
         let (m, k) = (lhs_l.shape()[ar - 2], lhs_l.shape()[ar - 1]);
         let (rk, n) = (rhs_l.shape()[br - 2], rhs_l.shape()[br - 1]);
@@ -950,6 +952,8 @@ impl CudaStorage {
 
         if ar == 2
             && br == 2
+            && self.dtype == DType::F32
+            && rhs.dtype == DType::F32
             && lhs_l.is_contiguous()
             && lhs_l.offset() == 0
             && rhs_l.is_contiguous()
@@ -964,6 +968,9 @@ impl CudaStorage {
     }
 
     pub fn softmax_last_axis(&self, layout: &Layout) -> Option<Self> {
+        if self.dtype != DType::F32 {
+            return None;
+        }
         let shape = layout.shape();
         let cols = *shape.last()?;
         if cols == 0 {
@@ -980,16 +987,25 @@ impl CudaStorage {
     }
 
     pub fn reduce_op(&self, layout: &Layout, axes: &[usize], op: ReduceOp) -> Result<Self> {
+        if let Some(out) = self.reduce_gpu(layout, axes, op)? {
+            return Ok(out);
+        }
         let cpu_out = self.to_cpu()?.reduce_op(layout, axes, op)?;
         Self::from_cpu(&cpu_out, self.device_index)
     }
 
     pub fn to_contiguous(&self, layout: &Layout) -> Result<Self> {
+        if let Some(out) = self.contiguous_gpu(layout)? {
+            return Ok(out);
+        }
         let cpu_out = self.to_cpu()?.to_contiguous(layout)?;
         Self::from_cpu(&cpu_out, self.device_index)
     }
 
     pub fn index_select_vals(&self, layout: &Layout, ax: usize, idx: &[i64]) -> Result<Self> {
+        if let Some(out) = self.index_select_gpu(layout, ax, idx)? {
+            return Ok(out);
+        }
         let cpu_out = self.to_cpu()?.index_select_vals(layout, ax, idx)?;
         Self::from_cpu(&cpu_out, self.device_index)
     }

@@ -106,11 +106,20 @@ pub fn clip_grad_norm(params: &[Tensor], max_norm: f64) -> Result<f64> {
     }
     no_grad(|| {
         let mut total_sq = 0.0f64;
+        // device-resident gradients: sum of squares on the device (one small download each, no f64 round trip of the data)
+        let mut pending: Vec<Tensor> = Vec::new();
         for p in params {
             if let Some(g) = p.grad() {
-                let sq = g.square()?.sum()?.item::<f64>()?;
-                total_sq += sq;
+                if let Some(sq) = g.storage().cuda_sum_squares(g.layout()) {
+                    total_sq += sq;
+                } else {
+                    pending.push(g);
+                }
             }
+        }
+        for g in pending {
+            let sq = g.square()?.sum()?.item::<f64>()?;
+            total_sq += sq;
         }
         let total_norm = total_sq.sqrt();
         if total_norm > max_norm {
@@ -355,24 +364,24 @@ impl Optimizer for Adam {
                 *t_slot += 1;
                 let bc1 = 1.0 - self.beta1.powi(*t_slot);
                 let bc2 = 1.0 - self.beta2.powi(*t_slot);
+                let on_cuda = matches!(p.device(), crate::device::Device::Cuda(_)) && g.device() == p.device();
                 if !self.amsgrad
                     && !self.maximize
                     && p.dtype() == crate::dtype::DType::F32
                     && g.dtype() == crate::dtype::DType::F32
-                    && p.device().is_cpu()
-                    && g.device().is_cpu()
+                    && ((p.device().is_cpu() && g.device().is_cpu()) || on_cuda)
                 {
                     let m_buf = match m_slot {
                         Some(m) => m,
                         None => {
-                            *m_slot = Some(Tensor::zeros_f32(p.shape())?);
+                            *m_slot = Some(Tensor::zeros(p.shape(), crate::dtype::DType::F32, &p.device())?);
                             m_slot.as_mut().unwrap()
                         }
                     };
                     let v_buf = match v_slot {
                         Some(v) => v,
                         None => {
-                            *v_slot = Some(Tensor::zeros_f32(p.shape())?);
+                            *v_slot = Some(Tensor::zeros(p.shape(), crate::dtype::DType::F32, &p.device())?);
                             v_slot.as_mut().unwrap()
                         }
                     };

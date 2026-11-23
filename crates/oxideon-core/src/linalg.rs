@@ -21,6 +21,20 @@ impl Tensor {
                 .to_dtype(self.dtype())?
                 .sum_axes(axes, keepdim);
         }
+        if p == 2.0 && !keepdim && axes.len() == self.ndim() && self.numel() > 0 {
+            // the whole tensor, no gradient needed: square and sum in f64, round once
+            let host_f32 = self.dtype() == crate::dtype::DType::F32 && self.device().is_cpu();
+            if host_f32 && !(crate::tensor::is_grad_enabled() && self.requires_grad()) {
+                let guard = self.storage().cpu_ref()?;
+                if let CpuStorage::F32(v) = &*guard
+                    && let Some(r) = self.layout().contiguous_range_in(v.len())
+                {
+                    let s = &v[r];
+                    let norm = crate::backend::cpu::dot_f64_of_f32(s, s).sqrt() as f32;
+                    return Tensor::from_slice(&[norm], &[]);
+                }
+            }
+        }
         if p == 2.0 {
             // No epsilon floor: the norm of a zero vector is exactly 0
             // (like torch; the gradient there is NaN, also like torch).
@@ -48,8 +62,47 @@ impl Tensor {
 
     /// Normalizes `self` along `axis` to unit $L_p$ norm: `x / max(||x||_p, eps)`.
     pub fn normalize(&self, p: f64, axis: isize, eps: f64) -> Result<Tensor> {
+        if let Some(r) = self.normalize_l2_host(p, axis, eps)? {
+            return Ok(r);
+        }
         let denom = self.norm_p(p, &[axis], true)?.clamp(eps, f64::INFINITY)?;
         self.div(&denom)
+    }
+
+    /// [`Tensor::normalize`] for `p = 2` along the last axis of a contiguous host `f32` tensor when no gradient is recorded: the norm
+    /// and the division are carried out in `f64`, so each element is rounded once instead of after the sum of squares, after the
+    /// square root and after the division. `None` when the tensor does not qualify.
+    fn normalize_l2_host(&self, p: f64, axis: isize, eps: f64) -> Result<Option<Tensor>> {
+        let nd = self.ndim() as isize;
+        let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+        if p != 2.0 || needs_grad || nd == 0 || (axis != -1 && axis != nd - 1) || self.dtype() != crate::dtype::DType::F32 || !self.device().is_cpu() {
+            return Ok(None);
+        }
+        let d = *self.shape().last().unwrap();
+        if d == 0 {
+            return Ok(None);
+        }
+        let guard = self.storage().cpu_ref()?;
+        let CpuStorage::F32(v) = &*guard else { return Ok(None) };
+        let Some(range) = self.layout().contiguous_range_in(v.len()) else { return Ok(None) };
+        let src = &v[range];
+        let mut out = vec![0.0f32; src.len()];
+        let row = |(x, o): (&[f32], &mut [f32])| {
+            let nrm = crate::backend::cpu::dot_f64_of_f32(x, x).sqrt().max(eps);
+            for (o, &v) in o.iter_mut().zip(x) {
+                *o = (v as f64 / nrm) as f32;
+            }
+        };
+        #[cfg(feature = "rayon")]
+        if src.len() >= 1 << 16 {
+            use rayon::prelude::*;
+            out.par_chunks_mut(d).zip(src.par_chunks(d)).for_each(|(o, x)| row((x, o)));
+            return Ok(Some(Tensor::from_slice(&out, self.shape())?));
+        }
+        for (o, x) in out.chunks_mut(d).zip(src.chunks(d)) {
+            row((x, o));
+        }
+        Ok(Some(Tensor::from_slice(&out, self.shape())?))
     }
 
     /// Pairwise Euclidean distance matrix between `[..., n, d]` and `[..., m, d]` -> `[..., n, m]`.

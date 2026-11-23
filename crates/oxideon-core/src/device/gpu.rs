@@ -24,6 +24,12 @@ pub enum GpuBackendKind {
     Wgpu,
 }
 
+/// `n` GiB as a `usize`, saturating on 32-bit targets (where 24 GiB does not fit).
+const fn gib(n: u64) -> usize {
+    let bytes = n << 30;
+    if bytes > usize::MAX as u64 { usize::MAX } else { bytes as usize }
+}
+
 /// GPU Compute Hardware Descriptor.
 #[derive(Debug, Clone)]
 pub struct GpuDescriptor {
@@ -128,7 +134,7 @@ impl GpuRegistry {
                         0,
                         name,
                         GpuBackendKind::Wgpu,
-                        16 * 1024 * 1024 * 1024, // 16GB
+                        gib(16), // 16GB
                         64,
                         32.0,
                         true,
@@ -145,7 +151,7 @@ impl GpuRegistry {
                     0,
                     "Simulated Accelerator 0 (host memory)",
                     GpuBackendKind::Cuda,
-                    24 * 1024 * 1024 * 1024, // 24GB
+                    gib(24), // 24GB
                     128,
                     65.0,
                     true,

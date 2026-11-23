@@ -4,8 +4,11 @@
 //! [`to_dlpack`] returns a heap `DLManagedTensor` whose `deleter` the consumer must call exactly once; [`from_dlpack`]
 //! consumes one (strided, offset and non-contiguous inputs included) and calls its deleter.
 //!
-//! ponytail: both directions copy the data (storage here can be reallocated behind its lock, so a borrowed pointer could
-//! dangle). Zero-copy export needs pinned storage; add it if exchange of very large arrays becomes a bottleneck.
+//! Both directions are zero-copy when they can be. Export pins the tensor's storage (see [`Storage::pin_dlpack`]) so the
+//! consumer's pointer stays valid. Import of aligned, non-negatively strided CPU data builds a tensor that **aliases the
+//! producer's memory** (writes through either side are visible to the other); the producer's `deleter` runs when the last
+//! handle to that storage drops. Anything else (misaligned, negative strides, `bool`, empty) is copied and the deleter runs
+//! immediately.
 
 use crate::dtype::{DType, bf16, f16};
 use crate::error::{Error, Result};
@@ -303,6 +306,10 @@ pub unsafe fn from_dlpack(managed: *mut DLManagedTensor) -> Result<Tensor> {
         return Err(err("null DLManagedTensor"));
     }
     // SAFETY: validity of the pointer and of what it describes is the caller's contract (see above).
+    if let Some(t) = unsafe { try_alias(managed) } {
+        return Ok(t);
+    }
+    // SAFETY: validity of the pointer and of what it describes is the caller's contract (see above).
     let result = unsafe { read(&(*managed).dl_tensor) };
     // SAFETY: the tensor has not been consumed before (caller's contract); the deleter is called exactly once, here.
     unsafe {
@@ -310,6 +317,214 @@ pub unsafe fn from_dlpack(managed: *mut DLManagedTensor) -> Result<Tensor> {
             d(managed);
         }
     }
+    result
+}
+
+/// A `Send` wrapper for the producer's `DLManagedTensor` pointer (its deleter may run on any thread, as the protocol allows).
+struct SendPtr(*mut DLManagedTensor);
+// SAFETY: the DLPack contract lets the consumer call the deleter from any thread.
+unsafe impl Send for SendPtr {}
+// SAFETY: the pointer is only dereferenced once, to call the deleter.
+unsafe impl Sync for SendPtr {}
+
+/// Zero-copy import: a tensor aliasing the producer's buffer, or `None` when the data needs the copying path.
+///
+/// # Safety
+/// As [`from_dlpack`].
+unsafe fn try_alias(managed: *mut DLManagedTensor) -> Option<Tensor> {
+    // SAFETY: the caller guarantees `managed` is valid.
+    let (cpu, layout) = unsafe { alias_parts(&(*managed).dl_tensor) }?;
+    let owner = SendPtr(managed);
+    Some(alias_tensor(cpu, layout, move || {
+        let owner = owner;
+        // SAFETY: the producer's deleter is called exactly once, when the last handle to the aliased storage drops.
+        unsafe {
+            if let Some(d) = (*owner.0).deleter {
+                d(owner.0);
+            }
+        }
+    }))
+}
+
+fn alias_tensor(cpu: crate::backend::CpuStorage, layout: crate::layout::Layout, release: impl FnOnce() + Send + Sync + 'static) -> Tensor {
+    Tensor::from_storage(crate::backend::Storage::from_foreign_cpu(cpu, Box::new(release)), layout)
+}
+
+/// The storage and layout for a zero-copy view of `t`, or `None` when the data needs the copying path.
+///
+/// # Safety
+/// `t` must describe readable, writable memory that outlives the returned storage (see [`from_dlpack`]).
+unsafe fn alias_parts(t: &DLTensor) -> Option<(crate::backend::CpuStorage, crate::layout::Layout)> {
+    use crate::backend::CpuStorage;
+    use crate::layout::Layout;
+    if t.device.device_type != DL_CPU || t.data.is_null() || t.ndim < 0 {
+        return None;
+    }
+    let dtype = from_dl_type(t.dtype).ok()?;
+    let ndim = t.ndim as usize;
+    if ndim > 0 && t.shape.is_null() {
+        return None;
+    }
+    // SAFETY: `shape` / `strides` hold `ndim` entries per the DLPack contract.
+    let shape: Vec<i64> = if ndim == 0 { vec![] } else { unsafe { std::slice::from_raw_parts(t.shape, ndim) }.to_vec() };
+    if shape.iter().any(|&d| d <= 0) {
+        return None; // empty tensors take the copying path
+    }
+    let strides: Vec<i64> = if t.strides.is_null() {
+        // row-major strides in elements
+        let mut s = vec![1i64; ndim];
+        let mut acc = 1i64;
+        for i in (0..ndim).rev() {
+            s[i] = acc;
+            acc = acc.checked_mul(shape[i])?;
+        }
+        s
+    } else {
+        unsafe { std::slice::from_raw_parts(t.strides, ndim) }.to_vec()
+    };
+    if strides.iter().any(|&s| s < 0) {
+        return None;
+    }
+    // elements the buffer must span: one past the last addressable element
+    let mut span: i64 = 1;
+    for (d, s) in shape.iter().zip(&strides) {
+        span = span.checked_add((d - 1).checked_mul(*s)?)?;
+    }
+    let len = usize::try_from(span).ok()?;
+    let esize = dtype.size_in_bytes();
+    len.checked_mul(esize)?;
+    let ptr = (t.data as *mut u8).wrapping_add(t.byte_offset as usize);
+    macro_rules! build {
+        ($variant:ident, $ty:ty) => {{
+            if (ptr as usize) % std::mem::align_of::<$ty>() != 0 {
+                return None;
+            }
+            // SAFETY: the memory is `len` valid elements; this Vec is detached (`forget_buffer`) before the storage is
+            // released, so it never reaches the allocator.
+            CpuStorage::$variant(unsafe { Vec::from_raw_parts(ptr as *mut $ty, len, len) })
+        }};
+    }
+    let cpu = match dtype {
+        DType::U8 => build!(U8, u8),
+        DType::I8 => build!(I8, i8),
+        DType::U16 => build!(U16, u16),
+        DType::I16 => build!(I16, i16),
+        DType::U32 => build!(U32, u32),
+        DType::I32 => build!(I32, i32),
+        DType::U64 => build!(U64, u64),
+        DType::I64 => build!(I64, i64),
+        DType::F16 => build!(F16, f16),
+        DType::BF16 => build!(BF16, bf16),
+        DType::F32 => build!(F32, f32),
+        DType::F64 => build!(F64, f64),
+        DType::C64 => build!(C64, [f32; 2]),
+        DType::C128 => build!(C128, [f64; 2]),
+        _ => return None, // bool (needs 0/1 validation) and the 8-bit floats are copied
+    };
+    let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+    let layout = if t.strides.is_null() { Layout::contiguous(dims) } else { Layout::new(dims, strides.iter().map(|&s| s as isize).collect(), 0) };
+    Some((cpu, layout))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DLPack 1.x (`DLManagedTensorVersioned`): carries a version and flags, so a consumer can tell a writable buffer from a
+// read-only one (NumPy only hands out writable arrays for versioned capsules).
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The `flags` bit marking a read-only buffer.
+pub const DLPACK_FLAG_READ_ONLY: u64 = 1;
+/// The `flags` bit marking a producer that already copied the data.
+pub const DLPACK_FLAG_IS_COPIED: u64 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DLPackVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+#[repr(C)]
+pub struct DLManagedTensorVersioned {
+    pub version: DLPackVersion,
+    pub manager_ctx: *mut c_void,
+    pub deleter: Option<unsafe extern "C" fn(*mut DLManagedTensorVersioned)>,
+    pub flags: u64,
+    pub dl_tensor: DLTensor,
+}
+
+unsafe extern "C" fn delete_versioned(p: *mut DLManagedTensorVersioned) {
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: built by `to_dlpack_versioned` from two `Box::into_raw`s; the consumer calls the deleter exactly once.
+    unsafe {
+        let m = Box::from_raw(p);
+        let inner = m.manager_ctx as *mut DLManagedTensor;
+        if let Some(d) = (*inner).deleter {
+            d(inner);
+        }
+    }
+}
+
+/// Exports `t` as a DLPack 1.0 `DLManagedTensorVersioned` (writable, zero-copy exactly like [`to_dlpack`]).
+pub fn to_dlpack_versioned(t: &Tensor) -> Result<*mut DLManagedTensorVersioned> {
+    let inner = to_dlpack(t)?;
+    // SAFETY: `inner` was just created by `to_dlpack`; its shape / strides stay alive until its deleter runs, which only
+    // `delete_versioned` does.
+    let dl_tensor = unsafe { std::ptr::read(&(*inner).dl_tensor) };
+    Ok(Box::into_raw(Box::new(DLManagedTensorVersioned {
+        version: DLPackVersion { major: 1, minor: 0 },
+        manager_ctx: inner as *mut c_void,
+        deleter: Some(delete_versioned),
+        flags: 0,
+        dl_tensor,
+    })))
+}
+
+struct SendPtrV(*mut DLManagedTensorVersioned);
+// SAFETY: as `SendPtr`: only dereferenced once, to call the deleter.
+unsafe impl Send for SendPtrV {}
+unsafe impl Sync for SendPtrV {}
+
+/// Imports a versioned capsule: zero-copy when it is writable and CPU-resident, otherwise a copy. Calls its deleter (now for
+/// a copy, when the last handle drops for an alias).
+///
+/// # Safety
+/// `managed` must be a valid, not yet consumed `DLManagedTensorVersioned` (see [`from_dlpack`]).
+pub unsafe fn from_dlpack_versioned(managed: *mut DLManagedTensorVersioned) -> Result<Tensor> {
+    if managed.is_null() {
+        return Err(err("null DLManagedTensorVersioned"));
+    }
+    // SAFETY: validity is the caller's contract.
+    let (version, flags) = unsafe { ((*managed).version, (*managed).flags) };
+    let call_deleter = move || unsafe {
+        if let Some(d) = (*managed).deleter {
+            d(managed);
+        }
+    };
+    if version.major != 1 {
+        call_deleter();
+        return Err(err(format!("unsupported DLPack major version {}", version.major)));
+    }
+    if flags & DLPACK_FLAG_READ_ONLY == 0
+        // SAFETY: as above
+        && let Some((cpu, layout)) = unsafe { alias_parts(&(*managed).dl_tensor) }
+    {
+        let owner = SendPtrV(managed);
+        return Ok(alias_tensor(cpu, layout, move || {
+            let owner = owner;
+            // SAFETY: called once, when the last handle to the aliased storage drops
+            unsafe {
+                if let Some(d) = (*owner.0).deleter {
+                    d(owner.0);
+                }
+            }
+        }));
+    }
+    // read-only data must never be aliased by a writable tensor: copy it
+    // SAFETY: the caller guarantees the tensor description is valid.
+    let result = unsafe { read(&(*managed).dl_tensor) };
+    call_deleter();
     result
 }
 
@@ -407,9 +622,162 @@ mod tests {
         assert!(t.retarget(&other).is_err());
         t.assign(&other).unwrap();
         let back = unsafe { from_dlpack(p) }.unwrap();
-        assert!(!t.storage().is_dlpack_pinned());
+        // the import aliases the exported buffer, so the pin lasts as long as `back` lives
+        assert!(t.storage().is_dlpack_pinned());
         assert_eq!(back.to_vec::<f32>().unwrap(), vec![9.0, 8.0, 7.0, 6.0]);
+        drop(back);
+        assert!(!t.storage().is_dlpack_pinned());
         assert!(t.retarget(&other).is_ok());
+    }
+
+    /// Host memory with a DLPack header around it, standing in for a producer such as NumPy.
+    struct Foreign {
+        data: Vec<f32>,
+        shape: Vec<i64>,
+        strides: Vec<i64>,
+    }
+    // the release counter below is global, so the tests that read it must not overlap
+    static FOREIGN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static FOREIGN_FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    unsafe extern "C" fn free_foreign(p: *mut DLManagedTensor) {
+        // SAFETY: built by `foreign_capsule` from two `Box::into_raw`s
+        unsafe {
+            let m = Box::from_raw(p);
+            drop(Box::from_raw(m.manager_ctx as *mut Foreign));
+        }
+        FOREIGN_FREED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn foreign_capsule(data: Vec<f32>, shape: Vec<i64>, strides: Option<Vec<i64>>, byte_offset: u64) -> *mut DLManagedTensor {
+        let mut owner = Box::new(Foreign { data, shape, strides: strides.clone().unwrap_or_default() });
+        let t = DLTensor {
+            data: owner.data.as_mut_ptr() as *mut c_void,
+            device: DLDevice { device_type: DL_CPU, device_id: 0 },
+            ndim: owner.shape.len() as i32,
+            dtype: DLDataType { code: CODE_FLOAT, bits: 32, lanes: 1 },
+            shape: owner.shape.as_mut_ptr(),
+            strides: if strides.is_some() { owner.strides.as_mut_ptr() } else { std::ptr::null_mut() },
+            byte_offset,
+        };
+        Box::into_raw(Box::new(DLManagedTensor { dl_tensor: t, manager_ctx: Box::into_raw(owner) as *mut c_void, deleter: Some(free_foreign) }))
+    }
+
+    #[test]
+    fn import_aliases_foreign_memory_and_releases_it_with_the_last_handle() {
+        let _g = FOREIGN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let freed = || FOREIGN_FREED.load(std::sync::atomic::Ordering::SeqCst);
+        let before = freed();
+        let cap = foreign_capsule((0..6).map(|i| i as f32).collect(), vec![2, 3], None, 0);
+        let data_ptr = unsafe { (*cap).dl_tensor.data };
+        let t = unsafe { from_dlpack(cap) }.unwrap();
+        assert_eq!(freed(), before, "the producer's buffer must stay alive while the tensor does");
+        // the tensor reads the producer's memory itself, not a copy
+        let ptr = match &*t.storage().read() {
+            crate::backend::StorageInner::Cpu(c) => c.raw_cpu_ptr() as *mut c_void,
+            _ => unreachable!(),
+        };
+        assert_eq!(ptr, data_ptr);
+        assert_eq!(t.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        // computation works on the aliased data, views share it, and the storage cannot be reallocated or replaced
+        assert_eq!(t.add_scalar(1.0).unwrap().to_vec::<f32>().unwrap()[5], 6.0);
+        let view = t.transpose(0, 1).unwrap();
+        assert!(t.storage().is_dlpack_pinned());
+        assert!(t.retarget(&Tensor::from_slice(&[0.0f32; 6], &[2, 3]).unwrap()).is_err());
+        // in-place writes go through to the producer's memory
+        t.assign(&Tensor::from_slice(&[9.0f32; 6], &[2, 3]).unwrap()).unwrap();
+        assert_eq!(unsafe { *(data_ptr as *const f32) }, 9.0);
+        drop(t);
+        assert_eq!(freed(), before, "a live view keeps the buffer");
+        assert_eq!(view.to_vec::<f32>().unwrap()[0], 9.0);
+        drop(view);
+        assert_eq!(freed(), before + 1, "the deleter runs exactly once, when the last handle drops");
+    }
+
+    #[test]
+    fn strided_and_offset_imports_alias_too_and_odd_cases_fall_back_to_copies() {
+        let _g = FOREIGN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let freed = || FOREIGN_FREED.load(std::sync::atomic::Ordering::SeqCst);
+        let before = freed();
+        // a transposed 3x2 view of a 2x3 buffer, starting one element in
+        let cap = foreign_capsule((0..8).map(|i| i as f32).collect(), vec![3, 2], Some(vec![1, 3]), 4);
+        let t = unsafe { from_dlpack(cap) }.unwrap();
+        assert_eq!(t.shape(), &[3, 2]);
+        assert_eq!(t.to_vec::<f32>().unwrap(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(freed(), before, "aliased: not released yet");
+        drop(t);
+        assert_eq!(freed(), before + 1);
+        // negative strides, empty tensors and misaligned data are copied and released immediately
+        let cap = foreign_capsule((0..4).map(|i| i as f32).collect(), vec![2, 2], Some(vec![-2, 1]), 8);
+        let t = unsafe { from_dlpack(cap) }.unwrap();
+        assert_eq!(freed(), before + 2, "copied: released at import");
+        assert_eq!(t.to_vec::<f32>().unwrap(), vec![2.0, 3.0, 0.0, 1.0]);
+        let cap = foreign_capsule(vec![1.0; 4], vec![0, 2], None, 0);
+        assert_eq!(unsafe { from_dlpack(cap) }.unwrap().numel(), 0);
+        assert_eq!(freed(), before + 3);
+        let cap = foreign_capsule(vec![1.0; 4], vec![3], None, 2); // 2 bytes in: not 4-aligned
+        let _ = unsafe { from_dlpack(cap) };
+        assert_eq!(freed(), before + 4);
+    }
+
+    #[test]
+    fn an_imported_tensor_can_be_dropped_on_another_thread() {
+        let _g = FOREIGN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let freed = || FOREIGN_FREED.load(std::sync::atomic::Ordering::SeqCst);
+        let before = freed();
+        let t = unsafe { from_dlpack(foreign_capsule(vec![2.0; 1000], vec![1000], None, 0)) }.unwrap();
+        let sum = std::thread::spawn(move || t.sum().unwrap().item::<f32>().unwrap()).join().unwrap();
+        assert_eq!(sum, 2000.0);
+        assert_eq!(freed(), before + 1);
+    }
+
+    #[test]
+    fn versioned_export_is_zero_copy_writable_and_round_trips() {
+        let _g = FOREIGN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+        let p = to_dlpack_versioned(&t).unwrap();
+        unsafe {
+            assert_eq!(((*p).version.major, (*p).version.minor), (1, 0));
+            assert_eq!((*p).flags & DLPACK_FLAG_READ_ONLY, 0, "exports are writable");
+        }
+        assert!(t.storage().is_dlpack_pinned());
+        let back = unsafe { from_dlpack_versioned(p) }.unwrap();
+        assert_eq!(back.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        back.assign(&Tensor::from_slice(&[9.0f32; 4], &[2, 2]).unwrap()).unwrap();
+        assert_eq!(t.to_vec::<f32>().unwrap(), vec![9.0; 4], "the round trip shares memory");
+        drop(back);
+        assert!(!t.storage().is_dlpack_pinned(), "the deleter chain ran and released the pin");
+    }
+
+    #[test]
+    fn read_only_versioned_data_is_copied_never_aliased() {
+        let _g = FOREIGN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let freed = || FOREIGN_FREED.load(std::sync::atomic::Ordering::SeqCst);
+        let before = freed();
+        let v0 = foreign_capsule(vec![1.0, 2.0, 3.0], vec![3], None, 0);
+        // wrap the v0 capsule in a versioned header flagged read-only
+        let mut hdr = Box::new(DLManagedTensorVersioned {
+            version: DLPackVersion { major: 1, minor: 0 },
+            manager_ctx: v0 as *mut c_void,
+            deleter: Some(delete_versioned),
+            flags: DLPACK_FLAG_READ_ONLY,
+            dl_tensor: unsafe { std::ptr::read(&(*v0).dl_tensor) },
+        });
+        let t = unsafe { from_dlpack_versioned(&mut *hdr as *mut _) }.unwrap();
+        std::mem::forget(hdr); // the deleter already freed it
+        assert_eq!(freed(), before + 1, "copied: the producer's buffer is released immediately");
+        assert_eq!(t.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+        assert!(!t.storage().is_dlpack_pinned(), "a copy owns its memory and is not pinned");
+    }
+
+    #[test]
+    fn re_exporting_an_import_shares_the_original_memory() {
+        let _g = FOREIGN_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let cap = foreign_capsule(vec![1.0, 2.0, 3.0, 4.0], vec![4], None, 0);
+        let data_ptr = unsafe { (*cap).dl_tensor.data };
+        let t = unsafe { from_dlpack(cap) }.unwrap();
+        let again = to_dlpack(&t).unwrap();
+        assert_eq!(unsafe { (*again).dl_tensor.data }, data_ptr, "numpy -> oxideon -> torch never copies");
+        let back = unsafe { from_dlpack(again) }.unwrap();
+        assert_eq!(back.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     static DELETED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

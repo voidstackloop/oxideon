@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Speed (accuracy unchanged unless noted)
+- Balanced `gelu` 150 -> 135 us per 1M elements (PyTorch 111 us): the tail exponent `poly - z^2` is never positive, so it uses an `exp` without the
+  upper clamp and the NaN restore (a NaN input still gives NaN through `x * cdf`), the 0.5 of the cdf folds into the quotient factor, and
+  two vectors run per iteration. Fastest `gelu` 113 -> 101 us. The measured errors are identical.
+- Balanced conv2d: the TwoSum error of each channel chain starts the next chain instead of living in a register set of its own (that
+  spilled 24 vectors at every chain boundary), and from 32 input channels the chains are 8 deep. 4x64x56x56 conv2d 1690 -> 1340-1470 us
+  (PyTorch 1529 us); 8x16x64x64 665 -> 640-660 us (PyTorch 512 us). Accuracy vs PyTorch (worst / mean): 16 channels 3.05x / 1.55x -> 2.69x /
+  1.54x, 64 channels 4.64x / 2.99x -> 4.58x / 2.67x.
+
+### Fixes
+- CUDA: `where_cond` with a broadcast mask (kernel declined) returned a host-backed tensor labelled `cuda:0`, so the next matmul failed with
+  `device mismatch (cuda:0 vs cuda:0)` (attention with a causal mask on the composed path); it now returns CUDA storage.
+- NVRTC is loaded with the wide-character Windows loader, so it is found under a user directory with non-ASCII characters
+  (`C:\Users\Jürgen\...`); before, the CUDA tests quietly skipped and every `.cu` kernel fell back to the host.
+- `ox.compile` sets `_compiled` once a call has been traced into a graph.
+- Examples: `gguf_generate` and `gguf_info`/`accuracy_dump` report a bad path, an unsupported tokenizer or a missing argument instead of
+  panicking; `browser_demo` says that it is a simulation; the duplicate `tools/core_ops_bench_*.py` scripts are gone (use `benchmarks/`).
+
+### Numerical accuracy (see `docs/NUMERICAL_ACCURACY.md`)
+- `PrecisionMode { Fastest, Balanced, Highest }`: one application-wide switch for `f32` matrix products (default `Balanced`; `Highest` does f64
+  accumulation at ~1.9x the time of `Fastest`). Set with `oxideon_core::set_precision_mode`, the `OXIDEON_PRECISION` environment
+  variable, or `oxideon.set_precision_mode("balanced")` in Python.
+- Float32 results measured against a float64 reference next to PyTorch (`benchmarks/accuracy_vs_pytorch.py`, 40 cases, worst and
+  mean error together). Large wins on long sums/means/dot/norm (f64 accumulators), matmul, softmax/log_softmax, layer/batch/group
+  norm and variance of offset data (accurate centring, `Tensor::centered_by_mean`), `cosine_similarity`, `softplus`, `elu`.
+- Default `Balanced` matmul: 48-deep f32 chains (matmul 2.35x / 1.66x better than PyTorch on worst / mean error); sigmoid, silu and tanh
+  use a hi/lo `exp` (accurate to ~0.03 ulp; tanh now ties PyTorch on worst and mean, sigmoid/silu worst 2.5-2.8x better); Winograd convolution sums channels in TwoSum-combined chains (conv2d 3.0x / 1.5x and 4.6x / 3.0x); `normalize`
+  (L2) and `var_axis` run in f64 on the host fast path.
+- `Fastest` matmul runs through the same block grid in 256-deep `f32` slices (was one `gemm` call: a 1x4096x4096 product took 2.5 ms, now 1.2 ms; matmul 512 / 1024 / k=4096 now 352 / 2823 / 707 us, all at or under PyTorch), and its k=512 error falls from about 6 to about 2.6 half-ulps. Balanced products inside a rayon worker run their chains serially instead of opening a parallel region per chain.
+- `Fastest` keeps plain `f32` accumulation for any `k` (the `f64` group combine of the long-`k` chain loop is `Balanced` only), the wide chain loop reuses per-thread work buffers, and the GELU mode is read once per tensor.
+- The buffer pool reads its limit and updates its byte accounting under one lock (a racing `give` could overshoot a freshly lowered limit, which made `typed_buffers_stay_inside_the_global_byte_limit` flaky).
+- `Fastest` mode evaluates GELU with a cheaper five-term erfc (150 -> 113 us per 1M elements, level with PyTorch; abs. CDF error ~1.5e-7).
+- Faster `Balanced` matmul (bit-identical results): the accumulation chains of one product run inside a single parallel region over output
+  blocks instead of one region per chain (matmul 512: 568 -> 391 us, 1024: 4.5 -> 3.3 ms, k=4096: 2.05 -> 0.96 ms, MLP step 1.35 -> 1.0 ms;
+  PyTorch 392 / 3045 / 804 / 832 us; with a 2-D block grid: 371 / 2813 / 866 / 860 us). The erfc polynomial of `gelu` and the plain `exp` polynomial use Estrin evaluation (gelu 184 -> 150 us, same error). Fused `layer_norm` variance is vectorized (83 -> 52 us, now faster than PyTorch and more accurate).
+- Faster: Winograd 3x3 convolution pipeline, fused unary backward, adaptive column blocks for leading-axis reductions.
+- Image codecs: PNG Adam7 interlacing and progressive JPEG decoding.
+- Fixed: `f32_row_broadcast` used x86 stubs on aarch64 (wrong layer-norm output on ARM); `c_char` portability on aarch64;
+  stale `Linear` graph test.
+
 ### Added
 - Training and serving infrastructure (oxideon-core), each with tests:
   - `loader`: `PrefetchLoader` (worker threads, output order independent of the worker count, per-epoch order fixed by

@@ -54,3 +54,7 @@ python benchmarks/bench_vs_pytorch.py
 
 - `CUDA matmul 1024x1024` (32x32 2x2 register-blocked PTX): **1.404 ms** (**1529.9 GFLOP/s**)
 - `CUDA matmul 2048x2048` (32x32 2x2 register-blocked PTX): **10.148 ms** (**1692.9 GFLOP/s**)
+
+## Numerical accuracy
+
+`accuracy_vs_pytorch.py` scores oxideon and PyTorch float32 results against a float64 reference (worst and mean error side by side); see [`docs/NUMERICAL_ACCURACY.md`](../docs/NUMERICAL_ACCURACY.md).

@@ -118,6 +118,23 @@ fn class_axis_check(name: &str, input: &Tensor) -> Result<()> {
     Ok(())
 }
 
+/// Class indices with `ignore_index` entries replaced by 0 (so they can be gathered safely), and a Bool tensor marking the
+/// entries that count. Everything stays on the targets' device; out-of-range classes are caught by the gather that follows.
+fn safe_index_and_mask(target: &Tensor, ignore_index: Option<i64>) -> Result<(Tensor, Tensor)> {
+    let t = target.to_dtype(crate::DType::I64)?;
+    match ignore_index {
+        Some(v) => {
+            let valid = t.ne_tensor(&t.full_like(v as f64)?)?;
+            let safe = Tensor::where_cond(&valid, &t, &t.zeros_like()?)?;
+            Ok((safe, valid))
+        }
+        None => {
+            let valid = t.ones_like()?.to_dtype(crate::DType::Bool)?;
+            Ok((t, valid))
+        }
+    }
+}
+
 /// Negative log-likelihood of `target` classes under `log_probs` (`[C]`, `[N, C]` or `[N, C, d1, ...]`), with
 /// optional class `weight` and `ignore_index`. `Mean` divides by the total weight of the counted targets.
 pub fn nll_loss_nd(
@@ -135,32 +152,18 @@ pub fn nll_loss_nd(
     } else {
         (log_probs.clone(), target.clone())
     };
-    let c = lp.shape()[1] as i64;
-    let tvals = tg.to_vec::<i64>()?;
-    let mut safe = Vec::with_capacity(tvals.len());
-    let mut valid = Vec::with_capacity(tvals.len());
-    for &t in &tvals {
-        if Some(t) == ignore_index {
-            safe.push(0);
-            valid.push(0.0);
-        } else if t < 0 || t >= c {
-            return Err(Error::Msg(format!("nll_loss_nd: target {t} is out of range for {c} classes")));
-        } else {
-            safe.push(t);
-            valid.push(1.0);
-        }
-    }
+    let (idx, valid) = safe_index_and_mask(&tg, ignore_index)?;
     let dev = lp.device();
-    let idx = Tensor::from_slice_on(&safe, tg.shape(), &dev)?;
+    let _ = dev;
     let picked = lp.gather(1, &idx.unsqueeze(1)?)?.squeeze_axis(1)?; // [N, d...]
-    let mask = Tensor::from_slice_on(&valid, tg.shape(), &dev)?.to_dtype(lp.dtype())?;
+    let mask = valid.to_dtype(lp.dtype())?;
     let w = match weight {
         Some(wt) => {
             if wt.shape() != [lp.shape()[1]] {
                 return Err(Error::Msg("nll_loss_nd: weight must have one entry per class".into()));
             }
             wt.to_dtype(lp.dtype())?
-                .index_select(0, &Tensor::from_slice_on(&safe, &[safe.len()], &dev)?)?
+                .index_select(0, &idx.reshape(&[idx.numel()])?)?
                 .reshape(tg.shape())?
                 .mul(&mask)?
         }
@@ -211,9 +214,8 @@ pub fn cross_entropy_nd(
                 None => logp.clone(),
             };
             let smooth = weighted.sum_axis(cdim, false)?.neg()?.div_scalar(c as f64)?;
-            let ivals = idx.to_vec::<i64>()?;
-            let keep: Vec<f64> = ivals.iter().map(|&t| if Some(t) == ignore_index { 0.0 } else { 1.0 }).collect();
-            let keep_t = Tensor::from_slice_on(&keep, idx.shape(), &logp.device())?.to_dtype(logp.dtype())?;
+            let (safe, valid) = safe_index_and_mask(idx, ignore_index)?;
+            let keep_t = valid.to_dtype(logp.dtype())?;
             let smooth = smooth.mul(&keep_t)?;
             let smooth = match r {
                 Reduction::None => smooth,
@@ -221,10 +223,9 @@ pub fn cross_entropy_nd(
                 Reduction::Mean => {
                     let denom = match weight {
                         Some(w) => {
-                            let safe: Vec<i64> = ivals.iter().map(|&t| if Some(t) == ignore_index { 0 } else { t }).collect();
                             let wi = w
                                 .to_dtype(logp.dtype())?
-                                .index_select(0, &Tensor::from_slice_on(&safe, &[safe.len()], &logp.device())?)?
+                                .index_select(0, &safe.reshape(&[safe.numel()])?)?
                                 .reshape(idx.shape())?
                                 .mul(&keep_t)?;
                             wi.sum()?

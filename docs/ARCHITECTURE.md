@@ -281,5 +281,6 @@ For detailed guides, refer to the following specialized manuals:
 - [Cloud & Distributed Training Manual](CLOUD_AND_DEPLOYMENT.md): AWS S3, GCP Cloud Storage, DDP, and distributed execution.
 - [Scientific AI & Mathematical Modules Manual](SCIENTIFIC_AI_MODULES.md): NOTEARS, graph kernels, evidential regression, and survival analysis.
 - [Benchmarks & Performance Analysis](BENCHMARKS.md): Detailed complexity proofs, microbenchmarks, and empirical speedups.
+- [Numerical Accuracy vs PyTorch](NUMERICAL_ACCURACY.md): worst/mean float32 error against a float64 reference, the matmul precision modes, and how to reproduce.
 - [Getting Started & Hands-on Tutorial](TUTORIAL.md): Step-by-step developer tutorial from tensor basics to foundation models.
 - [Engines Catalog & Milestone Taxonomy](ENGINES_CATALOG.md): Complete list of all 1,000 engine milestones across 100 decadal eras.

@@ -467,6 +467,296 @@ pub fn load_torch_state_dict(path: impl AsRef<std::path::Path>) -> Result<HashMa
     Ok(load_torch_tensors(path)?.into_iter().collect())
 }
 
+fn torch_storage_name(dtype: DType) -> Result<&'static str> {
+    match dtype {
+        DType::F32 => Ok("FloatStorage"),
+        DType::F64 => Ok("DoubleStorage"),
+        DType::F16 => Ok("HalfStorage"),
+        DType::BF16 => Ok("BFloat16Storage"),
+        DType::I64 => Ok("LongStorage"),
+        DType::I32 => Ok("IntStorage"),
+        DType::I16 => Ok("ShortStorage"),
+        DType::I8 => Ok("CharStorage"),
+        DType::U8 => Ok("ByteStorage"),
+        DType::Bool => Ok("BoolStorage"),
+        _ => Err(err(format!("unsupported dtype {dtype:?} for .pt export"))),
+    }
+}
+
+fn pkl_unicode(s: &str, out: &mut Vec<u8>) {
+    out.push(b'X');
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn pkl_int(v: usize, out: &mut Vec<u8>) {
+    if v <= 255 {
+        out.push(b'K');
+        out.push(v as u8);
+    } else if v <= i32::MAX as usize {
+        out.push(b'J');
+        out.extend_from_slice(&(v as i32).to_le_bytes());
+    } else {
+        // LONG1: length byte, then the little-endian two's-complement value (a zero byte keeps it positive)
+        let mut b = (v as u64).to_le_bytes().to_vec();
+        while b.len() > 1 && b[b.len() - 1] == 0 {
+            b.pop();
+        }
+        if b[b.len() - 1] & 0x80 != 0 {
+            b.push(0);
+        }
+        out.push(0x8a);
+        out.push(b.len() as u8);
+        out.extend_from_slice(&b);
+    }
+}
+
+const CRC_TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            k += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
+
+fn zip_crc32(data: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in data {
+        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
+fn build_store_zip(entries: &[(&str, &[u8])]) -> Result<Vec<u8>> {
+    // 32-bit ZIP fields: larger archives would need ZIP64, so refuse them instead of writing a corrupt file
+    let total: usize = entries.iter().map(|(n, d)| d.len() + n.len() * 2 + 100).sum();
+    if total >= u32::MAX as usize || entries.len() >= u16::MAX as usize {
+        return Err(err("checkpoint is too large for a classic ZIP (4 GiB / 65535 entries); ZIP64 is not supported"));
+    }
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for &(name, data) in entries {
+        let local_off = out.len() as u32;
+        let crc = zip_crc32(data);
+        let sz = data.len() as u32;
+        let nlen = name.len() as u16;
+        // Local file header
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // STORE
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&sz.to_le_bytes());
+        out.extend_from_slice(&sz.to_le_bytes());
+        out.extend_from_slice(&nlen.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+
+        // Central directory header
+        central.extend_from_slice(b"PK\x01\x02");
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&sz.to_le_bytes());
+        central.extend_from_slice(&sz.to_le_bytes());
+        central.extend_from_slice(&nlen.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&local_off.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let cd_off = out.len() as u32;
+    let cd_sz = central.len() as u32;
+    let cnt = entries.len() as u16;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&cnt.to_le_bytes());
+    out.extend_from_slice(&cnt.to_le_bytes());
+    out.extend_from_slice(&cd_sz.to_le_bytes());
+    out.extend_from_slice(&cd_off.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    Ok(out)
+}
+
+fn tensor_raw_le_bytes(t: &Tensor) -> Result<Vec<u8>> {
+    use crate::backend::{CpuStorage, StorageInner};
+    let guard = t.storage().read();
+    let cpu = match &*guard {
+        StorageInner::Cpu(c) => c,
+        _ => return Err(err("expected CPU tensor for .pt export")),
+    };
+    let mut out = Vec::new();
+    match cpu {
+        CpuStorage::F32(v) => v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes())),
+        CpuStorage::F64(v) => v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes())),
+        CpuStorage::F16(v) => v.iter().for_each(|x| out.extend_from_slice(&x.to_bits().to_le_bytes())),
+        CpuStorage::BF16(v) => v.iter().for_each(|x| out.extend_from_slice(&x.to_bits().to_le_bytes())),
+        CpuStorage::I64(v) => v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes())),
+        CpuStorage::I32(v) => v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes())),
+        CpuStorage::I16(v) => v.iter().for_each(|x| out.extend_from_slice(&x.to_le_bytes())),
+        CpuStorage::I8(v) => v.iter().for_each(|&x| out.push(x as u8)),
+        CpuStorage::U8(v) => out.extend_from_slice(v),
+        CpuStorage::Bool(v) => v.iter().for_each(|&x| out.push(u8::from(x))),
+        _ => return Err(err(format!("unsupported dtype {:?} for .pt export", t.dtype()))),
+    }
+    Ok(out)
+}
+
+/// Pickles one tensor as `torch._utils._rebuild_tensor_v2(storage, offset, shape, strides, requires_grad, hooks)`; the data
+/// itself goes into the archive entry `data/{idx}`.
+fn pkl_tensor(pkl: &mut Vec<u8>, t: &Tensor, idx: usize, requires_grad: bool) -> Result<()> {
+    let scls = torch_storage_name(t.dtype())?;
+    pkl.extend_from_slice(b"ctorch._utils\n_rebuild_tensor_v2\n(");
+    // BINPERSID tuple: ('storage', StorageClass, key, 'cpu', numel)
+    pkl.push(b'(');
+    pkl_unicode("storage", pkl);
+    pkl.extend_from_slice(format!("ctorch\n{scls}\n").as_bytes());
+    pkl_unicode(&idx.to_string(), pkl);
+    pkl_unicode("cpu", pkl);
+    pkl_int(t.numel(), pkl);
+    pkl.extend_from_slice(b"tQ");
+    pkl_int(0, pkl); // storage_offset
+    pkl.push(b'(');
+    for &d in t.shape() {
+        pkl_int(d, pkl);
+    }
+    pkl.push(b't');
+    pkl.push(b'(');
+    for &st in t.layout().strides() {
+        pkl_int(st as usize, pkl);
+    }
+    pkl.push(b't');
+    pkl.push(if requires_grad { 0x88 } else { 0x89 }); // NEWTRUE / NEWFALSE
+    pkl.extend_from_slice(b"ccollections\nOrderedDict\n)RtR");
+    Ok(())
+}
+
+/// Serializes a named tensor map into a PyTorch-compatible `.pt` ZIP+Pickle archive.
+pub fn serialize_torch_state_dict(tensors: &HashMap<String, Tensor>) -> Result<Vec<u8>> {
+    let mut keys: Vec<&String> = tensors.keys().collect();
+    keys.sort();
+
+    let mut pkl = Vec::new();
+    pkl.extend_from_slice(&[0x80, 0x02]); // PROTO 2
+    pkl.extend_from_slice(b"ccollections\nOrderedDict\n)R(");
+
+    let mut blobs: Vec<(String, Vec<u8>)> = Vec::with_capacity(keys.len());
+    for (idx, name) in keys.iter().enumerate() {
+        let t = tensors[*name].to_device(&crate::backend::Device::Cpu)?.contiguous()?;
+        pkl_unicode(name, &mut pkl);
+        pkl_tensor(&mut pkl, &t, idx, false)?;
+
+        let raw = tensor_raw_le_bytes(&t)?;
+        blobs.push((format!("archive/data/{idx}"), raw));
+    }
+    pkl.extend_from_slice(b"u.");
+
+    let mut zip_entries: Vec<(&str, &[u8])> = Vec::with_capacity(blobs.len() + 3);
+    zip_entries.push(("archive/data.pkl", &pkl));
+    zip_entries.push(("archive/version", b"3\n"));
+    zip_entries.push(("archive/byteorder", b"little"));
+    for (n, b) in &blobs {
+        zip_entries.push((n.as_str(), b.as_slice()));
+    }
+    build_store_zip(&zip_entries)
+}
+
+/// Serializes `tensors` and a TorchScript `forward` into an archive that `torch.jit.load` (and the C++ / mobile runtimes)
+/// accept: a scripted module `Model` whose floating-point tensors are parameters and every other tensor a buffer.
+///
+/// `forward_body` is the body of `forward(self, x: Tensor) -> Tensor` in TorchScript syntax, one statement per line
+/// (without indentation); tensors are available as locals named after their (sanitized) keys, e.g. a key `fc1.weight`
+/// is the local `fc1_weight`. The last statement must `return` the result.
+pub fn serialize_torchscript_module(tensors: &HashMap<String, Tensor>, forward_body: &str) -> Result<Vec<u8>> {
+    let mut entries: Vec<(String, &String)> = Vec::with_capacity(tensors.len());
+    let mut keys: Vec<&String> = tensors.keys().collect();
+    keys.sort();
+    for k in keys {
+        let mut attr: String = k.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+        if attr.is_empty() || attr.starts_with(|c: char| c.is_ascii_digit()) {
+            attr.insert(0, '_');
+        }
+        if ["x", "self", "training", "forward"].contains(&attr.as_str()) || entries.iter().any(|(a, _)| *a == attr) {
+            return Err(err(format!("tensor name '{k}' maps to the reserved or duplicate TorchScript attribute '{attr}'")));
+        }
+        entries.push((attr, k));
+    }
+
+    let mut pkl = vec![0x80, 0x02];
+    pkl.extend_from_slice(b"c__torch__\nModel\n)\x81}(");
+    let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+    let (mut params, mut buffers) = (Vec::new(), Vec::new());
+    for (idx, (attr, key)) in entries.iter().enumerate() {
+        let t = tensors[*key].to_device(&crate::backend::Device::Cpu)?.contiguous()?;
+        let is_param = t.dtype().is_floating_point();
+        pkl_unicode(attr, &mut pkl);
+        pkl_tensor(&mut pkl, &t, idx, is_param)?;
+        blobs.push(tensor_raw_le_bytes(&t)?);
+        if is_param { params.push(attr.clone()) } else { buffers.push(attr.clone()) }
+    }
+    pkl_unicode("training", &mut pkl);
+    pkl.push(0x89); // training = False
+    pkl_unicode("_is_full_backward_hook", &mut pkl);
+    pkl.push(b'N');
+    pkl.extend_from_slice(b"ub.");
+
+    let list = |v: &[String]| v.iter().map(|n| format!("\"{n}\", ")).collect::<String>();
+    let mut code = format!("class Model(Module):\n  __parameters__ = [{}]\n  __buffers__ = [{}]\n", list(&params), list(&buffers));
+    for (attr, _) in &entries {
+        code.push_str(&format!("  {attr} : Tensor\n"));
+    }
+    code.push_str("  training : bool\n  _is_full_backward_hook : Optional[bool]\n  def forward(self: __torch__.Model,\n    x: Tensor) -> Tensor:\n");
+    for (attr, _) in &entries {
+        code.push_str(&format!("    {attr} = self.{attr}\n"));
+    }
+    for line in forward_body.lines().filter(|l| !l.trim().is_empty()) {
+        code.push_str(&format!("    {}\n", line.trim()));
+    }
+
+    let blob_names: Vec<String> = (0..blobs.len()).map(|i| format!("archive/data/{i}")).collect();
+    let mut zip_entries: Vec<(&str, &[u8])> = vec![
+        ("archive/data.pkl", &pkl),
+        ("archive/code/__torch__.py", code.as_bytes()),
+        ("archive/constants.pkl", &[0x80, 0x02, b')', b'.']),
+        ("archive/version", b"3\n"),
+        ("archive/byteorder", b"little"),
+    ];
+    for (n, b) in blob_names.iter().zip(&blobs) {
+        zip_entries.push((n.as_str(), b.as_slice()));
+    }
+    build_store_zip(&zip_entries)
+}
+
+/// Writes a named tensor map as a PyTorch `.pt` checkpoint file.
+pub fn save_torch_state_dict(
+    tensors: &HashMap<String, Tensor>,
+    path: impl AsRef<std::path::Path>,
+) -> Result<()> {
+    let bytes = serialize_torch_state_dict(tensors)?;
+    std::fs::write(path.as_ref(), bytes)
+        .map_err(|e| err(format!("cannot write {}: {e}", path.as_ref().display())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +772,36 @@ mod tests {
         let w = ts[0].1.to_vec::<f32>().unwrap();
         assert!(w.iter().all(|x| x.abs() <= 0.36)); // Linear(8, 4) initializes within +-1/sqrt(8)
         assert!(load_torch_tensors_from_bytes(b"not a checkpoint").is_err());
+    }
+
+    #[test]
+    fn zip_crc32_matches_the_standard_check_value() {
+        assert_eq!(zip_crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(zip_crc32(b""), 0);
+    }
+
+    #[test]
+    fn pickle_ints_cover_every_range() {
+        let enc = |v: usize| {
+            let mut o = Vec::new();
+            pkl_int(v, &mut o);
+            o
+        };
+        assert_eq!(enc(7), vec![b'K', 7]);
+        assert_eq!(enc(70_000), [vec![b'J'], 70_000i32.to_le_bytes().to_vec()].concat());
+        // 3_000_000_000 = 0xB2D05E00: top bit set, so a zero byte keeps it positive
+        assert_eq!(enc(3_000_000_000), vec![0x8a, 5, 0x00, 0x5E, 0xD0, 0xB2, 0x00]);
+        assert_eq!(enc(1 << 40), vec![0x8a, 6, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn writes_and_reads_torch_state_dict() {
+        let mut sd = HashMap::new();
+        sd.insert("w".to_string(), Tensor::from_slice(&[1.0f32, -2.0, 3.0, 4.0], &[2, 2]).unwrap());
+        sd.insert("b".to_string(), Tensor::from_slice(&[0.5f32, -0.5], &[2]).unwrap());
+        let bytes = serialize_torch_state_dict(&sd).unwrap();
+        let loaded: HashMap<String, Tensor> = load_torch_tensors_from_bytes(&bytes).unwrap().into_iter().collect();
+        assert_eq!(loaded["w"].to_vec::<f32>().unwrap(), vec![1.0, -2.0, 3.0, 4.0]);
+        assert_eq!(loaded["b"].to_vec::<f32>().unwrap(), vec![0.5, -0.5]);
     }
 }

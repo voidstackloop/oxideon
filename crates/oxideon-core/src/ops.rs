@@ -221,8 +221,301 @@ fn unfold_fill_seq<T: Copy>(src: &[T], cols: &mut [T], g: &UnfoldGeom) {
     }
 }
 
+/// `m[c_out, tt] = u[c_out, c_in] @ v[c_in, tt]` for the small channel counts of the Winograd batched products (`tt` is a
+/// multiple of 16): 4 output rows by 16 tiles of accumulators stay in AVX2 registers while `c_in` streams through, which beats
+/// a general GEMM at these sizes (its packing and dispatch cost more than the 100 kFLOP product). With `precise` the channels are
+/// summed in short chains instead of one long one, see [`wino_small_gemm_precise`].
+#[cfg(all(feature = "rayon", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn wino_small_gemm(u: &[f32], v: &[f32], m: &mut [f32], c_out: usize, c_in: usize, tt: usize, precise: bool) {
+    use std::arch::x86_64::*;
+    assert!(tt % 16 == 0 && u.len() >= c_out * c_in && v.len() >= c_in * tt && m.len() >= c_out * tt);
+    if precise {
+        // 64 and more channels have error to spare (4.6x / 2.7x better than PyTorch with chains of 8, measured), so the chain totals are
+        // combined half as often; below 32 the margin is thin and the shorter chains stay
+        unsafe {
+            if c_in >= 32 {
+                wino_small_gemm_precise::<8>(u, v, m, c_out, c_in, tt)
+            } else {
+                wino_small_gemm_precise::<4>(u, v, m, c_out, c_in, tt)
+            }
+        };
+        return;
+    }
+    let (up, vp, mp) = (u.as_ptr(), v.as_ptr(), m.as_mut_ptr());
+    for oc0 in (0..c_out).step_by(4) {
+        let nr = (c_out - oc0).min(4);
+        // rows past `nr` repeat the last real row; their results are never stored
+        let urow: [*const f32; 4] = std::array::from_fn(|r| unsafe { up.add((oc0 + r.min(nr - 1)) * c_in) });
+        for t0 in (0..tt).step_by(16) {
+            // one unbroken FMA chain over the channels (the fastest form)
+            let mut acc = [[_mm256_setzero_ps(); 2]; 4];
+            for ic in 0..c_in {
+                // SAFETY: ic < c_in and t0 + 16 <= tt, so every read is inside `u` and `v` (checked by the assert above).
+                unsafe {
+                    let v0 = _mm256_loadu_ps(vp.add(ic * tt + t0));
+                    let v1 = _mm256_loadu_ps(vp.add(ic * tt + t0 + 8));
+                    for r in 0..4 {
+                        let uu = _mm256_broadcast_ss(&*urow[r].add(ic));
+                        acc[r][0] = _mm256_fmadd_ps(uu, v0, acc[r][0]);
+                        acc[r][1] = _mm256_fmadd_ps(uu, v1, acc[r][1]);
+                    }
+                }
+            }
+            for r in 0..nr {
+                // SAFETY: oc0 + r < c_out and t0 + 16 <= tt.
+                unsafe {
+                    _mm256_storeu_ps(mp.add((oc0 + r) * tt + t0), acc[r][0]);
+                    _mm256_storeu_ps(mp.add((oc0 + r) * tt + t0 + 8), acc[r][1]);
+                }
+            }
+        }
+    }
+}
+
+/// [`wino_small_gemm`] for the accurate modes. The channels are accumulated in chains of `CHAIN` FMAs whose totals are added
+/// with TwoSum, so the sum over `c_in` loses only the rounding of the chains themselves and of one final addition. The rounding error
+/// of each TwoSum is not kept in a register set of its own: it becomes the starting value of the next chain, where it is absorbed at
+/// a relative rounding of 2^-24 of a quantity that is itself 2^-24 of the total. That leaves 3 rows x 16 columns of `tot` and `acc`
+/// (12 registers) plus the operands, instead of the 24 vectors that spilled to the stack at every chain boundary.
+#[cfg(all(feature = "rayon", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn wino_small_gemm_precise<const CHAIN: usize>(u: &[f32], v: &[f32], m: &mut [f32], c_out: usize, c_in: usize, tt: usize) {
+    use std::arch::x86_64::*;
+    const R: usize = 4;
+    let (up, vp, mp) = (u.as_ptr(), v.as_ptr(), m.as_mut_ptr());
+    for oc0 in (0..c_out).step_by(R) {
+        let nr = (c_out - oc0).min(R);
+        // rows past `nr` repeat the last real row; their results are never stored
+        let urow: [*const f32; R] = std::array::from_fn(|r| unsafe { up.add((oc0 + r.min(nr - 1)) * c_in) });
+        for t0 in (0..tt).step_by(16) {
+            let mut tot = [[_mm256_setzero_ps(); 2]; R];
+            let mut acc = [[_mm256_setzero_ps(); 2]; R];
+            let mut ic0 = 0usize;
+            while ic0 < c_in {
+                for ic in ic0..(ic0 + CHAIN).min(c_in) {
+                    // SAFETY: ic < c_in and t0 + 16 <= tt, so every read is inside `u` and `v` (checked by the caller's assert).
+                    unsafe {
+                        let v0 = _mm256_loadu_ps(vp.add(ic * tt + t0));
+                        let v1 = _mm256_loadu_ps(vp.add(ic * tt + t0 + 8));
+                        for r in 0..R {
+                            let uu = _mm256_broadcast_ss(&*urow[r].add(ic));
+                            acc[r][0] = _mm256_fmadd_ps(uu, v0, acc[r][0]);
+                            acc[r][1] = _mm256_fmadd_ps(uu, v1, acc[r][1]);
+                        }
+                    }
+                }
+                if ic0 == 0 {
+                    // the first chain is the running total as it is (adding it to zero would be exact)
+                    tot = acc;
+                    acc = [[_mm256_setzero_ps(); 2]; R];
+                } else {
+                    for r in 0..R {
+                        for j in 0..2 {
+                            let (a, b) = (tot[r][j], acc[r][j]);
+                            let s = _mm256_add_ps(a, b);
+                            let bb = _mm256_sub_ps(s, a);
+                            tot[r][j] = s;
+                            // the error of the sum starts the next chain
+                            acc[r][j] = _mm256_add_ps(_mm256_sub_ps(a, _mm256_sub_ps(s, bb)), _mm256_sub_ps(b, bb));
+                        }
+                    }
+                }
+                ic0 += CHAIN;
+            }
+            for r in 0..nr {
+                // SAFETY: oc0 + r < c_out and t0 + 16 <= tt.
+                unsafe {
+                    _mm256_storeu_ps(mp.add((oc0 + r) * tt + t0), _mm256_add_ps(tot[r][0], acc[r][0]));
+                    _mm256_storeu_ps(mp.add((oc0 + r) * tt + t0 + 8), _mm256_add_ps(tot[r][1], acc[r][1]));
+                }
+            }
+        }
+    }
+}
+
+/// Everything one Winograd block task needs (all fields are shared, read-only data or plain sizes).
+#[cfg(feature = "rayon")]
+#[derive(Clone, Copy)]
+struct WinoCtx<'a> {
+    src: &'a [f32],
+    bias: Option<&'a [f32]>,
+    u: &'a [f32],
+    out_ptr: usize,
+    c_in: usize,
+    h: usize,
+    w: usize,
+    c_out: usize,
+    ph: usize,
+    pw: usize,
+    out_h: usize,
+    out_w: usize,
+    th: usize,
+    tw: usize,
+    l: usize,
+    rows_per_block: usize,
+    blocks_per_img: usize,
+    u_stride: usize,
+    hw: usize,
+    img_elems: usize,
+    pad_w: usize,
+    /// Sum the channels in short chains combined with TwoSum (every mode but `Fastest`).
+    precise: bool,
+}
+
+/// One block of tile rows through the whole pipeline. `inline(always)` so the AVX2 wrapper below compiles it with 8-wide vectors.
+#[cfg(feature = "rayon")]
+#[inline(always)]
+fn wino_block<const FMA: bool>(ctx: &WinoCtx, task: usize) {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    }
+    let WinoCtx { src, bias, u, out_ptr, c_in, h, w, c_out, ph, pw, out_h, out_w, th, tw, l, rows_per_block, blocks_per_img, u_stride, hw, img_elems, pad_w, precise } = *ctx;
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = precise;
+        let b = task / blocks_per_img;
+        let ty0 = (task % blocks_per_img) * rows_per_block;
+        let rows = rows_per_block.min(th - ty0);
+        let tt = rows * tw; // tiles in this block
+        let ttp = tt.next_multiple_of(16); // V and M rows are padded to whole 16-tile vectors; the extra columns are never read back
+        let src_img = &src[b * img_elems..(b + 1) * img_elems];
+        // SAFETY: tasks write disjoint output rows (distinct (b, ty0..ty0+rows)); nothing reads `out` meanwhile.
+        let out_base = out_ptr as *mut f32;
+
+        SCRATCH.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let need = 16 * (c_in + c_out) * ttp + 8 * pad_w + 2 * (tw + 1) + 16 * tw + 8 * tw;
+            if guard.len() < need {
+                guard.resize(need, 0.0);
+            }
+            let (vbuf, rest) = guard.split_at_mut(16 * c_in * ttp);
+            let (mbuf, rest) = rest.split_at_mut(16 * c_out * ttp);
+            let (padded, rest) = rest.split_at_mut(4 * pad_w);
+            let (vert, rest) = rest.split_at_mut(4 * pad_w);
+            let (even, rest) = rest.split_at_mut(tw + 1);
+            let (odd, rest) = rest.split_at_mut(tw + 1);
+            let (tmp, rest) = rest.split_at_mut(16 * tw);
+            let ybuf = &mut rest[..8 * tw];
+
+            // 2. Input transform V[p][ic][tile] = B^T d B
+            for ic in 0..c_in {
+                let plane = &src_img[ic * hw..(ic + 1) * hw];
+                for r in 0..rows {
+                    let ty = ty0 + r;
+                    // rows ty*2-ph .. +4 of the input, shifted right by `pw` columns and zero padded
+                    for k in 0..4 {
+                        let row = &mut padded[k * pad_w..(k + 1) * pad_w];
+                        let iy = (ty * 2 + k) as isize - ph as isize;
+                        row.fill(0.0);
+                        if iy >= 0 && (iy as usize) < h && pw < pad_w {
+                            let n_copy = w.min(pad_w - pw);
+                            row[pw..pw + n_copy].copy_from_slice(&plane[iy as usize * w..iy as usize * w + n_copy]);
+                        }
+                    }
+                    {
+                        let (p0, rest) = padded.split_at(pad_w);
+                        let (p1, rest) = rest.split_at(pad_w);
+                        let (p2, p3) = rest.split_at(pad_w);
+                        let (s0, rest) = vert.split_at_mut(pad_w);
+                        let (s1, rest) = rest.split_at_mut(pad_w);
+                        let (s2, s3) = rest.split_at_mut(pad_w);
+                        for j in 0..pad_w {
+                            s0[j] = p0[j] - p2[j];
+                            s1[j] = p1[j] + p2[j];
+                            s2[j] = p2[j] - p1[j];
+                            s3[j] = p1[j] - p3[j];
+                        }
+                    }
+                    let mut runs = tmp.chunks_exact_mut(tw);
+                    let mut dst: [&mut [f32]; 16] = std::array::from_fn(|_| runs.next().unwrap());
+                    for k in 0..4 {
+                        let sr = &vert[k * pad_w..(k + 1) * pad_w];
+                        for x in 0..=tw {
+                            even[x] = sr[2 * x];
+                            odd[x] = sr[2 * x + 1];
+                        }
+                        let [d0, d1, d2, d3] = &mut dst[k * 4..k * 4 + 4] else { unreachable!() };
+                        let (e, o) = (&even[..], &odd[..]);
+                        for tx in 0..tw {
+                            d0[tx] = e[tx] - e[tx + 1];
+                            d1[tx] = o[tx] + e[tx + 1];
+                            d2[tx] = e[tx + 1] - o[tx];
+                            d3[tx] = o[tx] - o[tx + 1];
+                        }
+                    }
+                    for p in 0..16 {
+                        let at = p * c_in * ttp + ic * ttp + r * tw;
+                        vbuf[at..at + tw].copy_from_slice(&tmp[p * tw..(p + 1) * tw]);
+                    }
+                }
+            }
+
+            // 3. 16 products M[p, c_out, tt] = U[p, c_out, c_in] @ V[p, c_in, tt]
+            for p in 0..16 {
+                let (up, vp, mp) = (&u[p * u_stride..(p + 1) * u_stride], &vbuf[p * c_in * ttp..(p + 1) * c_in * ttp], &mut mbuf[p * c_out * ttp..(p + 1) * c_out * ttp]);
+                #[cfg(target_arch = "x86_64")]
+                if FMA && c_in * c_out <= 4096 {
+                    // SAFETY: `FMA` is only true inside `wino_block_avx2`, i.e. after the CPU features were checked.
+                    unsafe { wino_small_gemm(up, vp, mp, c_out, c_in, ttp, precise) };
+                    continue;
+                }
+                {
+                    crate::gemm::gemm_f32_strided_seq(up, 0, c_in as isize, 1, vp, 0, ttp as isize, 1, mp, c_out, c_in, ttp);
+                }
+            }
+
+            // 4. Inverse transform Y = A^T M A + bias, written straight into the output rows of this block
+            let mbuf = &*mbuf;
+            for oc in 0..c_out {
+                let bb = bias.map_or(0.0, |bv| bv[oc]);
+                let plane = (b * c_out + oc) * l;
+                for r in 0..rows {
+                    let y0 = (ty0 + r) * 2;
+                    let col = oc * ttp + r * tw;
+                    let mr: [&[f32]; 16] = std::array::from_fn(|p| &mbuf[p * c_out * ttp + col..p * c_out * ttp + col + tw]);
+                    let (y00, rest) = ybuf.split_at_mut(tw);
+                    let (y01, rest) = rest.split_at_mut(tw);
+                    let (y10, rest) = rest.split_at_mut(tw);
+                    let (y11, rest) = rest.split_at_mut(tw);
+                    let (row_a, row_b) = rest.split_at_mut(2 * tw);
+                    for tx in 0..tw {
+                        let (t00, t01, t02, t03) = (mr[0][tx] + mr[4][tx] + mr[8][tx], mr[1][tx] + mr[5][tx] + mr[9][tx], mr[2][tx] + mr[6][tx] + mr[10][tx], mr[3][tx] + mr[7][tx] + mr[11][tx]);
+                        let (t10, t11, t12, t13) = (mr[4][tx] - mr[8][tx] - mr[12][tx], mr[5][tx] - mr[9][tx] - mr[13][tx], mr[6][tx] - mr[10][tx] - mr[14][tx], mr[7][tx] - mr[11][tx] - mr[15][tx]);
+                        y00[tx] = t00 + t01 + t02 + bb;
+                        y01[tx] = t01 - t02 - t03 + bb;
+                        y10[tx] = t10 + t11 + t12 + bb;
+                        y11[tx] = t11 - t12 - t13 + bb;
+                    }
+                    for tx in 0..tw {
+                        row_a[2 * tx] = y00[tx];
+                        row_a[2 * tx + 1] = y01[tx];
+                        row_b[2 * tx] = y10[tx];
+                        row_b[2 * tx + 1] = y11[tx];
+                    }
+                    let dst_a = unsafe { std::slice::from_raw_parts_mut(out_base.add(plane + y0 * out_w), out_w) };
+                    dst_a.copy_from_slice(&row_a[..out_w]);
+                    if y0 + 1 < out_h {
+                        let dst_b = unsafe { std::slice::from_raw_parts_mut(out_base.add(plane + (y0 + 1) * out_w), out_w) };
+                        dst_b.copy_from_slice(&row_b[..out_w]);
+                    }
+                }
+            }
+        });
+}
+
+#[cfg(all(feature = "rayon", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn wino_block_avx2(ctx: &WinoCtx, task: usize) {
+    wino_block::<true>(ctx, task)
+}
+
 /// Winograd F(2x2, 3x3) convolution for `F32` `[N, C_in, H, W]` * `[C_out, C_in, 3, 3]`,
-/// reducing multiplications per output pixel by 2.25x and executing 16 parallel GEMMs.
+/// reducing multiplications per output pixel by 2.25x.
+///
+/// The output is cut into blocks of whole tile rows. A rayon task takes one block through the complete pipeline
+/// (input transform, 16 small GEMMs, output transform) in thread-local scratch that stays in L2, so there is no
+/// barrier between the phases. All transforms run along `tw` consecutive tiles (unit stride, vectorisable).
 #[cfg(feature = "rayon")]
 #[allow(clippy::too_many_arguments)]
 fn conv2d_winograd_3x3_f32(
@@ -244,18 +537,18 @@ fn conv2d_winograd_3x3_f32(
 
     let th = out_h.div_ceil(2);
     let tw = out_w.div_ceil(2);
-    let tiles_per_img = th * tw;
     let l = out_h * out_w;
 
-    // 1. Filter transform U[16, c_out, c_in] = G g G^T (computed once across all batches)
+    // 1. Filter transform U[16, c_out, c_in] = G g G^T (computed once)
     let u_stride = c_out * c_in;
     let mut u = vec![0.0f32; 16 * u_stride];
     for oc in 0..c_out {
         for ic in 0..c_in {
             let g = &wv[(oc * c_in + ic) * 9..(oc * c_in + ic) * 9 + 9];
-            let mut t = [[0.0f32; 4]; 3];
+            // carried out in f64 and rounded once: every output of the layer reuses these values, so their rounding errors do not average out
+            let mut t = [[0.0f64; 4]; 3];
             for r in 0..3 {
-                let (g0, g1, g2) = (g[r * 3], g[r * 3 + 1], g[r * 3 + 2]);
+                let (g0, g1, g2) = (g[r * 3] as f64, g[r * 3 + 1] as f64, g[r * 3 + 2] as f64);
                 t[r][0] = g0;
                 t[r][1] = 0.5 * (g0 + g1 + g2);
                 t[r][2] = 0.5 * (g0 - g1 + g2);
@@ -264,157 +557,36 @@ fn conv2d_winograd_3x3_f32(
             for c in 0..4 {
                 let (t0, t1, t2) = (t[0][c], t[1][c], t[2][c]);
                 let base = oc * c_in + ic;
-                u[c * u_stride + base] = t0;
-                u[(4 + c) * u_stride + base] = 0.5 * (t0 + t1 + t2);
-                u[(8 + c) * u_stride + base] = 0.5 * (t0 - t1 + t2);
-                u[(12 + c) * u_stride + base] = t2;
+                u[c * u_stride + base] = t0 as f32;
+                u[(4 + c) * u_stride + base] = (0.5 * (t0 + t1 + t2)) as f32;
+                u[(8 + c) * u_stride + base] = (0.5 * (t0 - t1 + t2)) as f32;
+                u[(12 + c) * u_stride + base] = t2 as f32;
             }
         }
     }
 
-    // Process images in L3-resident micro-batches so V and M stay in cache.
-    let batch_chunk = 4.min(n.max(1));
-    let max_chunk_tiles = batch_chunk * tiles_per_img;
-    let mut v = crate::pool::take_f32(16 * c_in * max_chunk_tiles)
-        .unwrap_or_else(|| vec![0.0; 16 * c_in * max_chunk_tiles]);
-    let mut m = crate::pool::take_f32(16 * c_out * max_chunk_tiles)
-        .unwrap_or_else(|| vec![0.0; 16 * c_out * max_chunk_tiles]);
+    // Block size: V and M (16 * (c_in + c_out) * tiles floats) should stay around 512 KB, but a block needs enough
+    // tiles for the GEMMs to be efficient and enough blocks must exist to keep every thread busy.
+    let tile_target = (16384 / (c_in + c_out)).clamp(32, 192);
+    let rows_per_block = (tile_target / tw).max(1).min(th);
+    let blocks_per_img = th.div_ceil(rows_per_block);
 
     let hw = h * w;
     let img_elems = c_in * hw;
-    let out_img_elems = c_out * l;
+    let pad_w = 2 * tw + 2;
+    let out_ptr = out.as_mut_ptr() as usize;
 
-    for b0 in (0..n).step_by(batch_chunk) {
-        let batch_len = (n - b0).min(batch_chunk);
-        let chunk_tiles = batch_len * tiles_per_img;
-        let v_stride = c_in * chunk_tiles;
-        let m_stride = c_out * chunk_tiles;
-        let v_slice = &mut v[..16 * v_stride];
-        let m_slice_all = &mut m[..16 * m_stride];
-
-        // 2. Input transform V[16, c_in, chunk_tiles] = B^T d B
-        let src_chunk = &src[b0 * img_elems..(b0 + batch_len) * img_elems];
-        let v_ptr = v_slice.as_mut_ptr() as usize;
-        (0..batch_len * c_in).into_par_iter().for_each(|bi| {
-            let b = bi / c_in;
-            let ic = bi % c_in;
-            let plane = &src_chunk[b * img_elems + ic * hw..b * img_elems + (ic + 1) * hw];
-            let v_base_ptr = v_ptr as *mut f32;
-            for ty in 0..th {
-                let iy0 = (ty * 2) as isize - ph as isize;
-                for tx in 0..tw {
-                    let ix0 = (tx * 2) as isize - pw as isize;
-                    let mut d = [[0.0f32; 4]; 4];
-                    if iy0 >= 0 && (iy0 as usize) + 3 < h && ix0 >= 0 && (ix0 as usize) + 3 < w {
-                        let y0 = iy0 as usize;
-                        let x0 = ix0 as usize;
-                        for r in 0..4 {
-                            let row = &plane[(y0 + r) * w + x0..(y0 + r) * w + x0 + 4];
-                            d[r].copy_from_slice(row);
-                        }
-                    } else {
-                        for r in 0..4 {
-                            let iy = iy0 + r as isize;
-                            if iy >= 0 && (iy as usize) < h {
-                                let row = &plane[iy as usize * w..iy as usize * w + w];
-                                for c in 0..4 {
-                                    let ix = ix0 + c as isize;
-                                    if ix >= 0 && (ix as usize) < w {
-                                        d[r][c] = row[ix as usize];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let mut s = [[0.0f32; 4]; 4];
-                    for c in 0..4 {
-                        s[0][c] = d[0][c] - d[2][c];
-                        s[1][c] = d[1][c] + d[2][c];
-                        s[2][c] = -d[1][c] + d[2][c];
-                        s[3][c] = d[1][c] - d[3][c];
-                    }
-                    let tile_idx = (b * th + ty) * tw + tx;
-                    let col_off = ic * chunk_tiles + tile_idx;
-                    for r in 0..4 {
-                        let (a0, a1, a2, a3) = (s[r][0], s[r][1], s[r][2], s[r][3]);
-                        unsafe {
-                            *v_base_ptr.add((r * 4) * v_stride + col_off) = a0 - a2;
-                            *v_base_ptr.add((r * 4 + 1) * v_stride + col_off) = a1 + a2;
-                            *v_base_ptr.add((r * 4 + 2) * v_stride + col_off) = -a1 + a2;
-                            *v_base_ptr.add((r * 4 + 3) * v_stride + col_off) = a1 - a3;
-                        }
-                    }
-                }
-            }
-        });
-
-        // 3. 16 parallel GEMMs: M[p, c_out, chunk_tiles] = U[p, c_out, c_in] @ V[p, c_in, chunk_tiles]
-        m_slice_all
-            .par_chunks_mut(m_stride)
-            .enumerate()
-            .for_each(|(p, m_slice)| {
-                let up = &u[p * u_stride..(p + 1) * u_stride];
-                let vp = &v_slice[p * v_stride..(p + 1) * v_stride];
-                crate::gemm::gemm_f32_strided_seq(
-                    up,
-                    0,
-                    c_in as isize,
-                    1,
-                    vp,
-                    0,
-                    chunk_tiles as isize,
-                    1,
-                    m_slice,
-                    c_out,
-                    c_in,
-                    chunk_tiles,
-                );
-            });
-
-        // 4. Inverse transform Y = A^T M A + bias -> out_chunk[batch_len, c_out, out_h, out_w]
-        let out_chunk = &mut out[b0 * out_img_elems..(b0 + batch_len) * out_img_elems];
-        out_chunk.par_chunks_mut(l).enumerate().for_each(|(bo, o_plane)| {
-            let b = bo / c_out;
-            let oc = bo % c_out;
-            let bb = bias.map_or(0.0, |bv| bv[oc]);
-            for ty in 0..th {
-                let y0 = ty * 2;
-                let has_y1 = y0 + 1 < out_h;
-                for tx in 0..tw {
-                    let x0 = tx * 2;
-                    let has_x1 = x0 + 1 < out_w;
-                    let tile_idx = (b * th + ty) * tw + tx;
-                    let col_off = oc * chunk_tiles + tile_idx;
-                    let mut mp = [0.0f32; 16];
-                    for p in 0..16 {
-                        mp[p] = m_slice_all[p * m_stride + col_off];
-                    }
-                    let mut t0 = [0.0f32; 4];
-                    let mut t1 = [0.0f32; 4];
-                    for c in 0..4 {
-                        t0[c] = mp[c] + mp[4 + c] + mp[8 + c];
-                        t1[c] = mp[4 + c] - mp[8 + c] - mp[12 + c];
-                    }
-                    let y00 = t0[0] + t0[1] + t0[2] + bb;
-                    let y01 = t0[1] - t0[2] - t0[3] + bb;
-                    let y10 = t1[0] + t1[1] + t1[2] + bb;
-                    let y11 = t1[1] - t1[2] - t1[3] + bb;
-                    o_plane[y0 * out_w + x0] = y00;
-                    if has_x1 {
-                        o_plane[y0 * out_w + x0 + 1] = y01;
-                    }
-                    if has_y1 {
-                        o_plane[(y0 + 1) * out_w + x0] = y10;
-                        if has_x1 {
-                            o_plane[(y0 + 1) * out_w + x0 + 1] = y11;
-                        }
-                    }
-                }
-            }
-        });
-    }
-    crate::pool::give(v);
-    crate::pool::give(m);
+    let ctx = WinoCtx { src, bias, u: &u, out_ptr, c_in, h, w, c_out, ph, pw, out_h, out_w, th, tw, l, rows_per_block, blocks_per_img, u_stride, hw, img_elems, pad_w, precise: crate::gemm::precision_mode() != crate::gemm::PrecisionMode::Fastest };
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma");
+    (0..n * blocks_per_img).into_par_iter().for_each(|task| {
+        #[cfg(target_arch = "x86_64")]
+        if avx2 {
+            // SAFETY: the CPU features were checked above.
+            return unsafe { wino_block_avx2(&ctx, task) };
+        }
+        wino_block::<false>(&ctx, task)
+    });
 }
 
 impl Tensor {
@@ -469,6 +641,42 @@ impl Tensor {
         ))
     }
 
+    /// True if this 4D tensor is laid out in `channels_last` (`NHWC`) memory format.
+    pub fn is_channels_last(&self) -> bool {
+        self.layout().is_channels_last()
+    }
+
+    /// Converts a 4D `[N, C, H, W]` tensor to physical `channels_last` (`NHWC`) memory format
+    /// while preserving logical `[N, C, H, W]` shape (differentiable).
+    pub fn to_channels_last(&self) -> Result<Tensor> {
+        if self.ndim() != 4 {
+            return Err(Error::Msg(format!(
+                "to_channels_last expects 4D [N, C, H, W] tensor, got {:?}",
+                self.shape()
+            )));
+        }
+        if self.is_channels_last() && self.storage_offset() == 0 {
+            return Ok(self.clone());
+        }
+        let nhwc = self.permute(&[0, 2, 3, 1])?.contiguous()?;
+        let cl_layout = Layout::channels_last(self.shape().to_vec())?;
+        Ok(Tensor::from_op(
+            nhwc.storage().clone(),
+            cl_layout,
+            "channels_last",
+            vec![self.clone()],
+            |g| Ok(vec![Some(g.clone())]),
+        ))
+    }
+
+    /// Converts a tensor to the requested [`crate::layout::MemoryFormat`].
+    pub fn to_memory_format(&self, fmt: crate::layout::MemoryFormat) -> Result<Tensor> {
+        match fmt {
+            crate::layout::MemoryFormat::Contiguous => self.contiguous(),
+            crate::layout::MemoryFormat::ChannelsLast => self.to_channels_last(),
+        }
+    }
+
     /// Casts tensor elements to `dst` dtype. Differentiable between floating-point dtypes!
     pub fn to_dtype(&self, dst: DType) -> Result<Tensor> {
         if self.dtype() == dst {
@@ -503,10 +711,18 @@ impl Tensor {
         ))
     }
 
-    /// Alias for `to_device`.
-    #[inline]
-    pub fn to(&self, device: &Device) -> Result<Tensor> {
-        self.to_device(device)
+    /// torch-style `.to(...)`: accepts a device (`&Device`, `Device`, `"cuda:0"`), a dtype, a `(device, dtype)` pair,
+    /// or another tensor (takes its device and dtype). Differentiable; a no-op clone when nothing changes.
+    pub fn to<T: ToTarget>(&self, target: T) -> Result<Tensor> {
+        let (dev, dt) = target.resolve(self)?;
+        let mut t = self.clone();
+        if let Some(d) = dev {
+            t = t.to_device(&d)?;
+        }
+        if let Some(d) = dt {
+            t = t.to_dtype(d)?;
+        }
+        Ok(t)
     }
 
     /// Transfers this tensor to Host CPU.
@@ -943,6 +1159,15 @@ impl Tensor {
         ))
     }
 
+    /// Backward of a unary op as one fused pass when no higher-order graph is being recorded; `None` means "use the composed path".
+    fn fused_unary_backward(g: &Tensor, a: &Tensor, kind: crate::backend::cpu::UnaryBwd) -> Option<Tensor> {
+        if crate::tensor::is_grad_enabled() {
+            return None;
+        }
+        let s = g.storage().try_unary_backward(g.layout(), a.storage(), a.layout(), kind)?;
+        Some(Tensor::from_parts(s, Layout::contiguous(g.shape()), false, None))
+    }
+
     pub fn neg(&self) -> Result<Tensor> {
         self.run_unary("neg", UnaryOp::Neg, |g, _, _| g.neg())
     }
@@ -960,7 +1185,12 @@ impl Tensor {
             return x.exp();
         }
         // d/dx exp(x) = exp(x); using `x.exp()` keeps higher-order graph connected!
-        self.run_unary("exp", UnaryOp::Exp, |g, x, _| g.mul(&x.exp()?))
+        self.run_unary("exp", UnaryOp::Exp, |g, x, y| {
+            if let Some(r) = Self::fused_unary_backward(g, y, crate::backend::cpu::UnaryBwd::ExpFromOutput) {
+                return Ok(r);
+            }
+            g.mul(&x.exp()?)
+        })
     }
 
     pub fn ln(&self) -> Result<Tensor> {
@@ -991,7 +1221,10 @@ impl Tensor {
     }
 
     pub fn tanh(&self) -> Result<Tensor> {
-        self.run_unary("tanh", UnaryOp::Tanh, |g, x, _| {
+        self.run_unary("tanh", UnaryOp::Tanh, |g, x, y| {
+            if let Some(r) = Self::fused_unary_backward(g, y, crate::backend::cpu::UnaryBwd::TanhFromOutput) {
+                return Ok(r);
+            }
             let y = x.tanh()?;
             let one_minus_y2 = y.square()?.neg()?.add_scalar(1.0)?;
             g.mul(&one_minus_y2)
@@ -999,7 +1232,10 @@ impl Tensor {
     }
 
     pub fn sigmoid(&self) -> Result<Tensor> {
-        self.run_unary("sigmoid", UnaryOp::Sigmoid, |g, x, _| {
+        self.run_unary("sigmoid", UnaryOp::Sigmoid, |g, x, y| {
+            if let Some(r) = Self::fused_unary_backward(g, y, crate::backend::cpu::UnaryBwd::SigmoidFromOutput) {
+                return Ok(r);
+            }
             let y = x.sigmoid()?;
             let one_minus_y = y.neg()?.add_scalar(1.0)?;
             g.mul(&y.mul(&one_minus_y)?)
@@ -1008,6 +1244,9 @@ impl Tensor {
 
     pub fn relu(&self) -> Result<Tensor> {
         self.run_unary("relu", UnaryOp::Relu, |g, x, _| {
+            if let Some(r) = Self::fused_unary_backward(g, x, crate::backend::cpu::UnaryBwd::ReluFromInput) {
+                return Ok(r);
+            }
             let zero = x.zeros_like()?;
             let mask = x.gt(&zero)?.to_dtype(g.dtype())?;
             g.mul(&mask)
@@ -1083,6 +1322,9 @@ impl Tensor {
 
     pub fn square(&self) -> Result<Tensor> {
         self.run_unary("square", UnaryOp::Square, |g, x, _| {
+            if let Some(r) = Self::fused_unary_backward(g, x, crate::backend::cpu::UnaryBwd::SquareFromInput) {
+                return Ok(r);
+            }
             g.mul(&x.mul_scalar(2.0)?)
         })
     }
@@ -1521,6 +1763,18 @@ impl Tensor {
     }
 
     fn pred(&self, op: PredOp) -> Result<Tensor> {
+        // on a CUDA device the predicates are built from comparisons so no data leaves the GPU:
+        // x != x is NaN, x - x == 0 is finite (inf - inf and nan - nan are NaN), inf is neither
+        if self.is_cuda() && self.dtype().is_floating_point() {
+            return no_grad(|| {
+                let finite = || self.sub(self)?.eq_tensor(&self.zeros_like()?);
+                match op {
+                    PredOp::IsNan => self.ne_tensor(self),
+                    PredOp::IsFinite => finite(),
+                    PredOp::IsInf => finite()?.logical_not()?.logical_and(&self.eq_tensor(self)?),
+                }
+            });
+        }
         let s = self.storage().pred_op(self.layout(), op)?;
         Ok(Tensor::from_storage(
             s,
@@ -1725,6 +1979,10 @@ impl Tensor {
 
     /// Mean of all elements into a 0-D scalar tensor.
     pub fn mean(&self) -> Result<Tensor> {
+        if self.ndim() > 0 {
+            let axes: Vec<isize> = (0..self.ndim() as isize).collect();
+            return self.mean_axes(&axes, false);
+        }
         let n = self.numel() as f64;
         self.sum()?.div_scalar(n)
     }
@@ -1793,6 +2051,30 @@ impl Tensor {
                 seen.push(na);
                 count *= self.shape()[na];
             }
+        }
+        if axes.is_empty() {
+            return self.sum_axes(axes, keepdim)?.div_scalar(count as f64);
+        }
+        // float32/float64 on the host: the kernel divides its f64 accumulator once, so the mean is rounded a single time (rounding the
+        // sum first and dividing afterwards costs up to a second half-ulp)
+        if matches!(self.dtype(), DType::F32 | DType::F64) && self.device().is_cpu() {
+            seen.sort_unstable();
+            let s = self.storage().reduce_op(self.layout(), &seen, ReduceOp::Mean)?;
+            let mut kept_shape = self.shape().to_vec();
+            for &a in &seen {
+                kept_shape[a] = 1;
+            }
+            let out_shape: Vec<usize> = if keepdim {
+                kept_shape.clone()
+            } else {
+                self.shape().iter().enumerate().filter(|(i, _)| !seen.contains(i)).map(|(_, &d)| d).collect()
+            };
+            let src_shape = self.shape().to_vec();
+            let inv = count as f64;
+            return Ok(Tensor::from_op(s, Layout::contiguous(out_shape), "mean_axes", vec![self.clone()], move |g| {
+                let g_kept = g.reshape(&kept_shape)?;
+                Ok(vec![Some(g_kept.div_scalar(inv)?.broadcast_to(&src_shape)?)])
+            }));
         }
         self.sum_axes(axes, keepdim)?.div_scalar(count as f64)
     }
@@ -2270,6 +2552,63 @@ impl Tensor {
         Ok(Tensor::from_storage(s, Layout::contiguous(out_shape)))
     }
 
+    /// `(self - mean, mean)` over `axes` (the mean keeps its reduced dimensions), with the centring done accurately.
+    ///
+    /// A float32 mean is rounded, so `x - mean` carries an error of up to half an ulp of the mean in *every* element, which dwarfs
+    /// the signal when the data sits on a large offset (offset 1000, spread 1: hundreds of half-ulps). The residual
+    /// `mean(x - mean)` recovers what the rounding lost (accumulated in f64 by the mean kernels) and is subtracted as a second,
+    /// constant term, so gradients are unchanged. [`PrecisionMode::Fastest`] skips the correction; non-f32 tensors never need it.
+    pub fn centered_by_mean(&self, axes: &[isize]) -> Result<(Tensor, Tensor)> {
+        let mean = self.mean_axes(axes, true)?;
+        let centered = self.sub(&mean)?;
+        if self.dtype() != DType::F32 || crate::gemm::precision_mode() == crate::gemm::PrecisionMode::Fastest {
+            return Ok((centered, mean));
+        }
+        let residual = no_grad(|| centered.mean_axes(axes, true))?.detach();
+        Ok((centered.sub(&residual)?, mean))
+    }
+
+    /// Variance along the last axis of a contiguous host `f32` tensor when no gradient is recorded: mean and squared deviations in
+    /// `f64`, one rounding at the end. `None` when the tensor does not qualify.
+    fn var_last_axis_host(&self, ax: usize, denom: f64, keepdim: bool) -> Result<Option<Tensor>> {
+        let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+        let d = self.shape()[ax];
+        if needs_grad || ax + 1 != self.ndim() || d == 0 || self.dtype() != DType::F32 || !self.device().is_cpu() {
+            return Ok(None);
+        }
+        let guard = self.storage().cpu_ref()?;
+        let crate::backend::CpuStorage::F32(v) = &*guard else { return Ok(None) };
+        let Some(range) = self.layout().contiguous_range_in(v.len()) else { return Ok(None) };
+        let src = &v[range];
+        let row = |x: &[f32]| -> f32 {
+            let mean = crate::backend::cpu::mean_f64(x);
+            let ss: f64 = x.iter().map(|&a| (a as f64 - mean) * (a as f64 - mean)).sum();
+            (ss / denom) as f32
+        };
+        let rows = src.len() / d;
+        let mut out = vec![0.0f32; rows];
+        #[cfg(feature = "rayon")]
+        if src.len() >= 1 << 16 {
+            use rayon::prelude::*;
+            out.par_iter_mut().zip(src.par_chunks(d)).for_each(|(o, x)| *o = row(x));
+        } else {
+            for (o, x) in out.iter_mut().zip(src.chunks(d)) {
+                *o = row(x);
+            }
+        }
+        #[cfg(not(feature = "rayon"))]
+        for (o, x) in out.iter_mut().zip(src.chunks(d)) {
+            *o = row(x);
+        }
+        let mut shape = self.shape().to_vec();
+        if keepdim {
+            shape[ax] = 1;
+        } else {
+            shape.remove(ax);
+        }
+        Ok(Some(Tensor::from_slice(&out, &shape)?))
+    }
+
     /// Variance along `axis` (with Bessel's correction if `unbiased` is `true`).
     /// An unbiased estimate over 1 element is undefined and yields NaN, like PyTorch
     /// (the biased fallback it used to take silently claimed zero variance).
@@ -2281,8 +2620,10 @@ impl Tensor {
         } else {
             n as f64
         };
-        let mu = self.mean_axis(ax as isize, true)?;
-        let diff = self.sub(&mu)?;
+        if let Some(v) = self.var_last_axis_host(ax, denom, keepdim)? {
+            return Ok(v);
+        }
+        let (diff, _) = self.centered_by_mean(&[ax as isize])?;
         diff.square()?
             .sum_axis(ax as isize, keepdim)?
             .div_scalar(denom)
@@ -2348,6 +2689,21 @@ impl Tensor {
         if !self.dtype().is_floating_point() {
             return self.sub(&self.logsumexp(axis, true)?);
         }
+        // CUDA tensors: one fused kernel for the whole row (rows with a non-finite maximum are checked when recording gradients)
+        if self.ndim() > 0 && normalize_axis("log_softmax", axis, self.ndim())? == self.ndim() - 1 {
+            let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+            if let Some(out_storage) = self.storage().try_log_softmax_last_axis(self.layout(), needs_grad) {
+                let out_layout = Layout::contiguous(self.shape());
+                if !needs_grad {
+                    return Ok(Tensor::from_storage(out_storage, out_layout));
+                }
+                let y = Tensor::from_storage(out_storage.clone(), out_layout.clone());
+                return Ok(Tensor::from_op(out_storage, out_layout, "log_softmax", vec![self.clone()], move |g| {
+                    let s = g.sum_axis(-1, true)?;
+                    Ok(vec![Some(g.sub(&y.exp()?.mul(&s)?)?)])
+                }));
+            }
+        }
         // (x - max) - ln(sum(exp(x - max))): subtracting the max first keeps full precision for large magnitudes
         // (`x - (max + ln(sum))` would absorb the ln term into `max`). Only rows with a finite maximum use it; rows
         // with +inf / NaN / all -inf keep the original path below, whose gradient is zero instead of NaN.
@@ -2396,7 +2752,7 @@ impl Tensor {
         let ax = normalize_axis("softmax", axis, self.ndim())?;
         if self.ndim() > 0
             && ax == self.ndim() - 1
-            && let Some(out_storage) = self.storage().try_softmax_last_axis(self.layout())
+            && let Some(out_storage) = self.storage().try_softmax_last_axis(self.layout(), crate::tensor::is_grad_enabled() && self.requires_grad())
         {
             let out_layout = Layout::contiguous(self.shape());
             if !crate::tensor::is_grad_enabled() || !self.requires_grad() {
@@ -2514,7 +2870,26 @@ impl Tensor {
         if self.ndim() != 1 || other.ndim() != 1 {
             return Err(Error::Msg("dot requires 1D tensors".into()));
         }
+        if let Some(v) = self.dot_f64_host(other)? {
+            return Ok(v);
+        }
         self.mul(other)?.sum()
+    }
+
+    /// Dot product of two host `f32` vectors carried out in `f64` (the products are not rounded to `f32` first); `None` when a
+    /// gradient has to be recorded, the tensors are not contiguous host `f32`, or the lengths differ.
+    fn dot_f64_host(&self, other: &Tensor) -> Result<Option<Tensor>> {
+        use crate::backend::CpuStorage;
+        let host_f32 = |t: &Tensor| t.dtype() == DType::F32 && t.device().is_cpu();
+        let needs_grad = crate::tensor::is_grad_enabled() && (self.requires_grad() || other.requires_grad());
+        if needs_grad || !host_f32(self) || !host_f32(other) || self.numel() != other.numel() {
+            return Ok(None);
+        }
+        let (ga, gb) = (self.storage().cpu_ref()?, other.storage().cpu_ref()?);
+        let (CpuStorage::F32(a), CpuStorage::F32(b)) = (&*ga, &*gb) else { return Ok(None) };
+        let (Some(ra), Some(rb)) = (self.layout().contiguous_range_in(a.len()), other.layout().contiguous_range_in(b.len())) else { return Ok(None) };
+        let v = crate::backend::cpu::dot_f64_of_f32(&a[ra], &b[rb]) as f32;
+        Ok(Some(Tensor::from_slice(&[v], &[])?))
     }
 
     /// Outer product of two 1D vectors `[m]` and `[n]` -> `[m, n]`.
@@ -2647,12 +3022,42 @@ impl Tensor {
                 let n = outer * total_dim * inner;
                 let mut out_data: Vec<$ty> = crate::pool::take(n).unwrap_or_default();
                 if out_data.len() == n {
-                    let mut at = 0;
-                    for o in 0..outer {
-                        for (t_idx, &sz) in sizes.iter().enumerate() {
-                            let chunk = sz * inner;
-                            out_data[at..at + chunk].copy_from_slice(&vecs[t_idx][o * chunk..(o + 1) * chunk]);
-                            at += chunk;
+                    // big concatenations copy in parallel: cut the output into disjoint pieces, one per source chunk (large
+                    // chunks are split further), and let the pieces fill themselves
+                    #[cfg(feature = "rayon")]
+                    let parallel = n * std::mem::size_of::<$ty>() >= (1 << 20);
+                    #[cfg(not(feature = "rayon"))]
+                    let parallel = false;
+                    if parallel {
+                        #[cfg(feature = "rayon")]
+                        {
+                            use rayon::prelude::*;
+                            const PIECE: usize = 64 * 1024;
+                            let mut pieces: Vec<(&mut [$ty], &[$ty])> = Vec::new();
+                            let mut rest: &mut [$ty] = &mut out_data[..];
+                            for o in 0..outer {
+                                for (t_idx, &sz) in sizes.iter().enumerate() {
+                                    let chunk = sz * inner;
+                                    let mut src: &[$ty] = &vecs[t_idx][o * chunk..(o + 1) * chunk];
+                                    while !src.is_empty() {
+                                        let take = src.len().min(PIECE);
+                                        let (head, tail) = std::mem::take(&mut rest).split_at_mut(take);
+                                        pieces.push((head, &src[..take]));
+                                        rest = tail;
+                                        src = &src[take..];
+                                    }
+                                }
+                            }
+                            pieces.par_iter_mut().for_each(|(dst, src)| dst.copy_from_slice(src));
+                        }
+                    } else {
+                        let mut at = 0;
+                        for o in 0..outer {
+                            for (t_idx, &sz) in sizes.iter().enumerate() {
+                                let chunk = sz * inner;
+                                out_data[at..at + chunk].copy_from_slice(&vecs[t_idx][o * chunk..(o + 1) * chunk]);
+                                at += chunk;
+                            }
                         }
                     }
                 } else {
@@ -2670,7 +3075,14 @@ impl Tensor {
                 CpuStorage::$variant(out_data)
             }};
         }
-        let cpu = match dtype {
+        let gpu_cat = {
+            let parts: Vec<(&Storage, &Layout)> = tensors.iter().map(|t| (t.storage(), t.layout())).collect();
+            Storage::cuda_cat(&parts, ax, &out_shape)?
+        };
+        let cpu = if gpu_cat.is_some() {
+            CpuStorage::U8(Vec::new()) // unused: the device result below replaces it
+        } else {
+            match dtype {
             DType::Bool => stitch!(Bool, bool),
             DType::U8 => stitch!(U8, u8),
             DType::I8 => stitch!(I8, i8),
@@ -2716,9 +3128,12 @@ impl Tensor {
                 }
                 CpuStorage::C128(out_data)
             }
+            }
         };
-        let storage =
-            Storage::new_cpu(cpu).to_device(&Layout::contiguous(out_shape.clone()), &device)?;
+        let storage = match gpu_cat {
+            Some(s) => s,
+            None => Storage::new_cpu(cpu).to_device(&Layout::contiguous(out_shape.clone()), &device)?,
+        };
 
         Ok(Tensor::from_op(
             storage,
@@ -2923,16 +3338,19 @@ impl Tensor {
             return Err(Error::Msg("index_select requires a 1D index tensor".into()));
         }
         let ax = normalize_axis("index_select", axis, self.ndim())?;
-        let idx_vec = indices.to_vec::<i64>()?;
 
         let mut out_shape = self.shape().to_vec();
-        out_shape[ax] = idx_vec.len();
+        out_shape[ax] = indices.numel();
         // Refuse outputs that can never fit BEFORE reserving: outer*idx*inner
         // (each factor from a validated tensor) can exceed isize::MAX bytes.
         crate::limits::check_elements("index_select", &out_shape)?;
-        let storage = self
-            .storage()
-            .index_select_vals(self.layout(), ax, &idx_vec)?;
+        let storage = match self.storage().cuda_index_select_dev(self.layout(), ax, indices.storage(), indices.layout())? {
+            Some(s) => s,
+            None => {
+                let idx_vec = indices.to_vec::<i64>()?;
+                self.storage().index_select_vals(self.layout(), ax, &idx_vec)?
+            }
+        };
 
         let src_shape = self.shape().to_vec();
         let idx_clone = indices.clone();
@@ -2955,12 +3373,11 @@ impl Tensor {
             return Err(Error::Msg("index_add requires a 1D index tensor".into()));
         }
         let ax = normalize_axis("index_add", axis, self.ndim())?;
-        let idx_vec = indices.to_vec::<i64>()?;
 
         // `source` must match `self` on every axis except `axis`, where it
         // must hold one slice per index (torch index_add_ semantics).
         let mut expected_src = self.shape().to_vec();
-        expected_src[ax] = idx_vec.len();
+        expected_src[ax] = indices.numel();
         if source.shape() != expected_src.as_slice() {
             return Err(Error::ShapeMismatch {
                 op: "index_add",
@@ -2970,15 +3387,19 @@ impl Tensor {
         }
 
         let shape = self.shape().to_vec();
-        let cpu = self.storage().cpu_ref()?.index_add_vals(
-            self.layout(),
-            &*source.storage().cpu_ref()?,
-            source.layout(),
-            ax,
-            &idx_vec,
-        )?;
-        let storage =
-            Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?;
+        let storage = match self.storage().cuda_index_add_dev(self.layout(), source.storage(), source.layout(), indices.storage(), indices.layout(), ax)? {
+            Some(s) => s,
+            None => {
+                let idx_vec = indices.to_vec::<i64>()?;
+                match self.storage().cuda_index_add(self.layout(), source.storage(), source.layout(), ax, &idx_vec)? {
+                    Some(s) => s,
+                    None => {
+                        let cpu = self.storage().cpu_ref()?.index_add_vals(self.layout(), &*source.storage().cpu_ref()?, source.layout(), ax, &idx_vec)?;
+                        Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?
+                    }
+                }
+            }
+        };
 
         let (ra, rb) = (self.requires_grad(), source.requires_grad());
         let idx_clone = indices.clone();
@@ -3018,13 +3439,19 @@ impl Tensor {
             }
         }
         let idx_shape = index.shape().to_vec();
-        let idx = index.to_vec::<i64>()?;
-        let cpu =
-            self.storage()
-                .cpu_ref()?
-                .gather_vals(self.layout(), ax, &idx_shape, &idx)?;
-        let storage = Storage::new_cpu(cpu)
-            .to_device(&Layout::contiguous(idx_shape.clone()), &self.device())?;
+        let storage = match self.storage().cuda_gather_dev(self.layout(), ax, index.storage(), index.layout())? {
+            Some(s) => s,
+            None => {
+                let idx = index.to_vec::<i64>()?;
+                match self.storage().cuda_gather(self.layout(), ax, &idx_shape, &idx)? {
+                    Some(s) => s,
+                    None => {
+                        let cpu = self.storage().cpu_ref()?.gather_vals(self.layout(), ax, &idx_shape, &idx)?;
+                        Storage::new_cpu(cpu).to_device(&Layout::contiguous(idx_shape.clone()), &self.device())?
+                    }
+                }
+            }
+        };
         let src_shape = self.shape().to_vec();
         let idx_clone = index.clone();
         Ok(Tensor::from_op(
@@ -3065,18 +3492,20 @@ impl Tensor {
             }
         }
         let idx_shape = index.shape().to_vec();
-        let idx = index.to_vec::<i64>()?;
         let shape = self.shape().to_vec();
-        let cpu = self.storage().cpu_ref()?.scatter_add_vals(
-            self.layout(),
-            &*src.storage().cpu_ref()?,
-            src.layout(),
-            &idx_shape,
-            ax,
-            &idx,
-        )?;
-        let storage =
-            Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?;
+        let storage = match self.storage().cuda_scatter_dev(self.layout(), src.storage(), src.layout(), index.storage(), index.layout(), ax, true)? {
+            Some(s) => s,
+            None => {
+                let idx = index.to_vec::<i64>()?;
+                match self.storage().cuda_scatter(self.layout(), src.storage(), src.layout(), &idx_shape, ax, &idx, true)? {
+                    Some(s) => s,
+                    None => {
+                        let cpu = self.storage().cpu_ref()?.scatter_add_vals(self.layout(), &*src.storage().cpu_ref()?, src.layout(), &idx_shape, ax, &idx)?;
+                        Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?
+                    }
+                }
+            }
+        };
         let (ra, rb) = (self.requires_grad(), src.requires_grad());
         let idx_clone = index.clone();
         Ok(Tensor::from_op(
@@ -3124,18 +3553,20 @@ impl Tensor {
             }
         }
         let idx_shape = index.shape().to_vec();
-        let idx = index.to_vec::<i64>()?;
         let shape = self.shape().to_vec();
-        let cpu = self.storage().cpu_ref()?.scatter_vals(
-            self.layout(),
-            &*src.storage().cpu_ref()?,
-            src.layout(),
-            &idx_shape,
-            ax,
-            &idx,
-        )?;
-        let storage =
-            Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?;
+        let storage = match self.storage().cuda_scatter_dev(self.layout(), src.storage(), src.layout(), index.storage(), index.layout(), ax, false)? {
+            Some(s) => s,
+            None => {
+                let idx = index.to_vec::<i64>()?;
+                match self.storage().cuda_scatter(self.layout(), src.storage(), src.layout(), &idx_shape, ax, &idx, false)? {
+                    Some(s) => s,
+                    None => {
+                        let cpu = self.storage().cpu_ref()?.scatter_vals(self.layout(), &*src.storage().cpu_ref()?, src.layout(), &idx_shape, ax, &idx)?;
+                        Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?
+                    }
+                }
+            }
+        };
         let (ra, rb) = (self.requires_grad(), src.requires_grad());
         let idx_clone = index.clone();
         let idx_shape_clone = idx_shape.clone();
@@ -3173,22 +3604,24 @@ impl Tensor {
         let dim = self.shape()[ax];
         let outer: usize = self.shape()[..ax].iter().product();
         let inner: usize = self.shape()[ax + 1..].iter().product();
-        let mut data = self.to_vec::<f64>()?;
-
-        for o in 0..outer {
-            for k in 1..dim {
-                let cur = (o * dim + k) * inner;
-                let prev = (o * dim + k - 1) * inner;
-                for i in 0..inner {
-                    data[cur + i] += data[prev + i];
-                }
-            }
-        }
         let shape = self.shape().to_vec();
-        let cpu =
-            CpuStorage::F64(data).to_dtype(&Layout::contiguous(shape.clone()), self.dtype())?;
-        let storage =
-            Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?;
+        let storage = match self.storage().cuda_cumsum(self.layout(), ax, false)? {
+            Some(s) => s,
+            None => {
+                let mut data = self.to_vec::<f64>()?;
+                for o in 0..outer {
+                    for k in 1..dim {
+                        let cur = (o * dim + k) * inner;
+                        let prev = (o * dim + k - 1) * inner;
+                        for i in 0..inner {
+                            data[cur + i] += data[prev + i];
+                        }
+                    }
+                }
+                let cpu = CpuStorage::F64(data).to_dtype(&Layout::contiguous(shape.clone()), self.dtype())?;
+                Storage::new_cpu(cpu).to_device(&Layout::contiguous(shape.clone()), &self.device())?
+            }
+        };
         Ok(Tensor::from_op(
             storage,
             Layout::contiguous(shape),
@@ -3239,6 +3672,15 @@ impl Tensor {
         }
         let outer: usize = self.shape()[..ax].iter().product();
         let inner: usize = self.shape()[ax + 1..].iter().product();
+
+        // CUDA tensors: sort the indices on the device (bitonic chunks, same order as below), gather the values there too
+        if let Some(idx_storage) = self.storage().cuda_topk_indices(self.layout(), ax, k, largest)? {
+            let mut out_shape = self.shape().to_vec();
+            out_shape[ax] = k;
+            let idx_tensor = Tensor::from_storage(idx_storage, Layout::contiguous(out_shape));
+            let values = self.gather(ax as isize, &idx_tensor)?;
+            return Ok((values, idx_tensor));
+        }
 
         // I64 keys compare natively: past 2^53 an f64 key rounds (2^53+1
         // reads as 2^53) and misorders. Every other dtype widens to f64
@@ -3493,6 +3935,9 @@ impl Tensor {
             )));
         }
 
+        if let Some(t) = einsum_composed(&in_specs, &rhs_str, operands)? {
+            return Ok(t);
+        }
         let out_val = no_grad(|| eval_einsum_forward(&in_specs, &rhs_str, operands))?;
         let owned_ops: Vec<Tensor> = operands.iter().map(|&t| t.clone()).collect();
         let in_specs_owned: Vec<String> = in_specs.iter().map(|s| (*s).to_string()).collect();
@@ -3615,6 +4060,13 @@ impl Tensor {
 
         let out_shape = vec![n, col_c, l];
         let geom = UnfoldGeom { h, w, kh, kw, sh, sw, ph, pw, dh, dw, out_h, out_w };
+        if let Some(g) = crate::backend::cuda_ops::ConvGeo::new(n, c, h, w, kernel_size, stride, padding, dilation, out_h, out_w)
+            && let Some(storage) = self.storage().cuda_im2col(self.layout(), &g)?
+        {
+            return Ok(Tensor::from_op(storage, Layout::contiguous(out_shape), "unfold2d", vec![self.clone()], move |g| {
+                Ok(vec![Some(g.fold2d((h, w), kernel_size, stride, padding, dilation)?)])
+            }));
+        }
         let cpu = if self.dtype() == DType::F32 {
             // native f32: the source is read in place and whole row spans are copied, in parallel over channels
             let guard = self.storage().cpu_ref()?;
@@ -3776,6 +4228,13 @@ impl Tensor {
                 got: vec![n, col_c, l],
             });
         }
+        if let Some(g) = crate::backend::cuda_ops::ConvGeo::new(n, c, h, w, kernel_size, stride, padding, dilation, out_h, out_w)
+            && let Some(storage) = self.storage().cuda_col2im(self.layout(), &g)?
+        {
+            return Ok(Tensor::from_op(storage, Layout::contiguous(vec![n, c, h, w]), "fold2d", vec![self.clone()], move |g| {
+                Ok(vec![Some(g.unfold2d(kernel_size, stride, padding, dilation)?)])
+            }));
+        }
         let cols = self.to_vec::<f64>()?;
         let img = Self::fold2d_scatter(
             &cols,
@@ -3878,7 +4337,11 @@ impl Tensor {
         // inference on contiguous f32 host tensors: im2col and the matrix product run image by image, so the column
         // buffer (kh*kw times one image) stays in cache instead of being built for the whole batch first
         let needs_grad = crate::tensor::is_grad_enabled() && (self.requires_grad() || weight.requires_grad() || bias.is_some_and(Tensor::requires_grad));
-        if !needs_grad && bias.is_none_or(|b| b.dtype() == DType::F32 && b.shape() == [c_out]) {
+        // (host tensors only: reading the bias below must never pull data off a GPU)
+        if self.device().is_cpu()
+            && weight.device().is_cpu()
+            && bias.is_none_or(|b| b.dtype() == DType::F32 && b.shape() == [c_out] && b.device().is_cpu())
+        {
             let geom = UnfoldGeom { h, w, kh, kw, sh: stride.0, sw: stride.1, ph: padding.0, pw: padding.1, dh: dilation.0, dw: dilation.1, out_h, out_w };
             let (l, kdim) = (out_h * out_w, c_in * kh * kw);
             let bias_v = bias.map(|b| b.to_vec::<f32>()).transpose()?;
@@ -3903,8 +4366,13 @@ impl Tensor {
                         crate::pool::give(cols);
                     };
                     if total > 0 && kdim * l > 0 {
+                        // `Highest` takes the im2col + f64 GEMM route: the Winograd and direct kernels accumulate in f32 and are
+                        // about half as accurate (the GEMM route is ~9x slower than Winograd on 3x3 layers)
                         #[cfg(feature = "rayon")]
-                        if kh == 3
+                        let fast_kernels = crate::gemm::precision_mode() != crate::gemm::PrecisionMode::Highest;
+                        #[cfg(feature = "rayon")]
+                        if fast_kernels
+                            && kh == 3
                             && kw == 3
                             && stride == (1, 1)
                             && dilation == (1, 1)
@@ -3928,7 +4396,8 @@ impl Tensor {
                                 out_h,
                                 out_w,
                             );
-                        } else if stride == (1, 1)
+                        } else if fast_kernels
+                            && stride == (1, 1)
                             && dilation == (1, 1)
                             && out_w >= 8
                             && c_out % 4 == 0
@@ -3958,7 +4427,8 @@ impl Tensor {
                                     out_w,
                                 );
                             });
-                        } else if stride == (1, 1)
+                        } else if fast_kernels
+                            && stride == (1, 1)
                             && dilation == (1, 1)
                             && out_w >= 8
                             && crate::backend::simd_x86::has_avx2_fma()
@@ -4068,7 +4538,256 @@ impl Tensor {
             if let Some(inner) = fused
                 && let Some(out) = inner?
             {
-                return Ok(Tensor::from_storage(Storage::new_cpu(CpuStorage::F32(out)), Layout::contiguous(vec![n, c_out, out_h, out_w])));
+                let out_storage = Storage::new_cpu(CpuStorage::F32(out));
+                let out_layout = Layout::contiguous(vec![n, c_out, out_h, out_w]);
+                if !needs_grad {
+                    return Ok(Tensor::from_storage(out_storage, out_layout));
+                }
+                let x_saved = self.clone();
+                let w_saved = weight.clone();
+                let b_saved = bias.cloned();
+                let mut inputs = vec![x_saved.clone(), w_saved.clone()];
+                if let Some(bv) = &b_saved {
+                    inputs.push(bv.clone());
+                }
+                let backward: crate::tensor::BackwardFn = Box::new(move |gy: &Tensor| {
+                    if crate::tensor::is_grad_enabled()
+                        || gy.dtype() != DType::F32
+                        || !gy.device().is_cpu()
+                    {
+                        let cols = x_saved.unfold2d((kh, kw), stride, padding, dilation)?;
+                        let gy_flat = gy.reshape(&[n, c_out, l])?;
+                        let w_flat = w_saved.reshape(&[1, c_out, kdim])?;
+                        let gx = if x_saved.requires_grad() {
+                            let dcols = w_flat.transpose(1, 2)?.matmul(&gy_flat)?;
+                            Some(dcols.fold2d(
+                                (h, w),
+                                (kh, kw),
+                                stride,
+                                padding,
+                                dilation,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let gw = if w_saved.requires_grad() {
+                            let dw = gy_flat.matmul(&cols.transpose(1, 2)?)?.sum_axis(0, false)?;
+                            Some(dw.reshape(&[c_out, c_in, kh, kw])?)
+                        } else {
+                            None
+                        };
+                        let mut grads = vec![gx, gw];
+                        if let Some(bv) = &b_saved {
+                            let gb = if bv.requires_grad() {
+                                Some(gy.sum_axes(&[0, 2, 3], false)?)
+                            } else {
+                                None
+                            };
+                            grads.push(gb);
+                        }
+                        return Ok(grads);
+                    }
+
+                    let gy_vec = gy.to_vec::<f32>()?;
+                    let gx = if x_saved.requires_grad() {
+                        let w_vec = w_saved.to_vec::<f32>()?;
+                        let mut dx = vec![0.0f32; n * c_in * h * w];
+                        let img_elems = c_in * h * w;
+                        let gy_img_elems = c_out * l;
+                        #[cfg(feature = "rayon")]
+                        {
+                            use rayon::prelude::*;
+                            dx.par_chunks_mut(img_elems).enumerate().for_each_init(
+                                || vec![0.0f32; kdim * l],
+                                |dcols, (b, dx_img)| {
+                                    let gy_b = &gy_vec[b * gy_img_elems..(b + 1) * gy_img_elems];
+                                    // dcols[kdim, l] = W[c_out, kdim]^T @ gy_b[c_out, l]
+                                    crate::gemm::gemm_f32_strided_seq(
+                                        &w_vec,
+                                        0,
+                                        1,
+                                        kdim as isize,
+                                        gy_b,
+                                        0,
+                                        l as isize,
+                                        1,
+                                        dcols,
+                                        kdim,
+                                        c_out,
+                                        l,
+                                    );
+                                    for c in 0..c_in {
+                                        let dx_plane = &mut dx_img[c * h * w..(c + 1) * h * w];
+                                        for r in 0..kh {
+                                            for s in 0..kw {
+                                                let k_row = (c * kh + r) * kw + s;
+                                                let drow = &dcols[k_row * l..(k_row + 1) * l];
+                                                for oh in 0..out_h {
+                                                    let ih = (oh * stride.0 + r * dilation.0) as isize - padding.0 as isize;
+                                                    if ih < 0 || ih as usize >= h {
+                                                        continue;
+                                                    }
+                                                    let ih_u = ih as usize;
+                                                    for ow in 0..out_w {
+                                                        let iw = (ow * stride.1 + s * dilation.1) as isize - padding.1 as isize;
+                                                        if iw >= 0 && (iw as usize) < w {
+                                                            dx_plane[ih_u * w + iw as usize] += drow[oh * out_w + ow];
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                            );
+                        }
+                        #[cfg(not(feature = "rayon"))]
+                        {
+                            let mut dcols = vec![0.0f32; kdim * l];
+                            for b in 0..n {
+                                let gy_b = &gy_vec[b * gy_img_elems..(b + 1) * gy_img_elems];
+                                let dx_img = &mut dx[b * img_elems..(b + 1) * img_elems];
+                                crate::gemm::gemm_f32_strided_seq(
+                                    &w_vec, 0, 1, kdim as isize, gy_b, 0, l as isize, 1, &mut dcols, kdim, c_out, l,
+                                );
+                                for c in 0..c_in {
+                                    let dx_plane = &mut dx_img[c * h * w..(c + 1) * h * w];
+                                    for r in 0..kh {
+                                        for s in 0..kw {
+                                            let k_row = (c * kh + r) * kw + s;
+                                            let drow = &dcols[k_row * l..(k_row + 1) * l];
+                                            for oh in 0..out_h {
+                                                let ih = (oh * stride.0 + r * dilation.0) as isize - padding.0 as isize;
+                                                if ih < 0 || ih as usize >= h { continue; }
+                                                let ih_u = ih as usize;
+                                                for ow in 0..out_w {
+                                                    let iw = (ow * stride.1 + s * dilation.1) as isize - padding.1 as isize;
+                                                    if iw >= 0 && (iw as usize) < w {
+                                                        dx_plane[ih_u * w + iw as usize] += drow[oh * out_w + ow];
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(Tensor::from_storage(
+                            Storage::new_cpu(CpuStorage::F32(dx)),
+                            Layout::contiguous(vec![n, c_in, h, w]),
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let gw = if w_saved.requires_grad() {
+                        let x_vec = x_saved.to_vec::<f32>()?;
+                        let img_elems = c_in * h * w;
+                        let gy_img_elems = c_out * l;
+                        #[cfg(feature = "rayon")]
+                        let dw = {
+                            use rayon::prelude::*;
+                            (0..n)
+                                .into_par_iter()
+                                .fold(
+                                    || (vec![0.0f32; c_out * kdim], vec![0.0f32; kdim * l], vec![0.0f32; c_out * kdim]),
+                                    |(mut acc, mut cols, mut tmp), b| {
+                                        if padding.0 > 0 || padding.1 > 0 {
+                                            cols.fill(0.0);
+                                        }
+                                        unfold_fill_seq(&x_vec[b * img_elems..(b + 1) * img_elems], &mut cols, &geom);
+                                        let gy_b = &gy_vec[b * gy_img_elems..(b + 1) * gy_img_elems];
+                                        // tmp[c_out, kdim] = gy_b[c_out, l] @ cols[kdim, l]^T
+                                        crate::gemm::gemm_f32_strided_seq(
+                                            gy_b,
+                                            0,
+                                            l as isize,
+                                            1,
+                                            &cols,
+                                            0,
+                                            1,
+                                            l as isize,
+                                            &mut tmp,
+                                            c_out,
+                                            l,
+                                            kdim,
+                                        );
+                                        for (a, t) in acc.iter_mut().zip(tmp.iter()) {
+                                            *a += *t;
+                                        }
+                                        (acc, cols, tmp)
+                                    },
+                                )
+                                .map(|(acc, _, _)| acc)
+                                .reduce(
+                                    || vec![0.0f32; c_out * kdim],
+                                    |mut a, b| {
+                                        for (x, y) in a.iter_mut().zip(b.iter()) {
+                                            *x += *y;
+                                        }
+                                        a
+                                    },
+                                )
+                        };
+                        #[cfg(not(feature = "rayon"))]
+                        let dw = {
+                            let mut acc = vec![0.0f32; c_out * kdim];
+                            let mut cols = vec![0.0f32; kdim * l];
+                            let mut tmp = vec![0.0f32; c_out * kdim];
+                            for b in 0..n {
+                                if padding.0 > 0 || padding.1 > 0 {
+                                    cols.fill(0.0);
+                                }
+                                unfold_fill(&x_vec[b * img_elems..(b + 1) * img_elems], &mut cols, &geom);
+                                let gy_b = &gy_vec[b * gy_img_elems..(b + 1) * gy_img_elems];
+                                crate::gemm::gemm_f32_strided_seq(
+                                    gy_b, 0, l as isize, 1, &cols, 0, 1, l as isize, &mut tmp, c_out, l, kdim,
+                                );
+                                for (a, t) in acc.iter_mut().zip(tmp.iter()) {
+                                    *a += *t;
+                                }
+                            }
+                            acc
+                        };
+                        Some(Tensor::from_storage(
+                            Storage::new_cpu(CpuStorage::F32(dw)),
+                            Layout::contiguous(vec![c_out, c_in, kh, kw]),
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let mut grads = vec![gx, gw];
+                    if let Some(bv) = &b_saved {
+                        let gb = if bv.requires_grad() {
+                            let mut db = vec![0.0f32; c_out];
+                            for b in 0..n {
+                                let base = b * c_out * l;
+                                for oc in 0..c_out {
+                                    let sl = &gy_vec[base + oc * l..base + (oc + 1) * l];
+                                    let s: f32 = crate::backend::simd_x86::sum_f32_slice(sl)
+                                        .unwrap_or_else(|| sl.iter().sum());
+                                    db[oc] += s;
+                                }
+                            }
+                            Some(Tensor::from_storage(
+                                Storage::new_cpu(CpuStorage::F32(db)),
+                                Layout::contiguous(vec![c_out]),
+                            ))
+                        } else {
+                            None
+                        };
+                        grads.push(gb);
+                    }
+                    Ok(grads)
+                });
+                return Ok(Tensor::from_op(
+                    out_storage,
+                    out_layout,
+                    "conv2d",
+                    inputs,
+                    backward,
+                ));
             }
         }
         let cols = self.unfold2d((kh, kw), stride, padding, dilation)?; // [N, C_in*kH*kW, L]
@@ -4164,6 +4883,19 @@ impl Tensor {
         // times the size of the input and reduces it)
         let geom = UnfoldGeom { h, w, kh, kw, sh: stride.0, sw: stride.1, ph: padding.0, pw: padding.1, dh: 1, dw: 1, out_h, out_w };
         let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+        if let Some(g) = crate::backend::cuda_ops::ConvGeo::new(n, c, h, w, kernel_size, stride, padding, (1, 1), out_h, out_w)
+            && let Some((storage, arg)) = self.storage().cuda_max_pool(self.layout(), &g, needs_grad)?
+        {
+            let out_layout = Layout::contiguous(vec![n, c, out_h, out_w]);
+            let Some(arg) = arg else { return Ok(Tensor::from_storage(storage, out_layout)) };
+            return Ok(Tensor::from_op(storage, out_layout, "max_pool2d", vec![self.clone()], move |gy| {
+                let gy = gy.contiguous()?;
+                if let Some(gx) = gy.storage().cuda_max_pool_bwd(gy.layout(), &arg, &g)? {
+                    return Ok(vec![Some(Tensor::from_storage(gx, Layout::contiguous(vec![n, c, h, w])))]);
+                }
+                Err(Error::Msg("max_pool2d backward: the gradient is not on the CUDA device of the forward pass".into()))
+            }));
+        }
         let direct = with_f32_host(self, |src| {
             let mut out = crate::pool::take_f32(n * c * l).unwrap_or_else(|| vec![0.0; n * c * l]);
             let mut arg = if needs_grad { vec![0i64; n * c * l] } else { Vec::new() };
@@ -4412,6 +5144,14 @@ impl Tensor {
         // Scatter over the input grid (h, w): with output_padding the output is
         // bigger than fold2d's forward-size check accepts, so bypass it; the
         // fringe cells no window covers stay zero, matching torch.
+        let gpu_img = match crate::backend::cuda_ops::ConvGeo::new(n, c_out, out_h, out_w, (kh, kw), stride, padding, dilation, h, w) {
+            Some(g) => cols.storage().cuda_col2im(cols.layout(), &g)?,
+            None => None,
+        };
+        let out_shape = vec![n, c_out, out_h, out_w];
+        let storage = if let Some(s) = gpu_img {
+            s
+        } else {
         let col_vec = cols.to_vec::<f64>()?;
         let img = Self::fold2d_scatter(
             &col_vec,
@@ -4433,11 +5173,10 @@ impl Tensor {
                 dw: dilation.1,
             },
         )?;
-        let out_shape = vec![n, c_out, out_h, out_w];
         let cpu =
             CpuStorage::F64(img).to_dtype(&Layout::contiguous(out_shape.clone()), self.dtype())?;
-        let storage = Storage::new_cpu(cpu)
-            .to_device(&Layout::contiguous(out_shape.clone()), &self.device())?;
+        Storage::new_cpu(cpu).to_device(&Layout::contiguous(out_shape.clone()), &self.device())?
+        };
         // The unfolded gradient spans the full (H', W') grid; keep the (h, w)
         // subgrid whose columns exist (a no-op view when output_padding = 0).
         let eff_kh = (dilation.0 as u128) * ((kh - 1) as u128) + 1;
@@ -4994,6 +5733,17 @@ impl Tensor {
         let outer: usize = shape[..ax].iter().product();
         let inner: usize = shape[ax + 1..].iter().product();
 
+        if let Some(storage) = self.storage().cuda_cumsum(self.layout(), ax, true)? {
+            let out_layout = Layout::contiguous(shape.clone());
+            let x = self.detach();
+            let out = Tensor::from_storage(storage.clone(), out_layout.clone());
+            return Ok(Tensor::from_op(storage, out_layout, "cumprod", vec![self.clone()], move |go| {
+                match x.storage().cuda_cumprod_bwd(x.layout(), out.storage(), out.layout(), go.storage(), go.layout(), ax)? {
+                    Some(s) => Ok(vec![Some(Tensor::from_storage(s, Layout::contiguous(x.shape().to_vec())))]),
+                    None => Err(Error::Msg("cumprod backward: CUDA kernel unavailable".into())),
+                }
+            }));
+        }
         let x_vec = self.to_vec::<f64>()?;
         let mut out_vec = vec![0.0f64; x_vec.len()];
 
@@ -6588,6 +7338,93 @@ struct Fold2dGeo {
 // ---------------------------------------------------------------------------
 // Einsum helpers
 // ---------------------------------------------------------------------------
+/// einsum built from permute / reshape / matmul / sum: runs on whatever device the operands live on and differentiates
+/// through those ops. Operands are contracted left to right; a label is summed out as soon as no later operand or the
+/// output needs it. A label repeated inside one operand (a diagonal, as in `ii->i`) is folded with an identity mask and a
+/// sum; operands of different float/integer dtypes are cast to the widest one. Returns `None` (so the scalar loop below
+/// reports the error) for malformed equations, operands on different devices, or bool/complex data.
+fn einsum_composed(in_specs: &[&str], out_spec: &str, ops: &[&Tensor]) -> Result<Option<Tensor>> {
+    let mut labels: Vec<Vec<char>> = in_specs.iter().map(|s| s.chars().collect()).collect();
+    let out: Vec<char> = out_spec.chars().collect();
+    let rank = |d: DType| match d {
+        DType::F64 => 6,
+        DType::F32 => 5,
+        DType::BF16 => 4,
+        DType::F16 => 3,
+        DType::I64 => 2,
+        DType::I32 => 1,
+        _ => 0,
+    };
+    let dtype = ops.iter().map(|t| t.dtype()).max_by_key(|&d| rank(d)).unwrap();
+    if rank(dtype) == 0 || ops.iter().any(|t| rank(t.dtype()) == 0 || t.device() != ops[0].device()) {
+        return Ok(None);
+    }
+    let mut dim = HashMap::<char, usize>::new();
+    for (l, t) in labels.iter().zip(ops) {
+        if l.len() != t.ndim() {
+            return Ok(None);
+        }
+        for (i, c) in l.iter().enumerate() {
+            let size = t.shape()[i];
+            if dim.insert(*c, size).is_some_and(|p| p != size) {
+                return Ok(None);
+            }
+        }
+    }
+    if out.iter().enumerate().any(|(i, c)| !dim.contains_key(c) || out[..i].contains(c)) {
+        return Ok(None);
+    }
+    // fold repeated labels: keep the first occurrence of the label, drop the second by masking with an identity and summing
+    let mut tensors: Vec<Tensor> = Vec::with_capacity(ops.len());
+    for (k, t) in ops.iter().enumerate() {
+        let mut t = t.to_dtype(dtype)?;
+        while let Some((p, q)) = (0..labels[k].len()).find_map(|q| (0..q).find(|&p| labels[k][p] == labels[k][q]).map(|p| (p, q))) {
+            let n = t.shape()[p];
+            let mut eye = vec![0.0f64; n * n];
+            (0..n).for_each(|i| eye[i * n + i] = 1.0);
+            let mut shape = vec![1usize; t.ndim()];
+            (shape[p], shape[q]) = (n, n);
+            let mask = Tensor::from_slice_on(&eye, &[n, n], &t.device())?.to_dtype(dtype)?.reshape(&shape)?;
+            t = t.mul(&mask)?.sum_axes(&[q as isize], false)?;
+            labels[k].remove(q);
+        }
+        tensors.push(t);
+    }
+    let first = &tensors[0];
+    let needed_after = |k: usize| -> Vec<char> { out.iter().chain(labels[k + 1..].iter().flatten()).copied().collect() };
+    let sum_unneeded = |t: Tensor, l: Vec<char>, keep: &[char]| -> Result<(Tensor, Vec<char>)> {
+        let axes: Vec<isize> = l.iter().enumerate().filter(|(_, c)| !keep.contains(c)).map(|(i, _)| i as isize).collect();
+        if axes.is_empty() {
+            return Ok((t, l));
+        }
+        let kept = l.into_iter().filter(|c| keep.contains(c)).collect();
+        Ok((t.sum_axes(&axes, false)?, kept))
+    };
+    let pos = |l: &[char], want: &[char]| -> Vec<usize> { want.iter().map(|c| l.iter().position(|x| x == c).unwrap()).collect() };
+    let prod = |cs: &[char]| cs.iter().map(|c| dim[c]).product::<usize>();
+
+    let (mut acc, mut al) = sum_unneeded(first.clone(), labels[0].clone(), &needed_after(0))?;
+    for k in 1..ops.len() {
+        let needed = needed_after(k);
+        let keep: Vec<char> = needed.iter().chain(al.iter()).copied().collect();
+        let (b, bl) = sum_unneeded(tensors[k].clone(), labels[k].clone(), &keep)?;
+        let both = |c: &&char| al.contains(c) && bl.contains(c);
+        let batch: Vec<char> = al.iter().filter(both).filter(|c| needed.contains(c)).copied().collect();
+        let contr: Vec<char> = al.iter().filter(both).filter(|c| !needed.contains(c)).copied().collect();
+        let lonly: Vec<char> = al.iter().filter(|c| !bl.contains(c)).copied().collect();
+        let ronly: Vec<char> = bl.iter().filter(|c| !al.contains(c)).copied().collect();
+        let a2 = acc.permute(&pos(&al, &[&batch[..], &lonly, &contr].concat()))?.reshape(&[prod(&batch), prod(&lonly), prod(&contr)])?;
+        let b2 = b.permute(&pos(&bl, &[&batch[..], &contr, &ronly].concat()))?.reshape(&[prod(&batch), prod(&contr), prod(&ronly)])?;
+        al = [&batch[..], &lonly, &ronly].concat();
+        acc = a2.matmul(&b2)?.reshape(&al.iter().map(|c| dim[c]).collect::<Vec<_>>())?;
+    }
+    let order = pos(&al, &out);
+    if order.iter().enumerate().all(|(i, &p)| i == p) {
+        return Ok(Some(acc));
+    }
+    Ok(Some(acc.permute(&order)?))
+}
+
 fn eval_einsum_forward(in_specs: &[&str], out_spec: &str, ops: &[&Tensor]) -> Result<Tensor> {
     let mut dim_sizes = HashMap::<char, usize>::new();
     let mut all_labels = Vec::<char>::new();
@@ -6903,6 +7740,41 @@ impl std::ops::Neg for Tensor {
     type Output = Result<Tensor>;
     fn neg(self) -> Result<Tensor> {
         Tensor::neg(&self)
+    }
+}
+
+/// What `Tensor::to` can convert to: a device, a dtype, both, or a reference tensor.
+pub trait ToTarget {
+    fn resolve(self, src: &Tensor) -> Result<(Option<Device>, Option<DType>)>;
+}
+impl ToTarget for &Device {
+    fn resolve(self, _: &Tensor) -> Result<(Option<Device>, Option<DType>)> {
+        Ok((Some(self.clone()), None))
+    }
+}
+impl ToTarget for Device {
+    fn resolve(self, _: &Tensor) -> Result<(Option<Device>, Option<DType>)> {
+        Ok((Some(self), None))
+    }
+}
+impl ToTarget for DType {
+    fn resolve(self, _: &Tensor) -> Result<(Option<Device>, Option<DType>)> {
+        Ok((None, Some(self)))
+    }
+}
+impl ToTarget for &str {
+    fn resolve(self, _: &Tensor) -> Result<(Option<Device>, Option<DType>)> {
+        Ok((Some(self.parse::<Device>()?), None))
+    }
+}
+impl ToTarget for (Device, DType) {
+    fn resolve(self, _: &Tensor) -> Result<(Option<Device>, Option<DType>)> {
+        Ok((Some(self.0), Some(self.1)))
+    }
+}
+impl ToTarget for &Tensor {
+    fn resolve(self, _: &Tensor) -> Result<(Option<Device>, Option<DType>)> {
+        Ok((Some(self.device()), Some(self.dtype())))
     }
 }
 
@@ -8750,14 +9622,14 @@ mod tests {
     }
 
     #[test]
-    fn einsum_validation_and_3op_backward_limit() {
+    fn einsum_validation_and_3op_backward() {
         let m = Tensor::from_slice(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
         assert!(Tensor::einsum("ij,jk->ik", &[&m]).is_err());
         assert!(Tensor::einsum("ij->ik", &[&m]).is_err());
         assert!(Tensor::einsum("ij->ii", &[&m]).is_err());
         let v = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3]).unwrap();
         assert!(Tensor::einsum("ij,jk->ik", &[&m, &v]).is_err());
-        // 3+ operand backward is an explicit error (forward works)
+        // 3 operands: forward and backward both work
         let x = Tensor::from_slice(&arange_f64(6), &[2, 3])
             .unwrap()
             .requires_grad_(true);
@@ -8768,7 +9640,9 @@ mod tests {
             .unwrap()
             .requires_grad_(true);
         let y = Tensor::einsum("bn,nm,bm->b", &[&x, &w, &z]).unwrap();
-        assert!(y.sum().unwrap().backward().is_err());
+        y.sum().unwrap().backward().unwrap();
+        // d/dx[b,n] = sum_m w[n,m] z[b,m]; for b=0, n=0: 0*0 + 1*1 + 2*2 + 3*3
+        assert_eq!(x.grad().unwrap().to_vec::<f64>().unwrap()[0], 14.0);
     }
 
     #[test]
@@ -9232,3 +10106,4 @@ mod tests {
         assert_eq!(v(b.isfinite().unwrap()), vec![true, true]);
     }
 }
+

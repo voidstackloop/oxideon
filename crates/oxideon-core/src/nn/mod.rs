@@ -147,6 +147,36 @@ pub trait Module {
             .collect()
     }
 
+    /// Moves every parameter and buffer to `device`, in place (like torch's `module.to(device)`). Optimizers built from
+    /// `parameters()` keep working because the parameter tensors themselves are retargeted. Build the optimizer after
+    /// moving, since optimizer state created earlier stays on the old device.
+    fn to_device(&self, device: &crate::Device) -> Result<()> {
+        for t in self.parameters().into_iter().chain(self.buffers()) {
+            t.retarget(&t.detach().to_device(device)?)?;
+        }
+        Ok(())
+    }
+
+    /// Casts floating-point parameters and buffers to `dtype` in place (integer buffers are left alone).
+    fn to_dtype(&self, dtype: crate::DType) -> Result<()> {
+        for t in self.parameters().into_iter().chain(self.buffers()) {
+            if t.dtype().is_floating_point() {
+                t.retarget(&t.detach().to_dtype(dtype)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves to CUDA device `index`.
+    fn cuda(&self, index: usize) -> Result<()> {
+        self.to_device(&crate::Device::Cuda(index))
+    }
+
+    /// Moves to the host CPU.
+    fn cpu(&self) -> Result<()> {
+        self.to_device(&crate::Device::Cpu)
+    }
+
     /// Switches between training (`true`) and evaluation (`false`) mode.
     fn train(&self, _mode: bool) {}
 

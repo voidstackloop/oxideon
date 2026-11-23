@@ -24,6 +24,12 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// Prints `what: error` and exits with status 1 (a bad model path or an unsupported tokenizer is not a panic).
+fn fail(what: &str, e: impl std::fmt::Display) -> ! {
+    eprintln!("{what}: {e}");
+    std::process::exit(1);
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap_or_else(|| usage());
@@ -37,9 +43,9 @@ fn main() {
         .unwrap_or(24);
 
     let t0 = Instant::now();
-    let file = GGUFFile::open(&path).expect("cannot read GGUF file");
-    let tokenizer = GGUFTokenizer::from_gguf(&file).expect("cannot build tokenizer");
-    let model = GGUFCausalLM::from_gguf(&file).expect("cannot load model");
+    let file = GGUFFile::open(&path).unwrap_or_else(|e| fail("cannot read GGUF file", e));
+    let tokenizer = GGUFTokenizer::from_gguf(&file).unwrap_or_else(|e| fail("cannot build tokenizer", e));
+    let model = GGUFCausalLM::from_gguf(&file).unwrap_or_else(|e| fail("cannot load model", e));
     let load_secs = t0.elapsed().as_secs_f64();
     println!("loaded {path} in {load_secs:.2}s");
 
@@ -49,7 +55,7 @@ fn main() {
     let t1 = Instant::now();
     let all = model
         .generate_greedy(&ids, new_tokens, tokenizer.eos_id.map(i64::from))
-        .expect("generation failed");
+        .unwrap_or_else(|e| fail("generation failed", e));
     let gen_secs = t1.elapsed().as_secs_f64();
     let fresh = &all[ids.len()..];
     let stopped_early = fresh.len() < new_tokens;

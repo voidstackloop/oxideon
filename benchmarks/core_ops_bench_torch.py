@@ -30,6 +30,7 @@ a, b, row, small = rnd([1024, 1024], 0), rnd([1024, 1024], 1), rnd([1024], 2), r
 img, w, seq = rnd([8, 16, 64, 64], 4), rnd([32, 16, 3, 3], 5), rnd([32, 128, 256], 6)
 g, bb, m = rnd([256], 7), rnd([256], 8), rnd([512, 512], 9)
 idx = (torch.arange(4096) * 7) % 1024
+lk_a, lk_b = rnd([256, 4096], 10), rnd([4096, 256], 11)
 
 bench("add 1M", lambda: a + b)
 bench("mul 1M", lambda: a * b)
@@ -48,7 +49,10 @@ bench("transpose+contiguous 1M", lambda: a.t().contiguous())
 bench("add transposed 1M", lambda: a.t() + b)
 bench("matmul 512", lambda: m @ m)
 bench("matmul 1024", lambda: a @ b)
+bench("matmul 256x4096x256", lambda: lk_a @ lk_b)
 bench("conv2d 8x16x64x64 k3", lambda: F.conv2d(img, w, padding=1))
+img64, w64 = rnd([4, 64, 56, 56], 12), rnd([64, 64, 3, 3], 13)
+bench("conv2d 4x64x56x56 k3", lambda: F.conv2d(img64, w64, padding=1))
 bench("max_pool2d", lambda: F.max_pool2d(img, 2))
 bench("layer_norm 32x128x256", lambda: F.layer_norm(seq, [256], g, bb))
 bench("index_select 4096 rows", lambda: a.index_select(0, idx))

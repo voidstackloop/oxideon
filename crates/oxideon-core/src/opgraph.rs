@@ -50,6 +50,39 @@ enum Op {
     Mean { src: Id, axes: Vec<isize>, keepdim: bool },
     Max { src: Id, axis: isize, keepdim: bool },
     Softmax(Id, isize),
+    Conv2d {
+        x: Id,
+        weight: Id,
+        bias: Option<Id>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    },
+    BatchNorm2d {
+        x: Id,
+        gamma: Id,
+        beta: Id,
+        mean: Id,
+        var: Id,
+        eps: f64,
+    },
+    FusedConvBnRelu {
+        x: Id,
+        weight: Id,
+        bias: Option<Id>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+        relu: bool,
+    },
+    FusedAttention {
+        q: Id,
+        k: Id,
+        v: Id,
+        scale: f64,
+    },
     Fused(Box<Fused>),
 }
 
@@ -67,6 +100,15 @@ impl Op {
             Op::Unary(_, a) | Op::Reshape(a) | Op::Permute(a, _) | Op::Broadcast(a) | Op::Softmax(a, _) => vec![*a],
             Op::Sum { src, .. } | Op::Mean { src, .. } | Op::Max { src, .. } => vec![*src],
             Op::Binary(_, a, b) | Op::Matmul(a, b) => vec![*a, *b],
+            Op::Conv2d { x, weight, bias, .. } | Op::FusedConvBnRelu { x, weight, bias, .. } => {
+                let mut v = vec![*x, *weight];
+                if let Some(b) = bias {
+                    v.push(*b);
+                }
+                v
+            }
+            Op::BatchNorm2d { x, gamma, beta, mean, var, .. } => vec![*x, *gamma, *beta, *mean, *var],
+            Op::FusedAttention { q, k, v, .. } => vec![*q, *k, *v],
             Op::Fused(f) => f.inputs.clone(),
         }
     }
@@ -79,6 +121,25 @@ impl Op {
             Op::Binary(_, a, b) | Op::Matmul(a, b) => {
                 *a = f(*a);
                 *b = f(*b);
+            }
+            Op::Conv2d { x, weight, bias, .. } | Op::FusedConvBnRelu { x, weight, bias, .. } => {
+                *x = f(*x);
+                *weight = f(*weight);
+                if let Some(b) = bias {
+                    *b = f(*b);
+                }
+            }
+            Op::BatchNorm2d { x, gamma, beta, mean, var, .. } => {
+                *x = f(*x);
+                *gamma = f(*gamma);
+                *beta = f(*beta);
+                *mean = f(*mean);
+                *var = f(*var);
+            }
+            Op::FusedAttention { q, k, v, .. } => {
+                *q = f(*q);
+                *k = f(*k);
+                *v = f(*v);
             }
             Op::Fused(fu) => fu.inputs.iter_mut().for_each(|i| *i = f(*i)),
         }
@@ -270,6 +331,63 @@ impl OpGraph {
         Ok(self.push(Op::Softmax(a, axis), shape, dt))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d(
+        &mut self,
+        x: Id,
+        weight: Id,
+        bias: Option<Id>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> Result<Id> {
+        let xs = &self.nodes[x].shape;
+        let ws = &self.nodes[weight].shape;
+        if xs.len() != 4 || ws.len() != 4 {
+            return Err(Error::Msg("opgraph conv2d expects 4D input and weight".into()));
+        }
+        let (n, h, w) = (xs[0], xs[2], xs[3]);
+        let (c_out, kh, kw) = (ws[0], ws[2], ws[3]);
+        let eff_kh = dilation.0 * (kh - 1) + 1;
+        let eff_kw = dilation.1 * (kw - 1) + 1;
+        let out_h = (h + 2 * padding.0 - eff_kh) / stride.0 + 1;
+        let out_w = (w + 2 * padding.1 - eff_kw) / stride.1 + 1;
+        let dt = self.nodes[x].dtype;
+        Ok(self.push(
+            Op::Conv2d { x, weight, bias, stride, padding, dilation, groups },
+            vec![n, c_out, out_h, out_w],
+            dt,
+        ))
+    }
+
+    pub fn batch_norm2d(
+        &mut self,
+        x: Id,
+        gamma: Id,
+        beta: Id,
+        mean: Id,
+        var: Id,
+        eps: f64,
+    ) -> Result<Id> {
+        let shape = self.nodes[x].shape.clone();
+        let dt = self.nodes[x].dtype;
+        Ok(self.push(Op::BatchNorm2d { x, gamma, beta, mean, var, eps }, shape, dt))
+    }
+
+    pub fn scaled_dot_product_attention(&mut self, q: Id, k: Id, v: Id, scale: Option<f64>) -> Result<Id> {
+        let qs = self.nodes[q].shape.clone();
+        let vs = &self.nodes[v].shape;
+        if qs.len() < 2 || vs.len() < 2 {
+            return Err(Error::Msg("opgraph attention expects >=2D Q/K/V".into()));
+        }
+        let d = *qs.last().unwrap() as f64;
+        let mut out_shape = qs;
+        *out_shape.last_mut().unwrap() = *vs.last().unwrap();
+        let dt = self.nodes[q].dtype;
+        Ok(self.push(Op::FusedAttention { q, k, v, scale: scale.unwrap_or_else(|| 1.0 / d.sqrt()) }, out_shape, dt))
+    }
+
     /// `(x - mean) / sqrt(var + eps) * gamma + beta` over the last axis, built from primitive operations.
     pub fn layer_norm(&mut self, x: Id, gamma: Id, beta: Id, eps: f64) -> Result<Id> {
         let mu = self.mean(x, &[-1], true)?;
@@ -314,30 +432,42 @@ impl OpGraph {
         }
     }
 
+    /// Drops dead nodes and renumbers the rest in a topological order (operands before users). Fusion appends new nodes at the
+    /// end while earlier consumers are rewired to them, so execution order must be re-established here.
     fn dce(&mut self) {
-        let mut live = vec![false; self.nodes.len()];
-        let mut stack: Vec<Id> = self.outputs.clone();
-        while let Some(i) = stack.pop() {
-            if !std::mem::replace(&mut live[i], true) {
-                stack.extend(self.nodes[i].op.operands());
+        let n = self.nodes.len();
+        let mut state = vec![0u8; n]; // 0 unseen, 1 on the stack, 2 emitted
+        let mut order: Vec<Id> = Vec::with_capacity(n);
+        // inputs stay (they define the calling convention), then everything the outputs need
+        let mut roots: Vec<Id> = (0..n).filter(|&i| matches!(self.nodes[i].op, Op::Input(_))).collect();
+        roots.extend(self.outputs.iter().copied());
+        for root in roots {
+            let mut stack = vec![(root, false)];
+            while let Some((i, expanded)) = stack.pop() {
+                if expanded {
+                    state[i] = 2;
+                    order.push(i);
+                    continue;
+                }
+                if state[i] != 0 {
+                    continue;
+                }
+                state[i] = 1;
+                stack.push((i, true));
+                for o in self.nodes[i].op.operands().into_iter().rev() {
+                    if state[o] == 0 {
+                        stack.push((o, false));
+                    }
+                }
             }
         }
-        // inputs stay (they define the calling convention)
-        for (i, n) in self.nodes.iter().enumerate() {
-            if matches!(n.op, Op::Input(_)) {
-                live[i] = true;
-            }
+        let mut new_id = vec![usize::MAX; n];
+        for (k, &i) in order.iter().enumerate() {
+            new_id[i] = k;
         }
-        let mut new_id = vec![usize::MAX; self.nodes.len()];
-        let mut kept = Vec::new();
-        for (i, n) in self.nodes.iter().enumerate() {
-            if live[i] {
-                new_id[i] = kept.len();
-                kept.push(n.clone());
-            }
-        }
-        for n in &mut kept {
-            n.op.remap(&|i| new_id[i]);
+        let mut kept: Vec<Node> = order.iter().map(|&i| self.nodes[i].clone()).collect();
+        for node in &mut kept {
+            node.op.remap(&|i| new_id[i]);
         }
         self.outputs = self.outputs.iter().map(|&o| new_id[o]).collect();
         self.nodes = kept;
@@ -426,6 +556,7 @@ impl OpGraph {
                 Op::Mean { src, axes, keepdim } => Some(format!("mean{axes:?}{keepdim}({src})")),
                 Op::Max { src, axis, keepdim } => Some(format!("max{axis}{keepdim}({src})")),
                 Op::Softmax(a, ax) => Some(format!("sm{ax}({a})")),
+                _ => None,
             };
             if let Some(k) = key {
                 match seen.get(&k) {
@@ -440,6 +571,184 @@ impl OpGraph {
             }
         }
         self.rewrite(&alias);
+    }
+
+    /// A multiplication by a constant scalar (either operand order, or the `MulScalar` unary): returns the other operand and the scalar.
+    fn scaled_by_constant(&self, id: Id) -> Option<(Id, f64)> {
+        match &self.nodes[id].op {
+            Op::Unary(UnaryOp::MulScalar(c), x) => Some((*x, *c)),
+            Op::Binary(BinaryOp::Mul, a, b) => match (self.scalar_value(*a), self.scalar_value(*b)) {
+                (_, Some(c)) => Some((*a, c)),
+                (Some(c), None) => Some((*b, c)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Q, K and V share rank and batch dimensions and Q / K the head size, as the fused kernel requires.
+    fn is_plain_attention_shape(&self, q: Id, k: Id, v: Id) -> bool {
+        let (qs, ks, vs) = (&self.nodes[q].shape, &self.nodes[k].shape, &self.nodes[v].shape);
+        let r = qs.len();
+        r >= 2 && ks.len() == r && vs.len() == r && qs[..r - 2] == ks[..r - 2] && qs[..r - 2] == vs[..r - 2] && qs[r - 1] == ks[r - 1] && ks[r - 2] == vs[r - 2]
+    }
+
+    /// Pattern-matching operator fusion for high-level blocks:
+    /// - `Conv2d -> BatchNorm2d (-> Relu)` (with constant-folding of BN scale/shift into Conv weights/bias)
+    /// - `Conv2d -> Relu`
+    /// - `MatMul(Q, K^T) -> MulScalar -> Softmax -> MatMul(_, V)` -> `FusedAttention`
+    ///
+    /// Attention only fuses when the softmax runs over the last axis, K is transposed over its last two axes only, and
+    /// Q, K and V share batch dimensions.
+    fn fuse_high_level_patterns(&mut self, stats: &mut CompileStats) -> Result<()> {
+        let n = self.nodes.len();
+        let mut uses = vec![0usize; n];
+        for node in &self.nodes {
+            for op_id in node.op.operands() {
+                uses[op_id] += 1;
+            }
+        }
+        for &o in &self.outputs {
+            uses[o] += 1;
+        }
+
+        let mut replace: Vec<Option<Id>> = vec![None; n];
+        for i in 0..n {
+            // Pattern 1: MatMul(Softmax(MulScalar(MatMul(Q, Permute(K)), scale)), V)
+            if let Op::Matmul(sm_id, v_id) = self.nodes[i].op.clone()
+                && uses[sm_id] == 1
+                && let Op::Softmax(scaled_id, sm_axis) = self.nodes[sm_id].op
+                && (sm_axis == -1 || sm_axis == self.nodes[sm_id].shape.len() as isize - 1)
+                && uses[scaled_id] == 1
+                && let Some((qk_id, scale)) = self.scaled_by_constant(scaled_id)
+                && uses[qk_id] == 1
+                && let Op::Matmul(q_id, kt_id) = self.nodes[qk_id].op
+                && uses[kt_id] == 1
+                && let Op::Permute(k_id, ref axes) = self.nodes[kt_id].op
+                && axes.len() >= 2
+                && axes[axes.len() - 1] == axes.len() - 2
+                && axes[axes.len() - 2] == axes.len() - 1
+                && axes[..axes.len() - 2].iter().enumerate().all(|(k, &x)| k == x)
+                && self.is_plain_attention_shape(q_id, k_id, v_id)
+            {
+                let dt = self.nodes[i].dtype;
+                let shp = self.nodes[i].shape.clone();
+                let fused_id = self.push(
+                    Op::FusedAttention { q: q_id, k: k_id, v: v_id, scale },
+                    shp,
+                    dt,
+                );
+                replace[i] = Some(fused_id);
+                stats.fused_kernels += 1;
+                continue;
+            }
+
+            // Pattern 2: Relu(BatchNorm2d(Conv2d(x, W, b))) or BatchNorm2d(Conv2d(x, W, b))
+            let (bn_id, has_relu) = match self.nodes[i].op {
+                Op::Unary(UnaryOp::Relu, inner) if uses[inner] == 1 => (inner, true),
+                Op::BatchNorm2d { .. } => (i, false),
+                _ => continue,
+            };
+            if let Op::BatchNorm2d { x: conv_id, gamma, beta, mean, var, eps } = self.nodes[bn_id].op
+                && uses[conv_id] == 1
+                && let Op::Conv2d { x, weight, bias, stride, padding, dilation, groups } = self.nodes[conv_id].op
+                && let (Op::Const(wt), Op::Const(gt), Op::Const(bt), Op::Const(mt), Op::Const(vt)) = (
+                    &self.nodes[weight].op,
+                    &self.nodes[gamma].op,
+                    &self.nodes[beta].op,
+                    &self.nodes[mean].op,
+                    &self.nodes[var].op,
+                )
+            {
+                let c_out = wt.shape()[0];
+                let inv = vt.add_scalar(eps)?.rsqrt()?;
+                let scale = gt.mul(&inv)?;
+                let w_folded = wt.mul(&scale.reshape(&[c_out, 1, 1, 1])?)?;
+                let b_orig = match bias {
+                    Some(bid) => {
+                        if let Op::Const(bt0) = &self.nodes[bid].op {
+                            bt0.clone()
+                        } else {
+                            continue;
+                        }
+                    }
+                    None => Tensor::zeros(&[c_out], wt.dtype(), &wt.device())?,
+                };
+                let b_folded = b_orig.sub(mt)?.mul(&scale)?.add(bt)?;
+                let wf_id = self.constant(&w_folded)?;
+                let bf_id = self.constant(&b_folded)?;
+                let dt = self.nodes[i].dtype;
+                let shp = self.nodes[i].shape.clone();
+                let fused_id = self.push(
+                    Op::FusedConvBnRelu { x, weight: wf_id, bias: Some(bf_id), stride, padding, dilation, groups, relu: has_relu },
+                    shp,
+                    dt,
+                );
+                replace[i] = Some(fused_id);
+                stats.fused_kernels += 1;
+            } else if let Op::BatchNorm2d { x: conv_id, gamma, beta, mean, var, eps } = self.nodes[bn_id].op
+                && uses[conv_id] == 1
+                && let Op::Conv2d { x, weight, bias, stride, padding, dilation, groups } = self.nodes[conv_id].op
+            {
+                // some parameter is not a compile-time constant (a graph input, say): fold it into the convolution with graph
+                // nodes that are evaluated when the graph runs, which still saves the pass over the activations
+                let c_out = self.nodes[weight].shape[0];
+                let dtype = self.nodes[weight].dtype;
+                let eps_id = self.scalar(eps, var)?;
+                let var_eps = self.add(var, eps_id)?;
+                let inv = self.rsqrt(var_eps)?;
+                let scale = self.mul(gamma, inv)?;
+                let scale4 = self.reshape(scale, &[c_out, 1, 1, 1])?;
+                let w_folded = self.mul(weight, scale4)?;
+                let b_orig = match bias {
+                    Some(b) => b,
+                    None => self.constant(&Tensor::zeros(&[c_out], dtype, &crate::device::Device::Cpu)?)?,
+                };
+                let centered = self.sub(b_orig, mean)?;
+                let scaled = self.mul(centered, scale)?;
+                let b_folded = self.add(scaled, beta)?;
+                let dt = self.nodes[i].dtype;
+                let shp = self.nodes[i].shape.clone();
+                let fused_id = self.push(
+                    Op::FusedConvBnRelu { x, weight: w_folded, bias: Some(b_folded), stride, padding, dilation, groups, relu: has_relu },
+                    shp,
+                    dt,
+                );
+                replace[i] = Some(fused_id);
+                stats.fused_kernels += 1;
+            } else if has_relu
+                && let Op::Conv2d { x, weight, bias, stride, padding, dilation, groups } = self.nodes[bn_id].op
+            {
+                let dt = self.nodes[i].dtype;
+                let shp = self.nodes[i].shape.clone();
+                let fused_id = self.push(
+                    Op::FusedConvBnRelu { x, weight, bias, stride, padding, dilation, groups, relu: true },
+                    shp,
+                    dt,
+                );
+                replace[i] = Some(fused_id);
+                stats.fused_kernels += 1;
+            }
+        }
+
+        let map = |id: Id| -> Id {
+            let mut cur = id;
+            while cur < replace.len() {
+                if let Some(next) = replace[cur] {
+                    cur = next;
+                } else {
+                    break;
+                }
+            }
+            cur
+        };
+        for node in &mut self.nodes {
+            node.op.remap(&map);
+        }
+        for o in &mut self.outputs {
+            *o = map(*o);
+        }
+        Ok(())
     }
 
     /// Groups elementwise operations into fused kernels (regions of at least two operations).
@@ -524,6 +833,7 @@ impl OpGraph {
         self.fold_constants(&mut stats)?;
         self.simplify(&mut stats);
         self.cse(&mut stats);
+        self.fuse_high_level_patterns(&mut stats)?;
         self.dce();
         self.fuse(&mut stats);
         stats.nodes_after = self.nodes.len();
@@ -782,6 +1092,37 @@ fn eval_node(node: &Node, get: &dyn Fn(Id) -> Result<Tensor>, _inputs: &[Tensor]
         Op::Mean { src, axes, keepdim } => get(*src)?.mean_axes(axes, *keepdim),
         Op::Max { src, axis, keepdim } => get(*src)?.max_axis(*axis, *keepdim),
         Op::Softmax(a, axis) => get(*a)?.softmax(*axis),
+        Op::Conv2d { x, weight, bias, stride, padding, dilation, groups } => {
+            let b = match bias { Some(bi) => Some(get(*bi)?), None => None };
+            get(*x)?.conv2d_grouped(&get(*weight)?, b.as_ref(), *stride, *padding, *dilation, *groups)
+        }
+        Op::BatchNorm2d { x, gamma, beta, mean, var, eps } => {
+            let xt = get(*x)?;
+            let c = xt.shape()[1];
+            let g = get(*gamma)?.reshape(&[1, c, 1, 1])?;
+            let b = get(*beta)?.reshape(&[1, c, 1, 1])?;
+            let m = get(*mean)?.reshape(&[1, c, 1, 1])?;
+            let v = get(*var)?.reshape(&[1, c, 1, 1])?;
+            let inv = v.add_scalar(*eps)?.rsqrt()?;
+            xt.sub(&m)?.mul(&inv)?.mul(&g)?.add(&b)
+        }
+        Op::FusedConvBnRelu { x, weight, bias, stride, padding, dilation, groups, relu } => {
+            let b = match bias { Some(bi) => Some(get(*bi)?), None => None };
+            let y = get(*x)?.conv2d_grouped(&get(*weight)?, b.as_ref(), *stride, *padding, *dilation, *groups)?;
+            if *relu { y.relu() } else { Ok(y) }
+        }
+        Op::FusedAttention { q, k, v, scale } => {
+            let qt = get(*q)?;
+            let kt = get(*k)?;
+            let vt = get(*v)?;
+            if qt.ndim() == 4 && qt.dtype() == DType::F32 && qt.device().is_cpu() {
+                crate::fused_sdpa(&qt, &kt, &vt, Some(*scale), false)
+            } else {
+                let d = qt.ndim() as isize;
+                let scores = qt.matmul(&kt.transpose(d - 2, d - 1)?)?.mul_scalar(*scale)?;
+                scores.softmax(-1)?.matmul(&vt)
+            }
+        }
         Op::Fused(f) => {
             let ts: Vec<Tensor> = f.inputs.iter().map(|&i| get(i)).collect::<Result<_>>()?;
             let refs: Vec<&Tensor> = ts.iter().collect();
@@ -943,6 +1284,11 @@ mod tests {
         let comp = g.compile().unwrap();
         assert_eq!(comp.stats().fused_kernels, 1);
         let want = x.tanh().unwrap().mul_scalar(1.7).unwrap().silu().unwrap().add(&x).unwrap().exp().unwrap();
-        assert_eq!(comp.run(&[x]).unwrap()[0].to_vec::<f32>().unwrap(), want.to_vec::<f32>().unwrap());
+        let got = comp.run(&[x]).unwrap()[0].to_vec::<f32>().unwrap();
+        let want_v = want.to_vec::<f32>().unwrap();
+        for (i, (&g, &w)) in got.iter().zip(want_v.iter()).enumerate() {
+            let tol = 1e-5 * w.abs().max(1.0);
+            assert!((g - w).abs() <= tol, "mismatch at {i}: got={g} vs want={w}");
+        }
     }
 }

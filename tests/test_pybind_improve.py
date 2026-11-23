@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 DOC_CASES = [
     ('docs/TUTORIAL.md', [3, 4, 5, 6, 7, 8, 9, 10]),
-    ('README.md', [3, 4, 5]),
+    ('README.md', [3, 4]),  # the README has five python blocks (0-4)
     ('docs/CLOUD_AND_DEPLOYMENT.md', [0, 1, 2, 3, 4, 5, 6]),
     ('docs/PYTHON_API.md', list(range(14))),
     ('docs/SCIENTIFIC_AI_MODULES.md', list(range(11))),

@@ -1,8 +1,8 @@
-"""Runs every benchmark of examples/core_ops_bench.rs and tools/core_ops_bench_torch.py in its own process (with a pause
+"""Runs every benchmark of examples/core_ops_bench.rs and benchmarks/core_ops_bench_torch.py in its own process (with a pause
 in between, so power throttling of long-running processes does not distort later rows) and prints both side by side.
 
     cargo build --release --example core_ops_bench
-    python tools/core_ops_bench_compare.py
+    python benchmarks/core_ops_bench_compare.py
 """
 import re
 import subprocess
@@ -27,5 +27,5 @@ def one(cmd, name):
 print(f"{'op':<28}{'oxideon us':>12}{'torch us':>12}{'ratio':>8}")
 for n in NAMES:
     o = one([str(EXE)], n)
-    t = one([sys.executable, str(ROOT / "tools/core_ops_bench_torch.py")], n)
+    t = one([sys.executable, str(ROOT / "benchmarks/core_ops_bench_torch.py")], n)
     print(f"{n:<28}{o:>12.1f}{t:>12.1f}{o / t:>8.2f}", flush=True)

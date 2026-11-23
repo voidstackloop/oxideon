@@ -754,6 +754,7 @@ dependencies = [
  "libm",
  "pollster",
  "rayon",
+ "wasm-bindgen",
  "wgpu",
 ]
 

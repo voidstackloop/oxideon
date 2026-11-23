@@ -211,6 +211,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 pytest tests/ -q
 ```
 
+Environment notes (mostly Windows):
+
+- **Embedded Python.** With `--features python`, the tests that start an interpreter (`complete_dl`, `complete_millennium`) need to
+  find the standard library; set `PYTHONHOME` to your Python installation, or they abort with `No module named 'encodings'`.
+- **UTF-8 output.** The Python examples print characters such as `✓`. When their output is redirected on a console whose code page
+  cannot show them, run Python with `-X utf8` (or set `PYTHONUTF8=1`).
+- **CUDA kernels.** The `.cu` kernels need NVRTC. Without it the CUDA tests print `skipped: no CUDA device / NVRTC` and pass, and the
+  operations fall back to the host. Install it with `pip install --target <dir> nvidia-cuda-nvrtc-cu12` and set
+  `OXIDEON_NVRTC_SITE=<dir>` (see `backend/nvrtc.rs` for the search order); `cuda_bench` then reports its launched kernels.
+- **Interop example.** `examples/python_interop_showcase.py` also needs `pillow`, `pandas`, `polars`, `networkx` and `sympy`.
+
 ---
 
 ## Note on Cryptography Modules

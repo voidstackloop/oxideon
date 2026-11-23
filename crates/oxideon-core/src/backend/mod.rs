@@ -1,6 +1,7 @@
 //! Pluggable compute backends (`Cpu`, accelerated devices, and optional `Wgpu`) and reference-counted [`Storage`].
 
 pub mod cpu;
+pub mod simd_arm;
 #[cfg(target_arch = "x86_64")]
 pub mod simd_x86;
 #[cfg(not(target_arch = "x86_64"))]
@@ -10,7 +11,9 @@ pub mod simd_x86 {
     #[inline]
     pub fn exp_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
     #[inline]
-    pub fn gelu_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    pub fn tanh_f32_slice(_src: &[f32], _dst: &mut [f32]) -> bool { false }
+    #[inline]
+    pub fn gelu_f32_slice(_src: &[f32], _dst: &mut [f32], _fast: bool) -> bool { false }
     #[inline]
     pub fn gelu_backward_f32_slice(_g: &[f32], _x: &[f32], _dst: &mut [f32]) -> bool { false }
     #[inline]
@@ -65,6 +68,9 @@ pub mod simd_x86 {
 }
 pub mod cuda_driver;
 pub mod cuda_kernels;
+pub mod cuda_ops;
+pub mod cuda_rt;
+pub mod nvrtc;
 pub mod stream;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_backend;
@@ -204,6 +210,19 @@ pub struct Tracked {
     lock: RwLock<StorageInner>,
     bytes: usize,
     dlpack_pins: std::sync::atomic::AtomicUsize,
+    /// Set for storage that aliases memory owned by someone else (a zero-copy DLPack import): called once when the last
+    /// handle drops, after the buffer has been detached from its `Vec` so Rust never frees it.
+    foreign: Release,
+}
+
+/// A one-shot release callback (opaque for `Debug`).
+#[derive(Default)]
+struct Release(Option<Box<dyn FnOnce() + Send + Sync>>);
+
+impl std::fmt::Debug for Release {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Release(foreign)" } else { "Release(none)" })
+    }
 }
 
 impl std::ops::Deref for Tracked {
@@ -227,12 +246,22 @@ impl Tracked {
             lock: RwLock::new(inner),
             bytes,
             dlpack_pins: std::sync::atomic::AtomicUsize::new(0),
+            foreign: Release::default(),
         })
     }
 }
 
 impl Drop for Tracked {
     fn drop(&mut self) {
+        if let Some(release) = self.foreign.0.take() {
+            // the buffer belongs to the exporter: detach it so neither the allocator nor the pool ever sees it, then hand it
+            // back through the exporter's own deleter
+            if let StorageInner::Cpu(cpu) = self.lock.get_mut().unwrap_or_else(|p| p.into_inner()) {
+                cpu.forget_buffer();
+            }
+            release();
+            return;
+        }
         crate::memory::on_free(self.bytes);
         // large f32 buffers go back to the pool instead of to the operating system
         if self.bytes >= crate::pool::MIN_LEN * 4
@@ -263,8 +292,39 @@ impl std::ops::Deref for CpuRef<'_> {
 }
 
 impl Storage {
+    /// Wraps host memory owned by someone else (a DLPack producer) without copying it. `cpu` must be a [`CpuStorage`] whose
+    /// `Vec` was built over that memory; it is detached again before `release` runs when the last handle drops, so it is
+    /// never freed here. The storage counts as permanently pinned: it can be written in place but never reallocated or
+    /// replaced, which is what keeps the aliasing sound.
+    pub(crate) fn from_foreign_cpu(cpu: CpuStorage, release: Box<dyn FnOnce() + Send + Sync>) -> Self {
+        Self(Arc::new(Tracked {
+            lock: RwLock::new(StorageInner::Cpu(cpu)),
+            bytes: 0,
+            dlpack_pins: std::sync::atomic::AtomicUsize::new(1),
+            foreign: Release(Some(release)),
+        }))
+    }
+
+    /// Sum of squares of a CUDA tensor computed on the device (`None` for other storage).
+    pub(crate) fn cuda_sum_squares(&self, layout: &Layout) -> Option<f64> {
+        match &*self.read() {
+            StorageInner::Cuda(s) => s.sum_squares_gpu(layout).ok().flatten(),
+            _ => None,
+        }
+    }
+
     /// Fused single-pass last-axis softmax on contiguous CPU storage (returns `None` to fall back).
-    pub(crate) fn try_softmax_last_axis(&self, layout: &Layout) -> Option<Self> {
+    pub(crate) fn try_softmax_last_axis(&self, layout: &Layout, needs_grad: bool) -> Option<Self> {
+        // NVRTC-compiled kernel on CUDA tensors: rows with a non-finite maximum need the composed path when gradients are
+        // recorded (its +inf rows have a zero gradient), so the kernel reports them and this returns `None` for those
+        if let StorageInner::Cuda(s) = &*self.0.read().unwrap_or_else(|p| p.into_inner())
+            && cuda_rt::available()
+        {
+            return match s.softmax_gpu(layout, false, needs_grad) {
+                Ok(Some((out, false))) => Some(Self::new_cuda(out)),
+                _ => None,
+            };
+        }
         let out_inner = {
             let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
             match &*guard {
@@ -278,6 +338,23 @@ impl Storage {
             }
         };
         Some(Self(Tracked::new(out_inner)))
+    }
+
+    /// Log-softmax over the last axis of a CUDA tensor with the NVRTC kernel (`None` for everything else, or when a row with
+    /// a non-finite maximum must take the composed path because gradients are recorded).
+    pub(crate) fn try_log_softmax_last_axis(&self, layout: &Layout, needs_grad: bool) -> Option<Self> {
+        if let StorageInner::Cuda(s) = &*self.0.read().unwrap_or_else(|p| p.into_inner())
+            && cuda_rt::available()
+        {
+            return match s.softmax_gpu(layout, true, needs_grad) {
+                Ok(Some((out, false))) => Some(Self::new_cuda(out)),
+                _ => None,
+            };
+        }
+        if let StorageInner::Cpu(s) = &*self.0.read().unwrap_or_else(|p| p.into_inner()) {
+            return s.log_softmax_last_axis(layout).map(Self::new_cpu);
+        }
+        None
     }
 
     /// Fused single-pass last-axis `LayerNorm` on contiguous CPU `F32` storage.
@@ -298,6 +375,12 @@ impl Storage {
                 (StorageInner::Cpu(xs), StorageInner::Cpu(ws), StorageInner::Cpu(bs)) => {
                     StorageInner::Cpu(xs.layer_norm_last_axis(layout, ws, w_layout, bs, b_layout, eps)?)
                 }
+                (StorageInner::Cuda(xs), StorageInner::Cuda(ws), StorageInner::Cuda(bs)) if w_layout.is_contiguous() && b_layout.is_contiguous() && w_layout.offset() == 0 && b_layout.offset() == 0 => {
+                    match xs.layer_norm_gpu(layout, Some(ws), Some(bs), eps, false) {
+                        Ok(Some((y, _, _))) => StorageInner::Cuda(y),
+                        _ => return None,
+                    }
+                }
                 _ => return None,
             }
         };
@@ -317,6 +400,16 @@ impl Storage {
             }
         };
         Some(Self(Tracked::new(out_inner)))
+    }
+
+    /// Fused single-pass backward `g * f(a)` of a unary op on CPU `F32` storage (see [`cpu::UnaryBwd`]).
+    pub(crate) fn try_unary_backward(&self, g_layout: &Layout, a: &Self, a_layout: &Layout, kind: cpu::UnaryBwd) -> Option<Self> {
+        let gg = self.0.read().unwrap_or_else(|p| p.into_inner());
+        let ga = a.0.read().unwrap_or_else(|p| p.into_inner());
+        match (&*gg, &*ga) {
+            (StorageInner::Cpu(gs), StorageInner::Cpu(a_s)) => Some(Self(Tracked::new(StorageInner::Cpu(gs.unary_backward_f32(g_layout, a_s, a_layout, kind)?)))),
+            _ => None,
+        }
     }
 
     /// Adds a 1D `F32` `bias` (`[cols]`) in-place across every row of a freshly-allocated contiguous
@@ -383,6 +476,13 @@ impl Storage {
         let n = p_layout.numel();
         if n == 0 || !p_layout.is_contiguous() || !g_layout.is_contiguous() || g_layout.numel() != n {
             return false;
+        }
+        {
+            // CUDA tensors: one fused kernel, updating the buffers in place
+            let (rp, rg, rm, rv) = (self.read(), grad.read(), m_stor.read(), v_stor.read());
+            if let (StorageInner::Cuda(p), StorageInner::Cuda(g), StorageInner::Cuda(m), StorageInner::Cuda(v)) = (&*rp, &*rg, &*rm, &*rv) {
+                return p.adam_step_gpu(p_layout, g, g_layout, m, v, lr, beta1, beta2, eps, weight_decay, decoupled, bc1, bc2).unwrap_or(false);
+            }
         }
         let mut gp = self.0.write().unwrap_or_else(|p| p.into_inner());
         let gg = grad.0.read().unwrap_or_else(|p| p.into_inner());
@@ -496,13 +596,13 @@ impl Storage {
                     || (vec![0.0f32; d], vec![0.0f32; d]),
                     |(mut ldw, mut ldb), ((xr_s, gr_s), dx_s)| {
                         if !simd_x86::layer_norm_row_bwd_f32(xr_s, gr_s, ws, dx_s, &mut ldw, &mut ldb, eps32) {
-                            let mean = xr_s.iter().sum::<f32>() / (d as f32);
-                            let var = xr_s.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / (d as f32);
+                            let (hi, lo) = cpu::center_split(xr_s);
+                            let var = xr_s.iter().map(|&v| ((v - hi) - lo) * ((v - hi) - lo)).sum::<f32>() / (d as f32);
                             let inv_std = 1.0 / (var + eps32).sqrt();
                             let mut s1 = 0.0f32;
                             let mut s2 = 0.0f32;
                             for i in 0..d {
-                                let xhat = (xr_s[i] - mean) * inv_std;
+                                let xhat = ((xr_s[i] - hi) - lo) * inv_std;
                                 let gxh = gr_s[i] * ws[i];
                                 s1 += gxh;
                                 s2 += gxh * xhat;
@@ -511,7 +611,7 @@ impl Storage {
                             }
                             let inv_n = 1.0 / (d as f32);
                             for i in 0..d {
-                                let xhat = (xr_s[i] - mean) * inv_std;
+                                let xhat = ((xr_s[i] - hi) - lo) * inv_std;
                                 dx_s[i] = (gr_s[i] * ws[i] - s1 * inv_n - xhat * (s2 * inv_n)) * inv_std;
                             }
                         }
@@ -537,13 +637,13 @@ impl Storage {
 
         for ((xr_s, gr_s), dx_s) in xs.chunks(d).zip(gs.chunks(d)).zip(dx.chunks_mut(d)) {
             if !simd_x86::layer_norm_row_bwd_f32(xr_s, gr_s, ws, dx_s, &mut dw, &mut db, eps32) {
-                let mean = xr_s.iter().sum::<f32>() / (d as f32);
-                let var = xr_s.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / (d as f32);
+                let (hi, lo) = cpu::center_split(xr_s);
+                let var = xr_s.iter().map(|&v| ((v - hi) - lo) * ((v - hi) - lo)).sum::<f32>() / (d as f32);
                 let inv_std = 1.0 / (var + eps32).sqrt();
                 let mut s1 = 0.0f32;
                 let mut s2 = 0.0f32;
                 for i in 0..d {
-                    let xhat = (xr_s[i] - mean) * inv_std;
+                    let xhat = ((xr_s[i] - hi) - lo) * inv_std;
                     let gxh = gr_s[i] * ws[i];
                     s1 += gxh;
                     s2 += gxh * xhat;
@@ -552,7 +652,7 @@ impl Storage {
                 }
                 let inv_n = 1.0 / (d as f32);
                 for i in 0..d {
-                    let xhat = (xr_s[i] - mean) * inv_std;
+                    let xhat = ((xr_s[i] - hi) - lo) * inv_std;
                     dx_s[i] = (gr_s[i] * ws[i] - s1 * inv_n - xhat * (s2 * inv_n)) * inv_std;
                 }
             }
@@ -583,7 +683,7 @@ impl Storage {
             #[cfg(feature = "wgpu")]
             Device::Wgpu(dev) => Ok(Self::new_wgpu(WgpuStorage::from_cpu(&cpu, dev)?)),
             Device::Cuda(idx)
-                if cpu.dtype() == DType::F32
+                if cuda_ops::cpu_bytes(&cpu).is_some()
                     && cuda_driver::cuda_available()
                     && *idx < cuda_driver::cuda_device_count() =>
             {
@@ -723,6 +823,9 @@ impl Storage {
         if matches!(device, Device::Meta) {
             return Ok(Self::new_meta(dtype, numel)); // no data: do not build a buffer just to drop it
         }
+        if let Some(s) = Self::cuda_full(device, dtype, numel, val)? {
+            return Ok(s); // constants are written by a kernel (or memset), not built on the host and uploaded
+        }
         let cpu = CpuStorage::full(numel, val, dtype)?;
         Self::from_cpu_on_device(cpu, device)
     }
@@ -842,6 +945,9 @@ impl Storage {
                     Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, s.device())?))
                 }
                 StorageInner::Cuda(s) => {
+                    if let Some(out) = s.cmp_gpu(lhs_layout, s, rhs_layout, op)? {
+                        return Ok(Self::new_cuda(out));
+                    }
                     let cpu = s.to_cpu()?;
                     let out = cpu.cmp_op(lhs_layout, &cpu, rhs_layout, op)?;
                     Self::from_cpu_on_device(out, &Device::Cuda(s.device_index))
@@ -871,6 +977,9 @@ impl Storage {
                 Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, a.device())?))
             }
             (StorageInner::Cuda(a), StorageInner::Cuda(b)) => {
+                if let Some(out) = a.cmp_gpu(lhs_layout, b, rhs_layout, op)? {
+                    return Ok(Self::new_cuda(out));
+                }
                 let ca = a.to_cpu()?;
                 let cb = b.to_cpu()?;
                 let out = ca.cmp_op(lhs_layout, &cb, rhs_layout, op)?;
@@ -1030,6 +1139,11 @@ impl Storage {
         rhs_layout: &Layout,
         op: LogicOp,
     ) -> Result<Self> {
+        if let (StorageInner::Cuda(a), StorageInner::Cuda(b)) = (&*self.read(), &*rhs.read())
+            && let Some(out) = a.logic_gpu(lhs_layout, b, rhs_layout, op)?
+        {
+            return Ok(Self::new_cuda(out));
+        }
         self.pair_op(
             lhs_layout,
             rhs,
@@ -1075,17 +1189,17 @@ impl Storage {
         {
             return Ok(Self::new_wgpu(out));
         }
+        if let (StorageInner::Cuda(c), StorageInner::Cuda(a), StorageInner::Cuda(b)) = (&*cond.read(), &*t.read(), &*f.read())
+            && let Some(out) = cuda_kernels::CudaStorage::where_gpu(c, cond_l, a, t_l, b, f_l)?
+        {
+            return Ok(Self::new_cuda(out));
+        }
         let cc = cond.cpu_ref()?;
         let ct = t.cpu_ref()?;
         let cf = f.cpu_ref()?;
         let out = CpuStorage::where_cond(&cc, cond_l, &ct, t_l, &cf, f_l)?;
-        match &dev {
-            Device::Cpu => Ok(Self::new_cpu(out)),
-            #[cfg(feature = "wgpu")]
-            Device::Wgpu(d) => Ok(Self::new_wgpu(WgpuStorage::from_cpu(&out, d)?)),
-            Device::Meta => Ok(Self::new_meta(out.dtype(), out.len())),
-            d => Ok(Self::new_accelerator(d.clone(), out)),
-        }
+        // a CUDA operand must come back as CUDA storage: an `Accelerator` one on the same device index fails the next matmul
+        Self::from_cpu_on_device(out, &dev)
     }
 
     pub fn reduce_op(&self, layout: &Layout, axes: &[usize], op: ReduceOp) -> Result<Self> {
@@ -1095,6 +1209,9 @@ impl Storage {
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Ok(Self::new_wgpu(s.reduce_op(layout, axes, op)?)),
             StorageInner::Cuda(s) => {
+                if let Some(out) = s.reduce_gpu(layout, axes, op)? {
+                    return Ok(Self::new_cuda(out));
+                }
                 let cpu_out = s.to_cpu()?.reduce_op(layout, axes, op)?;
                 Self::from_cpu_on_device(cpu_out, &Device::Cuda(s.device_index))
             }
@@ -1262,6 +1379,9 @@ impl Storage {
             #[cfg(feature = "wgpu")]
             StorageInner::Wgpu(s) => Ok(Self::new_wgpu(s.to_dtype(layout, dst)?)),
             StorageInner::Cuda(s) => {
+                if let Some(out) = s.cast_gpu(layout, dst)? {
+                    return Ok(Self::new_cuda(out));
+                }
                 let cpu_out = s.to_cpu()?.to_dtype(layout, dst)?;
                 Self::from_cpu_on_device(cpu_out, &Device::Cuda(s.device_index))
             }
@@ -1298,6 +1418,9 @@ impl Storage {
         if dev.is_meta() {
             let n = Self::meta_len("view_scatter", &spec.dst_shape)?;
             return Ok(Self::new_meta(self.dtype(), n));
+        }
+        if let Some(out) = self.cuda_view_scatter(src_layout, spec)? {
+            return Ok(out);
         }
         let cpu = self.cpu_ref()?;
         let out = cpu.view_scatter(src_layout, spec)?;

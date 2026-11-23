@@ -152,8 +152,51 @@ pub fn kl_div_loss(log_probs: &Tensor, target_probs: &Tensor) -> Result<Tensor> 
         .mean()
 }
 
+/// [`cosine_similarity`] along the last axis of two contiguous host `f32` tensors of the same shape when no gradient is recorded:
+/// the dot product and the norms are accumulated in `f64` and divided once, so the many cancelling terms of a nearly orthogonal pair
+/// are not rounded to `f32` one by one (normalizing first and multiplying afterwards, as the differentiable path does, loses
+/// about a thousand times more on such pairs). `None` when the tensors do not qualify.
+fn cosine_similarity_host(a: &Tensor, b: &Tensor, axis: isize, eps: f64) -> Result<Option<Tensor>> {
+    use crate::backend::CpuStorage;
+    use crate::dtype::DType;
+    let host_f32 = |t: &Tensor| t.dtype() == DType::F32 && t.device().is_cpu();
+    let needs_grad = crate::tensor::is_grad_enabled() && (a.requires_grad() || b.requires_grad());
+    let nd = a.ndim() as isize;
+    if needs_grad || a.shape() != b.shape() || nd == 0 || !host_f32(a) || !host_f32(b) || (axis != -1 && axis != nd - 1) {
+        return Ok(None);
+    }
+    let d = *a.shape().last().unwrap();
+    if d == 0 {
+        return Ok(None);
+    }
+    let (ga, gb) = (a.storage().cpu_ref()?, b.storage().cpu_ref()?);
+    let (CpuStorage::F32(va), CpuStorage::F32(vb)) = (&*ga, &*gb) else { return Ok(None) };
+    let (Some(ra), Some(rb)) = (a.layout().contiguous_range_in(va.len()), b.layout().contiguous_range_in(vb.len())) else { return Ok(None) };
+    let (xa, xb) = (&va[ra], &vb[rb]);
+    let dot = crate::backend::cpu::dot_f64_of_f32;
+    let row = |(x, y): (&[f32], &[f32])| -> f32 {
+        let (na, nb) = (dot(x, x).sqrt().max(eps), dot(y, y).sqrt().max(eps));
+        (dot(x, y) / (na * nb)) as f32
+    };
+    let rows = xa.len() / d;
+    let mut out = vec![0.0f32; rows];
+    #[cfg(feature = "rayon")]
+    if xa.len() >= 1 << 16 {
+        use rayon::prelude::*;
+        out.par_iter_mut().zip(xa.par_chunks(d).zip(xb.par_chunks(d))).for_each(|(o, p)| *o = row(p));
+        return Ok(Some(Tensor::from_slice(&out, &a.shape()[..a.ndim() - 1])?));
+    }
+    for (o, p) in out.iter_mut().zip(xa.chunks(d).zip(xb.chunks(d))) {
+        *o = row(p);
+    }
+    Ok(Some(Tensor::from_slice(&out, &a.shape()[..a.ndim() - 1])?))
+}
+
 /// Cosine similarity between `a` and `b` along `axis`: $\frac{a \cdot b}{\max(\|a\|_2 \|b\|_2, \varepsilon)}$.
 pub fn cosine_similarity(a: &Tensor, b: &Tensor, axis: isize, eps: f64) -> Result<Tensor> {
+    if let Some(r) = cosine_similarity_host(a, b, axis, eps)? {
+        return Ok(r);
+    }
     let na = a.normalize(2.0, axis, eps)?;
     let nb = b.normalize(2.0, axis, eps)?;
     na.mul(&nb)?.sum_axis(axis, false)

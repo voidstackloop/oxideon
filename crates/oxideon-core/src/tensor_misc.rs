@@ -25,8 +25,9 @@ impl Tensor {
         if n == 0 || (unbiased && n < 2) {
             return Err(Error::Msg("std_all: needs at least 2 elements (1 when biased)".into()));
         }
-        let mean = self.mean()?;
-        let ss = self.sub(&mean)?.square()?.sum()?;
+        let axes: Vec<isize> = (0..self.ndim() as isize).collect();
+        let (centered, _) = self.centered_by_mean(&axes)?;
+        let ss = centered.square()?.sum()?;
         ss.div_scalar((if unbiased { n - 1 } else { n }) as f64)?.sqrt()
     }
 

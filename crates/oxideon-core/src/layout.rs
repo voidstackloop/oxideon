@@ -112,6 +112,13 @@ pub fn broadcast_shapes(op: &'static str, a: &[usize], b: &[usize]) -> Result<Ve
 }
 
 /// Describes how a multi-dimensional tensor maps logical indices to flat storage offsets.
+/// Physical memory layout convention for 4D tensors (`NCHW` vs `NHWC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MemoryFormat {
+    Contiguous,
+    ChannelsLast,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     shape: Vec<usize>,
@@ -228,6 +235,45 @@ impl Layout {
             };
         }
         true
+    }
+
+    /// True if a 4D tensor is laid out in `channels_last` (`NHWC`) physical order
+    /// `[H*W*C, 1, W*C, C]` while preserving logical `[N, C, H, W]` shape.
+    #[inline]
+    pub fn is_channels_last(&self) -> bool {
+        if self.shape.len() != 4 {
+            return false;
+        }
+        let (n, c, h, w) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        if n == 0 || c == 0 || h == 0 || w == 0 {
+            return true;
+        }
+        let s = &self.strides;
+        let ec = 1isize;
+        let ew = c as isize;
+        let eh = (w * c) as isize;
+        let en = (h * w * c) as isize;
+        (c == 1 || s[1] == ec)
+            && (w == 1 || s[3] == ew)
+            && (h == 1 || s[2] == eh)
+            && (n == 1 || s[0] == en)
+    }
+
+    /// Creates a `channels_last` (`NHWC` physical, `[N, C, H, W]` logical) layout.
+    pub fn channels_last(shape: Vec<usize>) -> crate::error::Result<Self> {
+        if shape.len() != 4 {
+            return Err(crate::error::Error::Msg(format!(
+                "channels_last layout requires 4D [N, C, H, W] shape, got {:?}",
+                shape
+            )));
+        }
+        let (_, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let strides = vec![(h * w * c) as isize, 1, (w * c) as isize, c as isize];
+        Ok(Self {
+            shape,
+            strides,
+            offset: 0,
+        })
     }
 
     /// Returns `Some(start..end)` if the tensor is contiguous so its storage slice

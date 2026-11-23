@@ -786,8 +786,7 @@ impl Module for GroupNorm {
         let g = self.num_groups;
 
         let grouped = input.reshape(&[n, g, (c / g) * spatial])?;
-        let mu = grouped.mean_axis(2, true)?;
-        let centered = grouped.sub(&mu)?;
+        let (centered, _) = grouped.centered_by_mean(&[2])?;
         let var = centered.square()?.mean_axis(2, true)?;
         let normed = centered
             .mul(&var.add_scalar(self.eps)?.rsqrt()?)?
@@ -1054,8 +1053,7 @@ impl Module for LayerNorm {
                         .then(|| Tensor::from_parts(db_s, crate::layout::Layout::contiguous(b_saved.shape().to_vec()), false, None));
                     return Ok(vec![gx, gw, gb]);
                 }
-                let mu = x_saved.mean_axes(&[-1], true)?;
-                let centered = x_saved.sub(&mu)?;
+                let (centered, _) = x_saved.centered_by_mean(&[-1])?;
                 let var = centered.square()?.mean_axes(&[-1], true)?;
                 let inv_std = var.add_scalar(eps)?.rsqrt()?;
                 let x_hat = centered.mul(&inv_std)?;
@@ -1096,8 +1094,7 @@ impl Module for LayerNorm {
         }
 
         let axes: Vec<isize> = (-(k as isize)..0).collect();
-        let mu = input.mean_axes(&axes, true)?;
-        let centered = input.sub(&mu)?;
+        let (centered, _) = input.centered_by_mean(&axes)?;
         let var = centered.square()?.mean_axes(&axes, true)?;
         let inv_std = var.add_scalar(self.eps)?.rsqrt()?;
         centered.mul(&inv_std)?.mul(&self.weight)?.add(&self.bias)
@@ -1173,6 +1170,7 @@ impl Module for BatchNorm1d {
                 input.shape()
             )));
         }
+        let mut batch_centered: Option<Tensor> = None;
         let (mu, var) = if self.training.load(Ordering::Relaxed) {
             // [N, C] reduces over the batch; [N, C, L] over batch and length.
             let reduce: &[isize] = if input.ndim() == 3 { &[0, 2] } else { &[0] };
@@ -1186,8 +1184,9 @@ impl Module for BatchNorm1d {
                     input.shape()
                 )));
             }
-            let mu = input.mean_axes(reduce, true)?;
-            let var = input.sub(&mu)?.square()?.mean_axes(reduce, true)?;
+            let (centered, mu) = input.centered_by_mean(reduce)?;
+            let var = centered.square()?.mean_axes(reduce, true)?;
+            batch_centered = Some(centered);
             let unbiased = var.mul_scalar(n as f64 / (n - 1) as f64)?;
             no_grad(|| -> Result<()> {
                 let m = self.momentum;
@@ -1217,7 +1216,11 @@ impl Module for BatchNorm1d {
         } else {
             (self.running_mean.clone(), self.running_var.clone())
         };
-        let norm = input.sub(&mu)?.mul(&var.add_scalar(self.eps)?.rsqrt()?)?;
+        let centered = match batch_centered {
+            Some(c) => c,
+            None => input.sub(&mu)?,
+        };
+        let norm = centered.mul(&var.add_scalar(self.eps)?.rsqrt()?)?;
         if input.ndim() == 3 {
             // Same keepdim view for the affine parameters (a square C == L
             // input would otherwise broadcast weight along L silently).
@@ -1280,6 +1283,7 @@ impl Module for BatchNorm2d {
                 input.shape()
             )));
         }
+        let mut batch_centered: Option<Tensor> = None;
         let (mu, var) = if self.training.load(Ordering::Relaxed) {
             // Torch parity: training needs more than 1 value per channel, and
             // the running variance tracks the Bessel-corrected batch variance.
@@ -1291,8 +1295,9 @@ impl Module for BatchNorm2d {
                     input.shape()
                 )));
             }
-            let mu = input.mean_axes(&[0, 2, 3], true)?;
-            let var = input.sub(&mu)?.square()?.mean_axes(&[0, 2, 3], true)?;
+            let (centered, mu) = input.centered_by_mean(&[0, 2, 3])?;
+            let var = centered.square()?.mean_axes(&[0, 2, 3], true)?;
+            batch_centered = Some(centered);
             let unbiased = var.mul_scalar(n as f64 / (n - 1) as f64)?;
             no_grad(|| -> Result<()> {
                 let m = self.momentum;
@@ -1311,7 +1316,11 @@ impl Module for BatchNorm2d {
         } else {
             (self.running_mean.clone(), self.running_var.clone())
         };
-        let norm = input.sub(&mu)?.mul(&var.add_scalar(self.eps)?.rsqrt()?)?;
+        let centered = match batch_centered {
+            Some(c) => c,
+            None => input.sub(&mu)?,
+        };
+        let norm = centered.mul(&var.add_scalar(self.eps)?.rsqrt()?)?;
         norm.mul(&self.weight)?.add(&self.bias)
     }
 
@@ -1520,6 +1529,13 @@ impl Module for Dropout {
         }
         let keep = 1.0 - self.p;
         let n = input.numel();
+        // CUDA: the mask comes from a kernel, so the activations never leave the device
+        if matches!(input.device(), crate::device::Device::Cuda(_)) {
+            let key = rng::with_rng(|r| r.next_u64());
+            if let Some(mask) = crate::backend::Storage::cuda_bernoulli_mask(&input.device(), input.dtype(), n, key, f64::from(keep), 1.0 / f64::from(keep))? {
+                return input.mul(&Tensor::from_storage(mask, crate::layout::Layout::contiguous(input.shape().to_vec())));
+            }
+        }
         let mask_data: Vec<f32> = rng::with_rng(|r| {
             (0..n)
                 .map(|_| if r.next_f32() < keep { 1.0 / keep } else { 0.0 })

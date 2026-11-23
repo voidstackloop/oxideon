@@ -380,6 +380,56 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+pub(crate) fn tensor_from_raw_bytes(raw: &[u8], dtype: DType, shape: &[usize]) -> Result<Tensor> {
+    tensor_from_le_bytes(dtype, shape.to_vec(), raw)
+}
+
+/// `(dtype, shape, data start, data end)` of one tensor in a safetensors header.
+pub(crate) type HeaderEntry = (DType, Vec<usize>, usize, usize);
+
+pub(crate) fn parse_header_entries(
+    header: &str,
+    body_len: usize,
+) -> Result<std::collections::BTreeMap<String, HeaderEntry>> {
+    let s = header.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return Err(Error::Serialization("invalid safetensors JSON object".into()));
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut out = std::collections::BTreeMap::new();
+    let mut pos = 0usize;
+    let bytes = inner.as_bytes();
+    while pos < bytes.len() {
+        while pos < bytes.len() && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b',') {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        let (key, next_pos) = parse_json_string(inner, pos)?;
+        pos = next_pos;
+        while pos < bytes.len() && (bytes[pos].is_ascii_whitespace() || bytes[pos] == b':') {
+            pos += 1;
+        }
+        let (obj_str, next_pos) = extract_balanced(inner, pos, b'{', b'}')?;
+        pos = next_pos;
+        if key == "__metadata__" {
+            continue;
+        }
+        let dtype_str = extract_field_string(obj_str, "dtype")?;
+        let dtype = DType::from_safetensors_name(&dtype_str)?;
+        let shape = extract_field_usize_list(obj_str, "shape")?;
+        let offsets = extract_field_usize_list(obj_str, "data_offsets")?;
+        if offsets.len() != 2 || offsets[1] > body_len || offsets[0] > offsets[1] {
+            return Err(Error::Serialization(format!(
+                "invalid data_offsets for '{key}': {offsets:?}"
+            )));
+        }
+        out.insert(key, (dtype, shape, offsets[0], offsets[1]));
+    }
+    Ok(out)
+}
+
 fn parse_safetensors_header(
     header: &str,
     body: &[u8],

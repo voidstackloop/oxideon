@@ -256,6 +256,8 @@ class CompiledCallable:
         self.fullgraph = fullgraph
         self._cache: Dict[Tuple[Any, ...], Any] = {}
         functools.update_wrapper(self, fn)
+        # True once a call has been traced into a graph; stays False while every call runs eagerly (tracing failed)
+        self._compiled = False
 
     def _sig(self, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
         sig = []
@@ -277,6 +279,7 @@ class CompiledCallable:
             from .fx import symbolic_trace
             gm = symbolic_trace(self.fn)
             self._cache[key] = gm
+            self._compiled = True
             return gm(*args)
         except Exception:
             if self.fullgraph:

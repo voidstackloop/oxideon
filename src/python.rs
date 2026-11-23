@@ -2131,6 +2131,20 @@ impl PyTensor {
             .call_method0("copy")
     }
 
+    /// Returns a zero-copy read-only NumPy `ndarray` view over host tensor memory.
+    pub fn numpy_view<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let np = py
+            .import("numpy")
+            .map_err(|_| pyo3::exceptions::PyImportError::new_err("numpy_view requires NumPy: pip install numpy"))?;
+        let iface = self.__array_interface__(py)?;
+        let types = py.import("types")?;
+        let py_self = pyo3::Py::new(py, self.clone())?;
+        let holder = types.call_method1("SimpleNamespace", ())?;
+        holder.setattr("__array_interface__", iface)?;
+        holder.setattr("_base", py_self)?;
+        np.call_method1("asarray", (holder,))
+    }
+
     /// Converts tensor to a NumPy array (`__array__` protocol: `np.asarray(t)`, `np.array(t)`).
     #[pyo3(signature = (dtype=None, copy=None))]
     pub fn __array__<'py>(
@@ -2139,6 +2153,13 @@ impl PyTensor {
         dtype: Option<&Bound<'py, PyAny>>,
         copy: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if copy != Some(true)
+            && dtype.is_none()
+            && self.inner.device().is_cpu()
+            && let Ok(view) = self.numpy_view(py)
+        {
+            return Ok(view);
+        }
         let mut arr = self.numpy(py)?;
         if let Some(dt) = dtype {
             arr = arr.call_method1("astype", (dt,))?;
@@ -2152,6 +2173,38 @@ impl PyTensor {
     /// Alias for `.numpy()` for PyTorch / JAX ergonomics: `t.to_numpy()`.
     pub fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.numpy(py)
+    }
+
+    /// True if this 4D tensor uses `channels_last` (`NHWC`) physical memory layout.
+    pub fn is_channels_last(&self) -> bool {
+        self.inner.is_channels_last()
+    }
+
+    /// Converts a 4D `[N, C, H, W]` tensor to `channels_last` (`NHWC`) memory format.
+    pub fn to_channels_last(&self) -> PyResult<Self> {
+        Ok(Self {
+            inner: self.inner.to_channels_last().map_err(to_py_err)?,
+        })
+    }
+
+    /// Einops-style `rearrange(pattern, **axes_lengths)` on this tensor.
+    #[pyo3(signature = (pattern, **kwargs))]
+    pub fn rearrange(
+        &self,
+        pattern: &str,
+        kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<Self> {
+        let mut owned = Vec::<(String, usize)>::new();
+        if let Some(d) = kwargs {
+            for (k, v) in d.iter() {
+                owned.push((k.extract::<String>()?, v.extract::<usize>()?));
+            }
+        }
+        let refs: Vec<(&str, usize)> = owned.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        Ok(Self {
+            inner: oxideon_core::einops::rearrange(&self.inner, pattern, &refs)
+                .map_err(to_py_err)?,
+        })
     }
 
     /// Serialization reduction protocol for Python `pickle` support.
@@ -2236,12 +2289,20 @@ impl PyTensor {
         dl_device: Option<&Bound<'py, PyAny>>,
         copy: Option<bool>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let _ = (stream, max_version, dl_device);
+        let _ = (stream, dl_device);
         let src = if copy == Some(true) {
             self.inner.contiguous().map_err(to_py_err)?
         } else {
             self.inner.clone()
         };
+        // consumers that understand DLPack 1.x pass `max_version=(1, x)` and get a versioned (writable-flagged) capsule
+        let versioned = match max_version {
+            Some(v) if !v.is_none() => v.extract::<(u32, u32)>().map(|(major, _)| major >= 1).unwrap_or(false),
+            _ => false,
+        };
+        if versioned {
+            return versioned_capsule(py, &src);
+        }
         let managed = oxideon_core::dlpack::to_dlpack(&src).map_err(to_py_err)?;
         unsafe extern "C" fn capsule_destructor(capsule: *mut pyo3::ffi::PyObject) {
             let name = unsafe { pyo3::ffi::PyCapsule_GetName(capsule) };
@@ -2282,28 +2343,44 @@ impl PyTensor {
 
     /// DLPack device metadata `(device_type, device_id)`.
     pub fn __dlpack_device__(&self) -> (i32, i32) {
-        (oxideon_core::dlpack::DL_CPU, 0)
+        match self.inner.device() {
+            oxideon_core::Device::Cuda(i) => (2, i as i32), // kDLCUDA
+            _ => (oxideon_core::dlpack::DL_CPU, 0),
+        }
     }
 
-    /// Imports a DLPack `"dltensor"` PyCapsule directly in Rust and marks it consumed (`"used_dltensor"`).
+    /// Imports a DLPack PyCapsule (`"dltensor"` or the versioned `"dltensor_versioned"`) directly in Rust and marks it consumed
+    /// (`"used_dltensor"` / `"used_dltensor_versioned"`). CPU data is aliased, not copied.
     #[staticmethod]
     pub fn from_dlpack_capsule(capsule: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let ptr = unsafe {
-            pyo3::ffi::PyCapsule_GetPointer(capsule.as_ptr(), c"dltensor".as_ptr())
-        } as *mut oxideon_core::dlpack::DLManagedTensor;
+        let raw = capsule.as_ptr();
+        let name = unsafe { pyo3::ffi::PyCapsule_GetName(raw) };
+        if name.is_null() {
+            unsafe { pyo3::ffi::PyErr_Clear() };
+            return Err(PyValueError::new_err("expected an unconsumed DLPack capsule"));
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(name) };
+        let (versioned, used): (bool, &std::ffi::CStr) = if name == c"dltensor" {
+            (false, c"used_dltensor")
+        } else if name == c"dltensor_versioned" {
+            (true, c"used_dltensor_versioned")
+        } else {
+            return Err(PyValueError::new_err("expected an unconsumed DLPack capsule named 'dltensor' or 'dltensor_versioned'"));
+        };
+        let ptr = unsafe { pyo3::ffi::PyCapsule_GetPointer(raw, name.as_ptr()) };
         if ptr.is_null() {
             unsafe { pyo3::ffi::PyErr_Clear() };
-            return Err(PyValueError::new_err(
-                "expected an unconsumed DLPack capsule named 'dltensor'",
-            ));
+            return Err(PyValueError::new_err("empty DLPack capsule"));
         }
-        let rc = unsafe {
-            pyo3::ffi::PyCapsule_SetName(capsule.as_ptr(), c"used_dltensor".as_ptr())
-        };
-        if rc != 0 {
+        if unsafe { pyo3::ffi::PyCapsule_SetName(raw, used.as_ptr()) } != 0 {
             return Err(pyo3::PyErr::fetch(capsule.py()));
         }
-        let inner = unsafe { oxideon_core::dlpack::from_dlpack(ptr) }.map_err(to_py_err)?;
+        let inner = if versioned {
+            unsafe { oxideon_core::dlpack::from_dlpack_versioned(ptr as *mut oxideon_core::dlpack::DLManagedTensorVersioned) }
+        } else {
+            unsafe { oxideon_core::dlpack::from_dlpack(ptr as *mut oxideon_core::dlpack::DLManagedTensor) }
+        }
+        .map_err(to_py_err)?;
         Ok(Self { inner })
     }
 
@@ -10554,6 +10631,23 @@ impl PyCompiledGraph {
 // ---------------------------------------------------------------------------
 // Module-Level Functions (Fused Kernels, Autograd, Quantization, Safetensors)
 // ---------------------------------------------------------------------------
+
+/// Selects the application-wide precision mode: "fastest", "balanced" (the default) or "highest".
+#[pyfunction]
+#[pyo3(name = "set_precision_mode")]
+pub fn py_set_precision_mode(mode: &str) -> PyResult<()> {
+    let m = oxideon_core::PrecisionMode::parse(mode)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown precision mode {mode:?}; use \"fastest\", \"balanced\" or \"highest\"")))?;
+    oxideon_core::set_precision_mode(m);
+    Ok(())
+}
+
+/// The current precision mode name: "fastest", "balanced" or "highest".
+#[pyfunction]
+#[pyo3(name = "get_precision_mode")]
+pub fn py_get_precision_mode() -> &'static str {
+    oxideon_core::precision_mode().name()
+}
 
 #[pyfunction]
 #[pyo3(name = "manual_seed")]
@@ -26827,6 +26921,8 @@ pub fn register_python_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyComputeStream>()?;
     m.add_class::<PyComputeGraph>()?;
 
+    m.add_function(wrap_pyfunction!(py_set_precision_mode, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_precision_mode, m)?)?;
     m.add_function(wrap_pyfunction!(py_manual_seed, m)?)?;
     m.add_function(wrap_pyfunction!(py_initial_seed, m)?)?;
     m.add_function(wrap_pyfunction!(py_seed, m)?)?;
@@ -26920,6 +27016,41 @@ pub fn register_python_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pymodule]
 pub fn oxideon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_python_module(m)
+}
+
+/// A `"dltensor_versioned"` PyCapsule around a DLPack 1.0 export of `t`; if the capsule is never consumed its destructor runs
+/// the deleter.
+#[cfg(feature = "python")]
+fn versioned_capsule<'py>(py: Python<'py>, t: &oxideon_core::Tensor) -> PyResult<Bound<'py, PyAny>> {
+    use oxideon_core::dlpack::DLManagedTensorVersioned;
+    unsafe extern "C" fn destructor(capsule: *mut pyo3::ffi::PyObject) {
+        let name = unsafe { pyo3::ffi::PyCapsule_GetName(capsule) };
+        if name.is_null() {
+            unsafe { pyo3::ffi::PyErr_Clear() };
+            return;
+        }
+        if unsafe { std::ffi::CStr::from_ptr(name) } == c"dltensor_versioned" {
+            let ptr = unsafe { pyo3::ffi::PyCapsule_GetPointer(capsule, c"dltensor_versioned".as_ptr()) } as *mut DLManagedTensorVersioned;
+            if !ptr.is_null() {
+                unsafe {
+                    if let Some(d) = (*ptr).deleter {
+                        d(ptr);
+                    }
+                }
+            }
+        }
+    }
+    let managed = oxideon_core::dlpack::to_dlpack_versioned(t).map_err(to_py_err)?;
+    let raw = unsafe { pyo3::ffi::PyCapsule_New(managed as *mut std::ffi::c_void, c"dltensor_versioned".as_ptr(), Some(destructor)) };
+    if raw.is_null() {
+        unsafe {
+            if let Some(d) = (*managed).deleter {
+                d(managed);
+            }
+        }
+        return Err(pyo3::PyErr::fetch(py));
+    }
+    Ok(unsafe { Bound::from_owned_ptr(py, raw) })
 }
 
 #[cfg(test)]

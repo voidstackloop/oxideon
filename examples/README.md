@@ -48,7 +48,6 @@ run with `cargo run --release --example <name>`.
 | Example | What it shows | Run |
 |---|---|---|
 | `fake_news_detector.py` | 10k-sample fake/real news classifier, training loop, `.safetensors` + vocab persistence | `python3 examples/fake_news_detector.py` |
-| `true_false_news.py` | TRUE/FALSE verdicts with the pretrained detector (trains one if missing) | `python3 examples/true_false_news.py [--weights PATH] [--epochs N]` |
 
 ### Interop, science, uncertainty & privacy
 
@@ -110,4 +109,4 @@ run with `cargo run --release --example <name>`.
 
 ### Browser
 
-`browser_demo/index.html` — static WebGPU/WASM demo page (open directly in a browser).
+`browser_demo/index.html` — static mock-up page for an in-browser inference UI (open directly in a browser); it is simulated: it loads no model and its timings are fixed.

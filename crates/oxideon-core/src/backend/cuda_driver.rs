@@ -106,6 +106,18 @@ mod dynlib {
     }
 }
 
+#[cfg(not(any(windows, unix)))]
+mod dynlib {
+    //! No dynamic loading on this target (for example WebAssembly): every library is reported as missing.
+    use std::ffi::{CStr, c_void};
+    pub unsafe fn open(_name: &CStr) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn sym(_lib: *mut c_void, _name: &CStr) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+}
+
 #[cfg(unix)]
 mod dynlib {
     use std::ffi::{CStr, c_int, c_void};
@@ -141,6 +153,8 @@ impl CudaApi {
         let lib_name = c"nvcuda.dll";
         #[cfg(unix)]
         let lib_name = c"libcuda.so.1";
+        #[cfg(not(any(windows, unix)))]
+        let lib_name = c"";
 
         let lib = unsafe { dynlib::open(lib_name) };
         if lib.is_null() {
@@ -261,7 +275,7 @@ pub fn cuda_device_info(index: usize) -> Result<CudaDeviceInfo> {
     }
     let mut dev: CUdevice = 0;
     check(unsafe { (a.cu_device_get)(&mut dev, index as c_int) }, "cuDeviceGet")?;
-    let mut name_buf = [0i8; 256];
+    let mut name_buf: [c_char; 256] = [0; 256]; // c_char is u8 on aarch64 Linux
     check(
         unsafe { (a.cu_device_get_name)(name_buf.as_mut_ptr(), 256, dev) },
         "cuDeviceGetName",
@@ -309,11 +323,55 @@ pub fn cuda_mem_info(index: usize) -> Result<(usize, usize)> {
     Ok((free, total))
 }
 
-/// Synchronizes all work on CUDA device `index`.
+/// Waits for everything queued on the default stream of CUDA device `index`: every kernel launch and copy of this library goes
+/// there. (It deliberately is not `cuCtxSynchronize`, which the driver rejects while *any* stream of the context is being
+/// captured into a graph, so a capture on one thread would break reads on every other thread. Work on a [`CudaStream`] is
+/// waited for with [`CudaStream::synchronize`].)
 pub fn cuda_synchronize(index: usize) -> Result<()> {
     ensure_context(index)?;
     let a = api()?;
-    check(unsafe { (a.cu_ctx_synchronize)() }, "cuCtxSynchronize")
+    check(unsafe { (a.cu_stream_synchronize)(std::ptr::null_mut()) }, "cuStreamSynchronize(default)")
+}
+
+/// Freed device allocations kept for reuse, by `(device, size)`. `cuMemAlloc` / `cuMemFree` cost far more than a short kernel
+/// (and `cuMemFree` waits for the device), so a buffer that is dropped goes back here and the next tensor of the same size
+/// takes it. Bounded by `OXIDEON_CUDA_POOL_MB` (default 1024; 0 turns pooling off); an allocation failure empties the pool and
+/// retries before giving up.
+struct DevicePool {
+    free: std::collections::HashMap<(usize, usize), Vec<CUdeviceptr>>,
+    pooled_bytes: usize,
+}
+
+fn device_pool() -> &'static Mutex<DevicePool> {
+    static P: OnceLock<Mutex<DevicePool>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(DevicePool { free: std::collections::HashMap::new(), pooled_bytes: 0 }))
+}
+
+fn pool_limit() -> usize {
+    static L: OnceLock<usize> = OnceLock::new();
+    *L.get_or_init(|| std::env::var("OXIDEON_CUDA_POOL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) << 20)
+}
+
+/// Size class of an allocation: 512-byte multiples, so tensors of the same shape reuse each other's memory.
+fn size_class(bytes: usize) -> usize {
+    bytes.next_multiple_of(512)
+}
+
+/// Returns every pooled allocation of every device to the driver.
+pub fn cuda_empty_pool() {
+    let Ok(a) = api() else { return };
+    let mut pool = device_pool().lock().unwrap_or_else(|p| p.into_inner());
+    for ((dev, _), ptrs) in pool.free.drain() {
+        if ensure_context(dev).is_ok() {
+            for p in ptrs {
+                // SAFETY: `p` was allocated by `cuMemAlloc` on this device and is freed once.
+                unsafe {
+                    let _ = (a.cu_mem_free)(p);
+                }
+            }
+        }
+    }
+    pool.pooled_bytes = 0;
 }
 
 /// RAII GPU VRAM allocation on a real CUDA device.
@@ -321,6 +379,8 @@ pub fn cuda_synchronize(index: usize) -> Result<()> {
 pub struct CudaBuffer {
     ptr: CUdeviceptr,
     bytes: usize,
+    /// Size of the underlying allocation (`bytes` rounded up to its size class), the key for returning it to the pool.
+    cap: usize,
     device_index: usize,
 }
 
@@ -329,12 +389,34 @@ impl CudaBuffer {
         ensure_context(device_index)?;
         let a = api()?;
         let mut ptr: CUdeviceptr = 0;
+        let cap = if bytes > 0 { size_class(bytes) } else { 0 };
         if bytes > 0 {
-            check(unsafe { (a.cu_mem_alloc)(&mut ptr, bytes) }, "cuMemAlloc_v2")?;
+            let pooled = {
+                let mut pool = device_pool().lock().unwrap_or_else(|p| p.into_inner());
+                let got = pool.free.get_mut(&(device_index, cap)).and_then(Vec::pop);
+                if got.is_some() {
+                    pool.pooled_bytes -= cap;
+                }
+                got
+            };
+            match pooled {
+                Some(p) => ptr = p,
+                None => {
+                    let mut rc = unsafe { (a.cu_mem_alloc)(&mut ptr, cap) };
+                    if rc != CUDA_SUCCESS {
+                        // out of memory: give the pooled allocations back and try once more
+                        cuda_empty_pool();
+                        ensure_context(device_index)?;
+                        rc = unsafe { (a.cu_mem_alloc)(&mut ptr, cap) };
+                    }
+                    check(rc, "cuMemAlloc_v2")?;
+                }
+            }
         }
         Ok(Self {
             ptr,
             bytes,
+            cap,
             device_index,
         })
     }
@@ -380,8 +462,18 @@ impl CudaBuffer {
 
 impl Drop for CudaBuffer {
     fn drop(&mut self) {
-        if self.ptr != 0
-            && let Ok(a) = api()
+        if self.ptr == 0 {
+            return;
+        }
+        {
+            let mut pool = device_pool().lock().unwrap_or_else(|p| p.into_inner());
+            if pool.pooled_bytes + self.cap <= pool_limit() {
+                pool.pooled_bytes += self.cap;
+                pool.free.entry((self.device_index, self.cap)).or_default().push(self.ptr);
+                return;
+            }
+        }
+        if let Ok(a) = api()
             && ensure_context(self.device_index).is_ok()
         {
             unsafe {
@@ -513,7 +605,7 @@ impl CudaStream {
         ensure_context(device_index)?;
         let a = api()?;
         let mut stream: CUstream = std::ptr::null_mut();
-        check(unsafe { (a.cu_stream_create)(&mut stream, 0) }, "cuStreamCreate")?;
+        check(unsafe { (a.cu_stream_create)(&mut stream, 1 /* CU_STREAM_NON_BLOCKING: no implicit sync with the default stream */) }, "cuStreamCreate")?;
         Ok(Self { stream, device_index })
     }
 
@@ -552,7 +644,7 @@ impl CudaGraph {
         ensure_context(stream.device_index)?;
         let a = api()?;
         check(
-            unsafe { (a.cu_stream_begin_capture)(stream.stream, 0 /* CU_STREAM_CAPTURE_MODE_GLOBAL */) },
+            unsafe { (a.cu_stream_begin_capture)(stream.stream, 2 /* CU_STREAM_CAPTURE_MODE_RELAXED: other threads keep working */) },
             "cuStreamBeginCapture",
         )?;
         let res = f(stream);
@@ -601,6 +693,212 @@ impl Drop for CudaPtxModule {
         {
             unsafe {
                 let _ = (a.cu_module_unload)(self.module);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Additions for the NVRTC-compiled kernel library (see `cuda_rt`): raw byte transfers, device-to-device copies, cubin
+// loading and cached function handles. The extra driver symbols are resolved lazily, next to the ones above.
+// ---------------------------------------------------------------------------------------------------------------------
+
+struct Extra {
+    memcpy_dtod: unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult,
+    memset_d8: unsafe extern "C" fn(CUdeviceptr, u8, usize) -> CUresult,
+    func_set_attribute: unsafe extern "C" fn(CUfunction, c_int, c_int) -> CUresult,
+    mem_alloc_host: unsafe extern "C" fn(*mut *mut c_void, usize) -> CUresult,
+    mem_free_host: unsafe extern "C" fn(*mut c_void) -> CUresult,
+}
+
+fn extra() -> Result<&'static Extra> {
+    static E: OnceLock<std::result::Result<Extra, String>> = OnceLock::new();
+    E.get_or_init(|| {
+        let a = api().map_err(|e| e.to_string())?;
+        // SAFETY: `a._lib` is the live driver handle and each symbol is requested with its documented signature.
+        unsafe {
+            Ok(Extra {
+                memcpy_dtod: load_fn(a._lib, b"cuMemcpyDtoD_v2\0")?,
+                memset_d8: load_fn(a._lib, b"cuMemsetD8_v2\0")?,
+                func_set_attribute: load_fn(a._lib, b"cuFuncSetAttribute\0")?,
+                mem_alloc_host: load_fn(a._lib, b"cuMemAllocHost_v2\0")?,
+                mem_free_host: load_fn(a._lib, b"cuMemFreeHost\0")?,
+            })
+        }
+    })
+    .as_ref()
+    .map_err(|e| Error::Backend(e.clone()))
+}
+
+impl CudaBuffer {
+    /// Uploads raw bytes (any element type).
+    pub fn from_host_bytes(device_index: usize, data: &[u8]) -> Result<Self> {
+        let buf = Self::alloc(device_index, data.len())?;
+        if !data.is_empty() {
+            let a = api()?;
+            check(unsafe { (a.cu_memcpy_htod)(buf.ptr, data.as_ptr() as *const c_void, data.len()) }, "cuMemcpyHtoD_v2")?;
+        }
+        Ok(buf)
+    }
+
+    /// Downloads `len` raw bytes from the start of the buffer.
+    pub fn to_host_bytes(&self, len: usize) -> Result<Vec<u8>> {
+        if len > self.bytes {
+            return Err(Error::Backend("CUDA D2H read exceeds buffer size".into()));
+        }
+        ensure_context(self.device_index)?;
+        let mut out = vec![0u8; len];
+        if len > 0 {
+            let a = api()?;
+            check(unsafe { (a.cu_memcpy_dtoh)(out.as_mut_ptr() as *mut c_void, self.ptr, len) }, "cuMemcpyDtoH_v2")?;
+        }
+        Ok(out)
+    }
+
+    /// Copies `bytes` bytes from `src` (same device) into this buffer at `dst_offset`.
+    pub fn copy_from_device(&self, dst_offset: usize, src: &CudaBuffer, src_offset: usize, bytes: usize) -> Result<()> {
+        if dst_offset + bytes > self.bytes || src_offset + bytes > src.bytes {
+            return Err(Error::Backend("CUDA D2D copy out of range".into()));
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        ensure_context(self.device_index)?;
+        let e = extra()?;
+        check(unsafe { (e.memcpy_dtod)(self.ptr + dst_offset as u64, src.ptr + src_offset as u64, bytes) }, "cuMemcpyDtoD_v2")
+    }
+
+    /// Sets every byte of the buffer to `value`.
+    pub fn memset(&self, value: u8) -> Result<()> {
+        if self.bytes == 0 {
+            return Ok(());
+        }
+        ensure_context(self.device_index)?;
+        let e = extra()?;
+        check(unsafe { (e.memset_d8)(self.ptr, value, self.bytes) }, "cuMemsetD8_v2")
+    }
+
+    pub fn device_index(&self) -> usize {
+        self.device_index
+    }
+}
+
+/// A kernel entry point of a loaded module, resolved once.
+#[derive(Clone)]
+pub struct CudaFunction {
+    raw: usize,
+    device_index: usize,
+    // keeps the module (and with it the function) alive
+    _module: Arc<CudaPtxModule>,
+}
+
+impl CudaFunction {
+    /// Launches on the default stream. `args` holds one pointer per kernel parameter, each pointing at that parameter's value.
+    pub fn launch(&self, grid: [u32; 3], block: [u32; 3], shared_mem_bytes: u32, args: &mut [*mut c_void]) -> Result<()> {
+        ensure_context(self.device_index)?;
+        let a = api()?;
+        check(
+            unsafe {
+                (a.cu_launch_kernel)(
+                    self.raw as CUfunction,
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    block[0],
+                    block[1],
+                    block[2],
+                    shared_mem_bytes,
+                    std::ptr::null_mut(),
+                    args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel",
+        )?;
+        if sync_each_launch() {
+            check(unsafe { (a.cu_ctx_synchronize)() }, "cuCtxSynchronize (OXIDEON_CUDA_SYNC)")?;
+        }
+        Ok(())
+    }
+
+    /// Allows more than 48 KiB of dynamic shared memory for this kernel (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`).
+    pub fn set_max_dynamic_shared(&self, bytes: i32) -> Result<()> {
+        ensure_context(self.device_index)?;
+        let e = extra()?;
+        check(unsafe { (e.func_set_attribute)(self.raw as CUfunction, 8, bytes) }, "cuFuncSetAttribute")
+    }
+}
+
+/// With `OXIDEON_CUDA_SYNC=1` every launch is followed by a synchronize, so a faulting kernel is reported at its own launch.
+fn sync_each_launch() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("OXIDEON_CUDA_SYNC").is_ok_and(|v| v != "0"))
+}
+
+impl CudaPtxModule {
+    /// Loads a compiled image (a CUBIN from NVRTC, or PTX text with a trailing NUL) onto the device.
+    pub fn load_image(device_index: usize, image: &[u8]) -> Result<Arc<Self>> {
+        ensure_context(device_index)?;
+        let a = api()?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        let mut err_buf = vec![0u8; 4096];
+        let mut opts: [c_int; 2] = [5, 6];
+        let mut vals: [*mut c_void; 2] = [err_buf.as_mut_ptr() as *mut c_void, err_buf.len() as *mut c_void];
+        let rc = unsafe { (a.cu_module_load_data_ex)(&mut module, image.as_ptr() as *const c_void, 2, opts.as_mut_ptr(), vals.as_mut_ptr()) };
+        if rc != CUDA_SUCCESS {
+            let msg = CStr::from_bytes_until_nul(&err_buf).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            return Err(Error::Backend(format!("cuModuleLoadDataEx failed with error code {rc}: {msg}")));
+        }
+        Ok(Arc::new(Self { module, device_index }))
+    }
+
+    /// Resolves the kernel `name` of this module.
+    pub fn function(self: &Arc<Self>, name: &str) -> Result<CudaFunction> {
+        ensure_context(self.device_index)?;
+        let a = api()?;
+        let c_name = CString::new(name).map_err(|e| Error::Backend(e.to_string()))?;
+        let mut func: CUfunction = std::ptr::null_mut();
+        check(unsafe { (a.cu_module_get_function)(&mut func, self.module, c_name.as_ptr()) }, &format!("cuModuleGetFunction({name})"))?;
+        Ok(CudaFunction { raw: func as usize, device_index: self.device_index, _module: self.clone() })
+    }
+}
+
+/// Page-locked host memory, for faster and asynchronous-capable transfers.
+pub struct CudaHostBuffer {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+// SAFETY: the allocation is exclusively owned, like a `Vec<u8>`.
+unsafe impl Send for CudaHostBuffer {}
+unsafe impl Sync for CudaHostBuffer {}
+
+impl CudaHostBuffer {
+    pub fn new(device_index: usize, bytes: usize) -> Result<Self> {
+        ensure_context(device_index)?;
+        let e = extra()?;
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        check(unsafe { (e.mem_alloc_host)(&mut ptr, bytes.max(1)) }, "cuMemAllocHost_v2")?;
+        Ok(Self { ptr, bytes })
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is valid for `bytes` bytes for the life of `self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.bytes) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: as above.
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.bytes) }
+    }
+}
+
+impl Drop for CudaHostBuffer {
+    fn drop(&mut self) {
+        if let Ok(e) = extra() {
+            // SAFETY: `ptr` came from `cuMemAllocHost` and is freed once.
+            unsafe {
+                let _ = (e.mem_free_host)(self.ptr);
             }
         }
     }

@@ -424,6 +424,13 @@ impl Tensor {
 
     pub fn randn_with(shape: &[usize], dtype: DType, device: &Device) -> Result<Self> {
         let n = crate::limits::check_elements("tensor element count", shape)?;
+        // CUDA: sampled by a kernel from a key drawn from the global generator (so `manual_seed` stays deterministic)
+        if matches!(device, Device::Cuda(_)) {
+            let key = rng::with_rng(|r| r.next_u64());
+            if let Some(storage) = Storage::cuda_rand(device, dtype, n, true, key, 0.0, 0.0)? {
+                return Ok(Self::from_storage(storage, Layout::contiguous(shape)));
+            }
+        }
         let mut data: Vec<f32> = crate::layout::try_with_capacity(n)?;
         rng::with_rng(|r| data.extend((0..n).map(|_| r.normal())));
         debug_assert_eq!(data.len(), n);
@@ -441,6 +448,19 @@ impl Tensor {
         } else {
             t.to_dtype(dtype)
         }
+    }
+
+    /// Uniform samples in `[low, high)` created on `device` (a kernel on CUDA, the host generator elsewhere).
+    pub fn rand_uniform_on(shape: &[usize], low: f32, high: f32, dtype: DType, device: &Device) -> Result<Self> {
+        if matches!(device, Device::Cuda(_)) {
+            let n = crate::limits::check_elements("tensor element count", shape)?;
+            let key = rng::with_rng(|r| r.next_u64());
+            if let Some(storage) = Storage::cuda_rand(device, dtype, n, false, key, f64::from(low), f64::from(high))? {
+                return Ok(Self::from_storage(storage, Layout::contiguous(shape)));
+            }
+        }
+        let t = Self::rand_uniform(shape, low, high)?.to_device(device)?;
+        if dtype == DType::F32 { Ok(t) } else { t.to_dtype(dtype) }
     }
 
     pub fn rand_uniform(shape: &[usize], low: f32, high: f32) -> Result<Self> {
@@ -528,6 +548,10 @@ impl Tensor {
     #[inline]
     pub fn id(&self) -> usize {
         self.0.id
+    }
+
+    pub(crate) fn trace_node(&self) -> Option<(&'static str, Vec<Tensor>)> {
+        self.0.node.as_ref().map(|n| (n.op, n.inputs.clone()))
     }
 
     #[inline]
