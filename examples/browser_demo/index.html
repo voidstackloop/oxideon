@@ -1,51 +1,218 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Oxideon in Browser — WebAssembly + WebGPU</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #0b0f19; color: #f3f4f6; margin: 0; padding: 2rem; }
-        .container { max-width: 800px; margin: 0 auto; background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 2rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-        h1 { color: #60a5fa; margin-top: 0; }
-        .badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.85rem; font-weight: 600; background: #1e3a8a; color: #93c5fd; margin-bottom: 1.5rem; }
-        textarea { width: 100%; height: 120px; background: #1f2937; color: #f9fafb; border: 1px solid #374151; border-radius: 8px; padding: 1rem; font-family: monospace; font-size: 1rem; box-sizing: border-box; resize: vertical; }
-        button { background: #2563eb; color: white; border: none; padding: 0.75rem 1.5rem; font-size: 1rem; font-weight: 600; border-radius: 8px; cursor: pointer; transition: background 0.2s; margin-top: 1rem; }
-        button:hover { background: #1d4ed8; }
-        .output { margin-top: 1.5rem; padding: 1rem; background: #030712; border: 1px solid #1f2937; border-radius: 8px; font-family: monospace; min-height: 80px; white-space: pre-wrap; color: #34d399; }
-        .meta { margin-top: 0.5rem; font-size: 0.85rem; color: #9ca3af; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oxideon in the browser</title>
+<style>
+  :root { --bg:#0b0f19; --card:#111827; --line:#1f2937; --fg:#f3f4f6; --mute:#9ca3af; --acc:#60a5fa; --ok:#34d399; --bad:#f87171; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); margin: 0; padding: 1.25rem; }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { color: var(--acc); margin: 0 0 .25rem; }
+  h2 { margin: 0 0 .25rem; font-size: 1.15rem; }
+  p { color: var(--mute); line-height: 1.5; margin: .25rem 0 .75rem; }
+  .status { font-size: .85rem; padding: .5rem .75rem; border-radius: 8px; background: #052e1a; color: var(--ok); border: 1px solid #14532d; margin: .75rem 0 1rem; }
+  .status.err { background: #3b0d0d; color: var(--bad); border-color: #7f1d1d; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.25rem; margin-bottom: 1rem; }
+  .row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; margin: .5rem 0; }
+  label { color: var(--mute); font-size: .9rem; }
+  select, input[type=range] { accent-color: var(--acc); }
+  select { background: #1f2937; color: var(--fg); border: 1px solid #374151; border-radius: 6px; padding: .3rem .5rem; }
+  button { background: #2563eb; color: #fff; border: 0; padding: .55rem 1.1rem; font-weight: 600; border-radius: 8px; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  button:disabled { background: #374151; cursor: default; }
+  pre { background: #030712; border: 1px solid var(--line); border-radius: 8px; padding: .75rem; margin: .5rem 0 0; color: var(--ok); font-size: .85rem; white-space: pre-wrap; overflow-x: auto; }
+  canvas { max-width: 100%; background: #030712; border: 1px solid var(--line); border-radius: 8px; display: block; margin-top: .5rem; }
+  .legend span { margin-right: 1rem; font-size: .85rem; }
+  footer { color: var(--mute); font-size: .8rem; text-align: center; margin: 1.5rem 0; }
+  a { color: var(--acc); }
+</style>
 </head>
 <body>
-    <div class="container">
-        <span class="badge">Oxideon (simulated demo)</span>
-        <h1>In-Browser LLM & Neural Inference</h1>
-        <p>Layout mock-up of a client-side inference page for Rust compiled to WebAssembly with WebGPU acceleration.</p>
-        <p><strong>Simulated:</strong> this page does not load oxideon or any model. The answer is canned and the timing is a fixed delay, so the numbers below say nothing about real performance.</p>
-        
-        <label for="prompt">Prompt Input:</label>
-        <textarea id="prompt">Explain the difference between PagedAttention and standard multi-head attention in one sentence.</textarea>
-        
-        <button id="runBtn" onclick="runInference()">Show canned answer</button>
-        
-        <div class="output" id="output">Output will stream here...</div>
-        <div class="meta" id="metrics">Backend: none (simulated)</div>
-    </div>
+<main>
+  <h1>Oxideon in your browser</h1>
+  <p>Every result below is computed by the real Oxideon tensor library, compiled to WebAssembly, running in this page. Nothing is sent to a server, and the numbers are measured on your machine.</p>
+  <div id="status" class="status">Loading the WebAssembly module...</div>
 
-    <script type="module">
-        window.runInference = async function() {
-            const out = document.getElementById("output");
-            const metrics = document.getElementById("metrics");
-            out.textContent = "Simulating...";
-            
-            const start = performance.now();
-            // Simulate Wasm generation step
-            setTimeout(() => {
-                const elapsed = (performance.now() - start).toFixed(2);
-                out.textContent = "PagedAttention partitions the KV cache into fixed-size physical blocks (like OS virtual memory pages), eliminating fragmentation and enabling zero-copy prefix sharing.";
-                metrics.textContent = `Simulated: ${elapsed} ms fixed delay | 28 canned tokens | WebGPU available in this browser: ${"gpu" in navigator ? "yes" : "no"}`;
-            }, 120);
-        };
-    </script>
+  <section>
+    <h2>1. Matrix multiply: speed and accuracy</h2>
+    <p>Multiplies two random <i>n</i>x<i>n</i> float32 matrices with Oxideon, then checks the result against a float64 reference. A plain JavaScript loop accumulating in float32 is shown next to it.</p>
+    <div class="row">
+      <label>size <select id="mm-n"><option>64</option><option>128</option><option selected>256</option><option>384</option></select></label>
+      <button id="mm-run" disabled>Run</button>
+    </div>
+    <pre id="mm-out">Press Run.</pre>
+  </section>
+
+  <section>
+    <h2>2. Activation functions</h2>
+    <p>Curves computed by Oxideon on 2000 points in [-6, 6] (solid) against an exact float64 reference (dashed). The table gives the largest absolute error.</p>
+    <div class="row"><button id="act-run" disabled>Draw</button></div>
+    <canvas id="act-cv" width="820" height="300"></canvas>
+    <div class="legend" id="act-legend"></div>
+    <pre id="act-out"></pre>
+  </section>
+
+  <section>
+    <h2>3. Softmax does not overflow</h2>
+    <p>Softmax of large logits. A textbook <code>exp(x) / sum(exp(x))</code> in JavaScript overflows to NaN; Oxideon subtracts the maximum first.</p>
+    <div class="row">
+      <label>logit scale <input id="sm-scale" type="range" min="1" max="2000" value="900"> <b id="sm-scale-v">900</b></label>
+      <button id="sm-run" disabled>Run</button>
+    </div>
+    <pre id="sm-out">Press Run.</pre>
+  </section>
+
+  <section>
+    <h2>4. A small neural network, forward pass</h2>
+    <p>A two-layer ReLU network (matmul, bias add, relu, matmul, softmax, all Oxideon ops) whose hand-set weights compute XOR: class 1 where <i>x</i> and <i>y</i> have the same sign. The map shows the predicted probability on a 64x64 grid, run as one batch of 4096 points.</p>
+    <div class="row">
+      <label>confidence <input id="nn-k" type="range" min="1" max="30" value="6"> <b id="nn-k-v">6</b></label>
+      <button id="nn-run" disabled>Run</button>
+    </div>
+    <canvas id="nn-cv" width="256" height="256" style="width:256px;image-rendering:pixelated"></canvas>
+    <pre id="nn-out"></pre>
+  </section>
+
+  <footer>Source: <a href="https://github.com/voidstackloop/oxideon">github.com/voidstackloop/oxideon</a> &middot; <code>pip install oxideon</code></footer>
+</main>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const status = $("status");
+let ox;
+try {
+  ox = await import("./pkg/oxideon.js");
+  const t0 = performance.now();
+  await ox.default();
+  const sess = new ox.WasmInferenceSession();
+  status.textContent = `Oxideon WebAssembly module loaded in ${(performance.now() - t0).toFixed(0)} ms (WebGPU backend in this build: ${sess.has_webgpu() ? "yes" : "no, CPU"}).`;
+  for (const b of ["mm-run", "act-run", "sm-run", "nn-run"]) $(b).disabled = false;
+} catch (e) {
+  status.className = "status err";
+  status.textContent = "Could not load the WebAssembly module (./pkg/oxideon.js): " + e + ". Build it first: see examples/browser_demo/README.md.";
+}
+
+const T = (data, shape) => ox.WasmTensor.from_f32_array(Float32Array.from(data), Uint32Array.from(shape));
+const fmt = v => v === 0 ? "0" : Math.abs(v) < 1e-3 || Math.abs(v) >= 1e5 ? v.toExponential(2) : v.toPrecision(4);
+const time = fn => { const t = performance.now(); const r = fn(); return [r, performance.now() - t]; };
+
+// ---- 1. matmul
+$("mm-run").onclick = () => {
+  const n = +$("mm-n").value;
+  const A = new Float32Array(n * n), B = new Float32Array(n * n);
+  for (let i = 0; i < n * n; i++) { A[i] = Math.random() * 2 - 1; B[i] = Math.random() * 2 - 1; }
+  const a = T(A, [n, n]), b = T(B, [n, n]);
+  a.matmul(b).free(); // warm-up
+  const [c, ms] = time(() => a.matmul(b));
+  const out = c.to_f32_vec(); c.free();
+  // float64 reference and a naive float32 loop (summation order k = 0..n)
+  const ref = new Float64Array(n * n), naive = new Float32Array(n * n);
+  const [, msNaive] = time(() => {
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      let s = 0, f = 0;
+      for (let k = 0; k < n; k++) { const p = A[i * n + k] * B[k * n + j]; s += p; f = Math.fround(f + Math.fround(p)); }
+      ref[i * n + j] = s; naive[i * n + j] = f;
+    }
+  });
+  // error relative to the sum of the absolute terms (cancellation cannot hide it), in units of 2^-24
+  let eo = 0, en = 0;
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    let sa = 0; for (let k = 0; k < n; k++) sa += Math.abs(A[i * n + k] * B[k * n + j]);
+    const u = 16777216 / sa;
+    eo = Math.max(eo, Math.abs(out[i * n + j] - ref[i * n + j]) * u);
+    en = Math.max(en, Math.abs(naive[i * n + j] - ref[i * n + j]) * u);
+  }
+  const gf = 2 * n ** 3 / (ms / 1000) / 1e9;
+  $("mm-out").textContent =
+`${n}x${n} @ ${n}x${n}
+Oxideon (WebAssembly): ${ms.toFixed(2)} ms  (${gf.toFixed(2)} GFLOP/s)
+JavaScript loop:       ${msNaive.toFixed(0)} ms  (also computes the float64 reference; not a fair timing)
+
+worst error vs float64, in units of 2^-24 relative to the sum of |terms|:
+  Oxideon:          ${fmt(eo)}
+  naive float32 JS: ${fmt(en)}`;
+};
+
+// ---- 2. activations (exact float64 references)
+function erf(x) { // series for small |x|, continued fraction for the tail; accurate to ~1e-15
+  const ax = Math.abs(x);
+  let r;
+  if (ax < 3) { let t = ax, s = ax, k = 0; do { k++; t *= -ax * ax / k; s += t / (2 * k + 1); } while (Math.abs(t) > 1e-18); r = 2 / Math.sqrt(Math.PI) * s; }
+  else { let f = 0; for (let k = 60; k >= 1; k--) f = k / 2 / (ax + f); r = 1 - Math.exp(-ax * ax) / Math.sqrt(Math.PI) / (ax + f); }
+  return x < 0 ? -r : r;
+}
+const ACT = {
+  gelu: { ref: x => 0.5 * x * (1 + erf(x / Math.SQRT2)), color: "#f472b6" },
+  silu: { ref: x => x / (1 + Math.exp(-x)), color: "#60a5fa" },
+  tanh: { ref: Math.tanh, color: "#34d399" },
+  relu: { ref: x => Math.max(0, x), color: "#fbbf24" },
+};
+$("act-legend").innerHTML = Object.entries(ACT).map(([k, v]) => `<span style="color:${v.color}">&#9632; ${k}</span>`).join("");
+$("act-run").onclick = () => {
+  const N = 2000, xs = new Float32Array(N);
+  for (let i = 0; i < N; i++) xs[i] = -6 + 12 * i / (N - 1);
+  const x = T(xs, [N]);
+  const cv = $("act-cv"), g = cv.getContext("2d"), W = cv.width, H = cv.height;
+  g.clearRect(0, 0, W, H);
+  const X = v => (v + 6) / 12 * W, Y = v => H / 2 - v * (H / 2) / 6.2; // y range about [-6.2, 6.2]
+  g.strokeStyle = "#1f2937"; g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(W, Y(0)); g.moveTo(X(0), 0); g.lineTo(X(0), H); g.stroke();
+  let lines = "function   max |Oxideon - float64 reference|\n";
+  for (const [name, a] of Object.entries(ACT)) {
+    const y = x[name](), ys = y.to_f32_vec(); y.free();
+    let maxErr = 0;
+    g.strokeStyle = a.color; g.lineWidth = 2; g.setLineDash([]); g.beginPath();
+    for (let i = 0; i < N; i++) { const px = X(xs[i]), py = Y(ys[i]); i ? g.lineTo(px, py) : g.moveTo(px, py); maxErr = Math.max(maxErr, Math.abs(ys[i] - a.ref(xs[i]))); }
+    g.stroke();
+    g.lineWidth = 1; g.setLineDash([4, 4]); g.beginPath();
+    for (let i = 0; i < N; i++) { const px = X(xs[i]), py = Y(a.ref(xs[i])); i ? g.lineTo(px, py) : g.moveTo(px, py); }
+    g.stroke();
+    lines += `${name.padEnd(10)} ${maxErr.toExponential(2)}\n`;
+  }
+  g.setLineDash([]); x.free();
+  $("act-out").textContent = lines.trimEnd();
+};
+
+// ---- 3. softmax
+$("sm-scale").oninput = e => $("sm-scale-v").textContent = e.target.value;
+$("sm-run").onclick = () => {
+  const s = +$("sm-scale").value, v = [1, 0.5, 0.25, 0, -0.5].map(u => u * s);
+  const naiveE = v.map(Math.exp), z = naiveE.reduce((p, q) => p + q, 0), naive = naiveE.map(e => e / z);
+  const t = T(v, [1, v.length]), r = t.softmax(-1), p = r.to_f32_vec(); t.free(); r.free();
+  const sum = Array.from(p).reduce((a, b) => a + b, 0);
+  $("sm-out").textContent =
+`logits: [${v.join(", ")}]
+Oxideon softmax: [${Array.from(p).map(fmt).join(", ")}]   sum = ${sum.toFixed(6)}
+naive JS softmax: [${naive.map(fmt).join(", ")}]${naive.some(Number.isNaN) ? "   <- NaN: exp overflowed" : ""}`;
+};
+
+// ---- 4. XOR network
+$("nn-k").oninput = e => $("nn-k-v").textContent = e.target.value;
+$("nn-run").onclick = () => {
+  const k = +$("nn-k").value, G = 64, P = G * G, pts = new Float32Array(P * 2);
+  for (let i = 0; i < G; i++) for (let j = 0; j < G; j++) { pts[(i * G + j) * 2] = -1 + 2 * (j + .5) / G; pts[(i * G + j) * 2 + 1] = 1 - 2 * (i + .5) / G; }
+  // hidden = relu([x+y, -(x+y), x-y, y-x]); f = |x+y| - |x-y| has the sign of x*y
+  const W1 = T([1, -1, 1, -1, 1, -1, -1, 1], [2, 4]), b1 = T([0, 0, 0, 0], [1, 4]);
+  const W2 = T([k, -k, k, -k, -k, k, -k, k], [4, 2]), b2 = T([0, 0], [1, 2]);
+  const X = T(pts, [P, 2]);
+  const [probs, ms] = time(() => {
+    const h = X.matmul(W1).add(b1).relu();
+    const o = h.matmul(W2).add(b2);
+    return o.softmax(-1);
+  });
+  const p = probs.to_f32_vec(); probs.free(); X.free();
+  const cv = $("nn-cv"), g = cv.getContext("2d"), img = g.createImageData(G, G);
+  cv.width = G; cv.height = G;
+  let right = 0;
+  for (let i = 0; i < P; i++) {
+    const p1 = p[i * 2], x = pts[i * 2], y = pts[i * 2 + 1];
+    img.data.set([Math.round(244 * p1 + 59 * (1 - p1)), Math.round(114 * p1 + 130 * (1 - p1)), Math.round(182 * p1 + 246 * (1 - p1)), 255], i * 4);
+    if ((p1 > .5) === (x * y > 0)) right++;
+  }
+  g.putImageData(img, 0, 0);
+  $("nn-out").textContent = `4096 points through the network in ${ms.toFixed(2)} ms\n${right} of 4096 points classified correctly (${(100 * right / P).toFixed(1)}%)\nclass 1 (x and y have the same sign) in pink, class 0 in blue`;
+};
+</script>
 </body>
 </html>

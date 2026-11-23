@@ -1,11 +1,14 @@
 name: Deploy browser demo (GitHub Pages)
 
-# Publishes examples/browser_demo/ at https://voidstackloop.github.io/oxideon/
+# Builds the WebAssembly module and publishes examples/browser_demo/ at https://voidstackloop.github.io/oxideon/
 # One-time setup: repository Settings -> Pages -> Source: "GitHub Actions".
 on:
   push:
     branches: [main]
-    paths: ["examples/browser_demo/**", ".github/workflows/pages.yml"]
+    paths:
+      - "examples/browser_demo/**"
+      - "crates/oxideon-core/src/wasm.rs"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -25,9 +28,22 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build the WebAssembly module
+        run: cargo build --release --lib --target wasm32-unknown-unknown --no-default-features --features wasm
+      - name: Generate the JavaScript bindings (same wasm-bindgen version as Cargo.lock)
+        run: |
+          version=$(grep -A1 'name = "wasm-bindgen"$' Cargo.lock | grep -m1 version | cut -d'"' -f2)
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          mkdir -p site
+          cp examples/browser_demo/index.html site/
+          wasm-bindgen target/wasm32-unknown-unknown/release/oxideon.wasm --target web --out-dir site/pkg
+          ls -la site site/pkg
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: examples/browser_demo
+          path: site
       - id: deployment
         uses: actions/deploy-pages@v4

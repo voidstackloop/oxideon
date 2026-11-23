@@ -109,4 +109,4 @@ run with `cargo run --release --example <name>`.
 
 ### Browser
 
-`browser_demo/index.html` — static mock-up page for an in-browser inference UI (open directly in a browser); it is simulated: it loads no model and its timings are fixed.
+`browser_demo/` — four live demos (matmul speed and accuracy, activation curves, overflow-safe softmax, a small network forward pass) running the real Oxideon library compiled to WebAssembly; build steps in its README, live at https://voidstackloop.github.io/oxideon/.

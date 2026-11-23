@@ -20,3 +20,4 @@ a.out
 *.tmp
 *.tmp.*
 *.bak.tmp
+examples/browser_demo/pkg/
