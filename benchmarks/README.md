@@ -7,7 +7,7 @@ Reproducible performance benchmarks comparing Oxideon (`--release`) against PyTo
 | Script | Scope |
 |---|---|
 | [`bench_vs_pytorch.py`](bench_vs_pytorch.py) | Core ops, norms, `Conv2d`, and `MLP` forward+backward vs PyTorch |
-| [`core_ops_bench_compare.py`](core_ops_bench_compare.py) | Core Rust vs PyTorch operation comparison runner: time and numerical error (worst / mean, vs a float64 reference) side by side |
+| [`core_ops_bench_compare.py`](core_ops_bench_compare.py) | Core Rust vs PyTorch comparison: time and numerical error (worst / mean, vs a float64 reference) per operation, with matrix products, convolutions and gelu run once per precision mode (`--markdown`, `--repeat N`, `--modes`) |
 | [`accuracy_vs_pytorch.py`](accuracy_vs_pytorch.py) | Numerical error of 40 operations vs a float64 reference, oxideon next to PyTorch (needs `cargo build --release --example accuracy_dump`) |
 | [`core_ops_bench_torch.py`](core_ops_bench_torch.py) | PyTorch reference timings for core operations |
 | [`ops_bench.py`](ops_bench.py) | Tensor op microbenchmarks |

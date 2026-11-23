@@ -262,36 +262,59 @@ Matrix products and convolutions trade accuracy for speed through one switch, `o
 
 ### Speed
 
-Best of several runs, microseconds, each benchmark in its own process (so power throttling of a long run does not distort later rows). `ratio` is Oxideon's time divided by PyTorch's (below 1 is faster). The last columns repeat the numerical error of the same operation from the table above.
+Microseconds, best of several runs, each benchmark in its own process (so power throttling of a long run does not distort later rows) and the best of two such passes. `time ratio` is Oxideon's time divided by PyTorch's (below 1 is faster). The error columns repeat the numerical error of the same operation ("x better": PyTorch's error divided by Oxideon's; below 1 means PyTorch is more accurate).
 
-op                            oxideon us    torch us   ratio
-add 1M                              40.6        47.2    0.86
-mul 1M                              39.2        48.0    0.82
-add broadcast row 1M                36.6        26.5    1.38
-mul_scalar 1M                       33.1        29.6    1.12
-exp 1M                              68.3        42.6    1.60
-tanh 1M                            182.6       247.1    0.74
-gelu 1M                            182.8       108.3    1.69
-relu 1M                             33.3        28.2    1.18
-sum 1M                              21.1        24.4    0.86
-sum axis0 1M                        38.1        37.9    1.01
-sum axis1 1M                        24.9        28.1    0.89
-max axis1 1M                        54.4       105.4    0.52
-softmax 1M                         120.2       129.1    0.93
-transpose+contiguous 1M            484.9       764.5    0.63
-add transposed 1M                  258.2       344.9    0.75
-matmul 512                         390.8       392.0    1.00
-matmul 1024                       3312.6      3045.3    1.09
-matmul 256x4096x256                955.6       803.5    1.19
-conv2d 8x16x64x64 k3               685.5       521.9    1.31
-max_pool2d                          96.8       206.6    0.47
-layer_norm 32x128x256               51.6        79.5    0.65
-index_select 4096 rows             155.6       127.7    1.22
-cat 2x1M                            57.3        72.4    0.79
-small add 64 (overhead)              0.6         1.2    0.50
-small matmul 8x8                     1.1         3.5    0.31
-mlp train step b256                992.9       832.3    1.19
-autograd elementwise chain         661.5       892.7    0.74
+Matrix products, convolutions and `gelu` depend on the precision mode, so they are shown once per mode: `fastest` is PyTorch-class in speed and accuracy (on matrix products slightly less accurate, 0.8-0.9x), `balanced` (the default) keeps PyTorch-class speed and is 1.5-4.6x more accurate, `highest` accumulates in float64 for 6-19x lower error at 2-8x the time. Every other operation is the same in all three modes.
+
+| operation | precision mode | Oxideon us | PyTorch us | time ratio | error worst (x better) | error mean (x better) |
+|---|---|---:|---:|---:|---:|---:|
+| gelu 1M | fastest | 101.5 | 108.6 | 0.93 | 18.04x | 143.73x |
+|  | balanced (default) | 135.0 | 108.6 | 1.24 | 22.32x | 905.37x |
+|  | highest | 135.2 | 108.6 | 1.24 | 22.32x | 905.37x |
+| matmul 512 | fastest | 324.9 | 398.9 | 0.81 | 0.93x | 0.85x |
+|  | balanced (default) | 371.1 | 398.9 | 0.93 | 2.35x | 1.66x |
+|  | highest | 934.3 | 398.9 | 2.34 | 11.39x | 10.59x |
+| matmul 1024 | fastest | 2728.3 | 3116.8 | 0.88 | - | - |
+|  | balanced (default) | 2986.2 | 3116.8 | 0.96 | - | - |
+|  | highest | 6632.5 | 3116.8 | 2.13 | - | - |
+| matmul 256x4096x256 | fastest | 736.4 | 992.4 | 0.74 | 0.79x | 0.82x |
+|  | balanced (default) | 850.9 | 992.4 | 0.86 | 1.64x | 1.58x |
+|  | highest | 2700.3 | 992.4 | 2.72 | 6.09x | 11.90x |
+| conv2d 8x16x64x64 k3 | fastest | 490.5 | 544.7 | 0.90 | 1.96x | 1.22x |
+|  | balanced (default) | 636.9 | 544.7 | 1.17 | 2.69x | 1.54x |
+|  | highest | 4193.9 | 544.7 | 7.70 | 12.68x | 8.74x |
+| conv2d 4x64x56x56 k3 | fastest | 1227.9 | 1401.0 | 0.88 | 2.09x | 1.43x |
+|  | balanced (default) | 1453.7 | 1401.0 | 1.04 | 4.58x | 2.67x |
+|  | highest | 6361.1 | 1401.0 | 4.54 | 19.42x | 17.14x |
+| mlp train step b256 | fastest | 809.0 | 866.2 | 0.93 | - | - |
+|  | balanced (default) | 943.9 | 866.2 | 1.09 | - | - |
+|  | highest | 2093.9 | 866.2 | 2.42 | - | - |
+
+| operation (same in every mode) | Oxideon us | PyTorch us | time ratio | error worst (x better) | error mean (x better) |
+|---|---:|---:|---:|---:|---:|
+| add 1M | 40.1 | 48.1 | 0.83 | exact | exact |
+| mul 1M | 42.0 | 47.2 | 0.89 | exact | exact |
+| add broadcast row 1M | 33.3 | 27.1 | 1.23 | exact | exact |
+| mul_scalar 1M | 31.8 | 31.5 | 1.01 | exact | exact |
+| exp 1M | 67.9 | 41.0 | 1.66 | 1.06x | 0.99x |
+| tanh 1M | 184.2 | 249.2 | 0.74 | 1.00x | 1.00x |
+| relu 1M | 32.9 | 28.3 | 1.16 | exact | exact |
+| sum 1M | 19.4 | 20.0 | 0.97 | tie | tie |
+| sum axis0 1M | 37.5 | 31.0 | 1.21 | 3.53x | 2.00x |
+| sum axis1 1M | 24.8 | 20.4 | 1.22 | 3.82x | 2.09x |
+| max axis1 1M | 53.8 | 95.6 | 0.56 | exact | exact |
+| softmax 1M | 118.1 | 127.5 | 0.93 | 7.70x | 8.54x |
+| transpose+contiguous 1M | 512.1 | 765.2 | 0.67 | exact | exact |
+| add transposed 1M | 272.4 | 305.9 | 0.89 | exact | exact |
+| max_pool2d | 106.7 | 199.7 | 0.53 | exact | exact |
+| layer_norm 32x128x256 | 50.7 | 53.3 | 0.95 | 384.80x | 680.76x |
+| index_select 4096 rows | 114.3 | 132.2 | 0.86 | exact | exact |
+| cat 2x1M | 57.4 | 70.1 | 0.82 | exact | exact |
+| small add 64 (overhead) | 0.5 | 1.2 | 0.42 | - | - |
+| small matmul 8x8 | 0.9 | 4.8 | 0.19 | - | - |
+| autograd elementwise chain | 648.8 | 819.3 | 0.79 | - | - |
+
+Where Oxideon is slower than PyTorch (default mode, more than 10% over): gelu 1M (1.24x), conv2d 8x16x64x64 k3 (1.17x), add broadcast row 1M (1.23x), exp 1M (1.66x), relu 1M (1.16x), sum axis0 1M (1.21x), sum axis1 1M (1.22x).
 
 Operations whose result is a single correctly rounded IEEE operation (add, mul, relu, copies ...) are `exact` in both libraries. Run-to-run noise is about 10-15%.
 

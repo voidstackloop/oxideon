@@ -146,7 +146,7 @@ kernel and other architectures always use the accurate form. Second, the accurat
 normalizations (`batch_norm`, `group_norm`, `var`, `std`, the `LayerNorm`/`BatchNorm` layers): `Fastest` skips the two extra
 passes that recover the rounded mean, `Balanced` and `Highest` keep them (see `Tensor::centered_by_mean`). Convolutions:
 `Fastest` sums the input channels of the Winograd kernel in one FMA chain; `Balanced` sums them in 4-channel chains whose totals are
-added with TwoSum (about 1.3x the time for 16 input channels and 0.9x for 64, error roughly halved; from 32 input channels the chains are 8 deep, which is
+added with TwoSum (about 1.3x the time of `Fastest` for 16 input channels and 1.2x for 64, error roughly halved; from 32 input channels the chains are 8 deep, which is
 what keeps the 64-channel case under PyTorch's time at a small cost in accuracy: 4.64x -> 4.58x worst, 2.99x -> 2.67x mean better than PyTorch); `Highest` takes im2col + the f64 GEMM (about 8x the time of Winograd).
 
 ### What the modes cost
@@ -155,13 +155,13 @@ what keeps the 64-channel case under PyTorch's time at a small cost in accuracy:
 
 | benchmark | `Fastest` | `Balanced` | `Highest` | PyTorch |
 |---|---:|---:|---:|---:|
-| matmul 512 | 328 | 351 | 920 | 392 |
-| matmul 1024 | 2 630 | 2 643 | 6 451 | 3 086 |
-| matmul 256x4096x256 | 698 | 820 | 2 499 | 812 |
-| MLP train step, batch 256 | 777 | 888 | 1 920 | 876 |
-| conv2d 8x16x64x64 k3 | 484 | 664 | 4 105 | 512 |
-| conv2d 4x64x56x56 k3 | 1 190 | 1 467 | 6 279 | 1 529 |
-| gelu 1M | 101 | 135 | 134 | 111 |
+| matmul 512 | 325 | 371 | 934 | 399 |
+| matmul 1024 | 2 728 | 2 986 | 6 633 | 3 117 |
+| matmul 256x4096x256 | 736 | 851 | 2 700 | 992 |
+| MLP train step, batch 256 | 809 | 944 | 2 094 | 866 |
+| conv2d 8x16x64x64 k3 | 491 | 637 | 4 194 | 545 |
+| conv2d 4x64x56x56 k3 | 1 228 | 1 454 | 6 361 | 1 401 |
+| gelu 1M | 102 | 135 | 135 | 109 |
 | everything else in the suite (softmax, layer_norm, sum, exp ...) | unchanged | unchanged | unchanged |
 
 `Balanced` no longer costs a synchronization per 48-deep chain: when a product has several chains, one parallel region splits the output into
@@ -215,10 +215,10 @@ benchmarks read `OXI_KCHUNK=<depth>` for experiments.
 
 No switches: the accurate variants (f64 accumulation, hi/lo mean, `ln_1p` log-softmax, TwoSum-corrected softmax, correctly
 rounded `erf` via `libm` in f64) are always on, at no or small speed cost. Measured against PyTorch on the same machine:
-conv2d 1.3x the time of PyTorch for 16 channels and 0.96x for 64 (the TwoSum channel chains), layer_norm 0.65x (its variance sum used to be a scalar f32 chain; now eight
+conv2d 1.17x the time of PyTorch for 16 channels and 1.04x for 64 (the TwoSum channel chains), layer_norm 0.65x (its variance sum used to be a scalar f32 chain; now eight
 vector lanes, which is also more accurate: layer_norm of offset data went from 115x to 385x better than PyTorch), softmax 0.97x, gelu
-1.2x in `Balanced` (its tail-accurate erfc is what makes it ~22x better than PyTorch) and 0.9x in `Fastest`, which switches to the
-five-term Abramowitz-Stegun erfc (101 us vs PyTorch's ~111 us; still ~18x / ~140x better than PyTorch on worst / mean error), tanh 0.6x (faster than PyTorch's).
+1.24x in `Balanced` (its tail-accurate erfc is what makes it ~22x better than PyTorch) and 0.93x in `Fastest`, which switches to the
+five-term Abramowitz-Stegun erfc (102 us vs PyTorch's ~109 us; still ~18x / ~140x better than PyTorch on worst / mean error), tanh 0.6x (faster than PyTorch's).
 
 ## Techniques, per op
 
