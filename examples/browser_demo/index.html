@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Oxideon — Live Deep Learning in WebAssembly</title>
+<link rel="icon" type="image/svg+xml" href="./assets/oxideon-logo.svg">
 <style>
   :root {
     --bg: #0b0f19;
@@ -52,13 +53,16 @@
 </head>
 <body>
 <main>
-  <header>
+  <header style="display:flex;gap:1rem;align-items:center;">
+    <img src="./assets/oxideon-logo.svg" alt="Oxideon logo" width="60" height="60" style="border-radius:14px;flex-shrink:0;">
+    <div>
     <h1>Oxideon — Live Deep Learning in WebAssembly</h1>
     <p>Running the real <code>oxideon-core</code> tensor engine, reverse-mode autograd, and <code>AdamW</code> optimizer directly in your browser. Zero server calls.</p>
     <div class="badges">
       <a class="badge" href="https://github.com/voidstackloop/oxideon">GitHub</a>
       <a class="badge" href="https://pypi.org/project/oxideon/">pip install oxideon</a>
       <a class="badge" href="https://crates.io/crates/oxideon-core">cargo add oxideon-core</a>
+    </div>
     </div>
   </header>
 

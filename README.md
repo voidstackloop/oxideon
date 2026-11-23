@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/oxideon-logo.svg" alt="Oxideon logo" width="112" height="112">
+
 # Oxideon
 
 **A fast, Hackable Deep Learning & Tensor Library in Rust — with a PyTorch-friendly Python API.**

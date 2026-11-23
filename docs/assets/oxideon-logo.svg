@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Oxideon">
+  <defs>
+    <linearGradient id="oxWarm" x1="15%" y1="5%" x2="85%" y2="95%">
+      <stop offset="0%" stop-color="#FF9F43"/>
+      <stop offset="48%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#C2410C"/>
+    </linearGradient>
+    <linearGradient id="oxWarmHi" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FED7AA" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#F97316" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="oxCool" x1="15%" y1="95%" x2="85%" y2="5%">
+      <stop offset="0%" stop-color="#1D4ED8"/>
+      <stop offset="52%" stop-color="#0EA5E9"/>
+      <stop offset="100%" stop-color="#5EEAD4"/>
+    </linearGradient>
+    <linearGradient id="oxCoolHi" x1="100%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#BAE6FD" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#0EA5E9" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="oxSpark" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Sculpted interlocking warm Rust arc forming the upper-left crest of the "O" -->
+  <path d="M168 38
+           C132 18, 84 22, 54 54
+           C22 88, 20 144, 52 182
+           C64 196, 84 194, 90 178
+           C68 148, 68 106, 92 80
+           C114 56, 148 56, 174 72
+           C188 80, 196 52, 168 38 Z"
+        fill="url(#oxWarm)"/>
+
+  <!-- Top bevel highlight on the warm ribbon -->
+  <path d="M162 42
+           C129 25, 86 29, 59 58
+           C39 80, 32 110, 36 138
+           C42 104, 58 76, 84 58
+           C110 40, 140 38, 162 42 Z"
+        fill="url(#oxWarmHi)"/>
+
+  <!-- Sculpted interlocking compute-cyan arc forming the lower-right crest of the "O" -->
+  <path d="M88 218
+           C124 238, 172 234, 202 202
+           C234 168, 236 112, 204 74
+           C192 60, 172 62, 166 78
+           C188 108, 188 150, 164 176
+           C142 200, 108 200, 82 184
+           C68 176, 60 204, 88 218 Z"
+        fill="url(#oxCool)"/>
+
+  <!-- Bottom bevel highlight on the cool ribbon -->
+  <path d="M94 214
+           C127 231, 170 227, 197 198
+           C217 176, 224 146, 220 118
+           C214 152, 198 180, 172 198
+           C146 216, 116 218, 94 214 Z"
+        fill="url(#oxCoolHi)"/>
+
+  <!-- Minimal faceted tensor diamond core -->
+  <polygon points="128,96 156,128 128,160 100,128" fill="url(#oxSpark)"/>
+  <polygon points="128,96 156,128 128,128" fill="#FFFFFF" fill-opacity="0.22"/>
+</svg>

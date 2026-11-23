@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -88,9 +92,16 @@ jobs:
         os: [ubuntu-24.04, windows-latest, macos-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         exclude:
-          # Not verified that actions/setup-python offers 3.9 for the Apple Silicon runners; remove to try it.
+          # Wheel is abi3-py39 (identical binary across Python 3.9–3.13); Ubuntu and Windows test every version
+          # while macOS tests 3.12 to avoid competing for limited hosted macOS runner concurrency.
           - os: macos-latest
             python: "3.9"
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.13"
     defaults:
       run:
         shell: bash

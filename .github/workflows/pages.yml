@@ -37,8 +37,9 @@ jobs:
         run: |
           version=$(grep -A1 'name = "wasm-bindgen"$' Cargo.lock | grep -m1 version | cut -d'"' -f2)
           cargo install wasm-bindgen-cli --version "$version" --locked
-          mkdir -p site
+          mkdir -p site/assets
           cp examples/browser_demo/index.html site/
+          cp docs/assets/oxideon-logo.svg site/assets/oxideon-logo.svg
           wasm-bindgen target/wasm32-unknown-unknown/release/oxideon.wasm --target web --out-dir site/pkg
           ls -la site site/pkg
       - uses: actions/configure-pages@v5

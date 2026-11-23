@@ -123,9 +123,16 @@ jobs:
           - os: macos-latest
             artifact: wheels-macos-aarch64
         exclude:
-          # Not verified that actions/setup-python offers 3.9 for the Apple Silicon runners; remove to try it.
+          # Wheel is abi3-py39; Ubuntu and Windows verify Python 3.9–3.13 while macOS verifies 3.12
+          # so release jobs don't stall behind macOS hosted runner queue limits.
           - os: macos-latest
             python: "3.9"
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.13"
     defaults:
       run:
         shell: bash
