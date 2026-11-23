@@ -4506,9 +4506,11 @@ tensors = {
     "embd": ox.Tensor.randn([16, 8]),
     "proj": ox.Tensor.randn([8, 8]),
 }
-ox.save_gguf("/tmp/test_py.gguf", tensors, {"arch": "test_model"})
+import os, tempfile
+gguf_path = os.path.join(tempfile.mkdtemp(), "test_py.gguf")
+ox.save_gguf(gguf_path, tensors, {"arch": "test_model"})
 
-gguf = ox.GGUFFile.open("/tmp/test_py.gguf")
+gguf = ox.GGUFFile.open(gguf_path)
 assert gguf.version == 3
 assert gguf.alignment == 32
 assert "embd" in gguf.tensor_names

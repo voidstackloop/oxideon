@@ -40,10 +40,29 @@ NAMES = re.findall(r'bench\("([^"]+)"', (ROOT / "examples/core_ops_bench.rs").re
 ALL_MODES = ["fastest", "balanced", "highest"]
 MARKDOWN = "--markdown" in sys.argv
 WITH_ACCURACY = "--no-accuracy" not in sys.argv
-MODES = ALL_MODES
-REPEAT = int(sys.argv[sys.argv.index("--repeat") + 1]) if "--repeat" in sys.argv else 1
-if "--modes" in sys.argv:
-    MODES = sys.argv[sys.argv.index("--modes") + 1].split(",")
+
+
+def option(flag, default):
+    """The value after `flag` (a usage error if there is none)."""
+    if flag not in sys.argv:
+        return default
+    i = sys.argv.index(flag)
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        sys.exit(f"{flag} needs a value (see the docstring of {Path(__file__).name})")
+    return sys.argv[i + 1]
+
+
+MODES = option("--modes", ",".join(ALL_MODES)).split(",")
+for _mode in MODES:
+    # Oxideon only warns about an unknown OXIDEON_PRECISION and runs in balanced, which would label balanced numbers with the typo
+    if _mode not in ALL_MODES:
+        sys.exit(f"unknown precision mode {_mode!r}; use a comma-separated list of {', '.join(ALL_MODES)}")
+try:
+    REPEAT = int(option("--repeat", "1"))
+except ValueError:
+    sys.exit("--repeat needs a whole number")
+if REPEAT < 1:
+    sys.exit("--repeat needs a positive number")
 
 # benchmarks whose time depends on the precision mode (the others are measured once, in the default mode)
 MODE_DEPENDENT = {"gelu 1M", "matmul 512", "matmul 1024", "matmul 256x4096x256", "conv2d 8x16x64x64 k3", "conv2d 4x64x56x56 k3", "mlp train step b256"}

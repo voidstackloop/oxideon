@@ -256,7 +256,9 @@ impl TrainLoop {
                     if self.config.checkpoint_every > 0 && step % self.config.checkpoint_every == 0 && self.checkpoints.is_some() {
                         let (e, m) = if epoch_over { (epoch + 1, 0) } else { (epoch, micro) };
                         let st = self.snapshot(model, opt, e, step, m)?;
-                        self.checkpoints.as_mut().unwrap().save(&st, false)?;
+                        if let Some(ck) = self.checkpoints.as_mut() {
+                            ck.save(&st, false)?;
+                        }
                     }
                     let mut stop = done(step, &self.config);
                     for cb in &mut self.callbacks {

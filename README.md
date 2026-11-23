@@ -30,6 +30,15 @@ Most deep learning stacks force a trade-off: either you use Python on top of a m
 
 ## Getting Started
 
+### Install from PyPI
+
+```bash
+pip install oxideon        # prebuilt wheels: Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), Windows (x86_64); Python 3.9+
+```
+
+One wheel serves every supported Python version (the extension is `abi3`). On other platforms `pip` builds from the source
+distribution, which needs a Rust toolchain (1.85+).
+
 ### Build from source (Python + Rust)
 
 ```bash
@@ -350,7 +359,7 @@ Environment notes (mostly Windows):
   cannot show them, run Python with `-X utf8` (or set `PYTHONUTF8=1`).
 - **CUDA kernels.** The `.cu` kernels need NVRTC. Without it the CUDA tests print `skipped: no CUDA device / NVRTC` and pass, and the
   operations fall back to the host. Install it with `pip install --target <dir> nvidia-cuda-nvrtc-cu12` and set
-  `OXIDEON_NVRTC_SITE=<dir>` (see `backend/nvrtc.rs` for the search order); `cuda_bench` then reports its launched kernels.
+  `OXIDEON_NVRTC_SITE=<dir>` (see `backend/nvrtc.rs` for the search order); `cuda_bench` then reports its launched kernels. Set `OXIDEON_REQUIRE_CUDA=1` on a machine that has a GPU so that `cuda_end_to_end` fails, instead of skipping, when NVRTC is missing.
 - **Interop example.** `examples/python_interop_showcase.py` also needs `pillow`, `pandas`, `polars`, `networkx` and `sympy`.
 
 ---

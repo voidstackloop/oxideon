@@ -200,7 +200,7 @@ mod tests {
         let x = Tensor::randn(&[3, 4]).unwrap();
 
         let eager = l2.forward(&l1.forward(&x).unwrap().relu().unwrap()).unwrap();
-        let compiled = trace_and_compile(&[x.clone()], |ins| {
+        let compiled = trace_and_compile(std::slice::from_ref(&x), |ins| {
             let h = l1.forward(&ins[0])?.relu()?;
             Ok(vec![l2.forward(&h)?])
         })
@@ -216,7 +216,7 @@ mod tests {
     fn unsupported_ops_are_rejected_instead_of_frozen_into_constants() {
         let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
         // `sum_axis` has no graph lowering: tracing must say so, not bake in this call's value
-        let r = trace_and_compile(&[x.clone()], |ins| Ok(vec![ins[0].sum_axis(1, false)?]));
+        let r = trace_and_compile(std::slice::from_ref(&x), |ins| Ok(vec![ins[0].sum_axis(1, false)?]));
         assert!(r.is_err(), "an unsupported op must not silently trace");
         assert!(format!("{:?}", r.err().unwrap()).contains("not supported"));
     }
@@ -228,10 +228,10 @@ mod tests {
         let w = Tensor::randn(&[4, 3, 3, 3]).unwrap();
         let b = Tensor::randn(&[4]).unwrap();
         for (stride, pad, dil) in [((1, 1), (1, 1), (1, 1)), ((2, 2), (1, 1), (1, 1)), ((1, 2), (0, 2), (1, 1)), ((1, 1), (2, 2), (2, 2)), ((3, 2), (0, 1), (1, 1))] {
-            let compiled = trace_and_compile(&[x.clone()], |ins| Ok(vec![ins[0].conv2d(&w, Some(&b), stride, pad, dil)?])).unwrap();
+            let compiled = trace_and_compile(std::slice::from_ref(&x), |ins| Ok(vec![ins[0].conv2d(&w, Some(&b), stride, pad, dil)?])).unwrap();
             // different data than the traced call: the lowered conv must be the real conv, not a replay
             let x2 = Tensor::randn(&[2, 3, 11, 10]).unwrap();
-            let got = compiled.run(&[x2.clone()]).unwrap()[0].to_vec::<f32>().unwrap();
+            let got = compiled.run(std::slice::from_ref(&x2)).unwrap()[0].to_vec::<f32>().unwrap();
             let want = x2.conv2d(&w, Some(&b), stride, pad, dil).unwrap().to_vec::<f32>().unwrap();
             for (a, b) in got.iter().zip(&want) {
                 assert!((a - b).abs() < 1e-3, "stride {stride:?} pad {pad:?} dil {dil:?}: {a} vs {b}");

@@ -80,7 +80,7 @@ mod tests {
         let x = Tensor::from_slice(&[1.0f32; 64], &[64]).unwrap();
         x.set_requires_grad(true).unwrap();
         let d = std::sync::Arc::clone(&drop);
-        let y = checkpoint(move |ins| d.forward(&ins[0]), &[x.clone()]).unwrap();
+        let y = checkpoint(move |ins| d.forward(&ins[0]), std::slice::from_ref(&x)).unwrap();
         let before = crate::rng::get_rng_state();
         y.sum().unwrap().backward().unwrap();
         // x = 1, so y is exactly the mask and d(sum y)/dx must be that same mask

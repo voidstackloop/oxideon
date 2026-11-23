@@ -132,14 +132,16 @@ pub fn precision_mode() -> PrecisionMode {
     if v != MODE_UNSET {
         return from(v);
     }
-    let mode = match std::env::var("OXIDEON_PRECISION") {
+    // threads that reach this point together all get the same answer, and the warning is printed once
+    static FROM_ENV: std::sync::OnceLock<PrecisionMode> = std::sync::OnceLock::new();
+    let mode = *FROM_ENV.get_or_init(|| match std::env::var("OXIDEON_PRECISION") {
         Ok(n) => PrecisionMode::parse(&n).unwrap_or_else(|| {
             // a typo must not silently change the numerics
             eprintln!("oxideon: ignoring OXIDEON_PRECISION={n:?} (expected fastest, balanced or highest); using balanced");
             PrecisionMode::Balanced
         }),
         Err(_) => PrecisionMode::Balanced,
-    };
+    });
     // a concurrent explicit `set_precision_mode` wins over the environment
     let _ = PRECISION.compare_exchange(MODE_UNSET, mode as u8, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
     from(PRECISION.load(std::sync::atomic::Ordering::Relaxed))

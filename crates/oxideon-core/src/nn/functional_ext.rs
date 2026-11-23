@@ -841,7 +841,7 @@ mod fused_layer_norm_tests {
         let second = |f: &dyn Fn(&Tensor) -> Tensor| {
             let x = t(4 * 6, &[4, 6], 0.5).requires_grad_(true);
             let y = f(&x).mul(&t(24, &[4, 6], 7.0)).unwrap().sum().unwrap();
-            let g = crate::tensor::grad(&[y], &[x.clone()], None, true).unwrap()[0].clone().unwrap();
+            let g = crate::tensor::grad(&[y], std::slice::from_ref(&x), None, true).unwrap()[0].clone().unwrap();
             let z = g.square().unwrap().sum().unwrap();
             crate::tensor::grad(&[z], &[x], None, false).unwrap()[0].clone().unwrap()
         };

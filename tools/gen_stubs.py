@@ -1157,7 +1157,7 @@ def main():
         if _e.startswith('    "') and _e.endswith('",'):
             _have.add(_e[5:-2])
     init_py[-2:-2] = ['    "' + s + '",' for s in submods if s not in _have]
-    (PKG / "__init__.py").write_text("\n".join(init_py), encoding="utf-8")
+    (PKG / "__init__.py").write_text("\n".join(init_py), encoding="utf-8", newline="\n")
 
     stats = {"typed": 0, "any": 0}
     stubs = [
@@ -1196,7 +1196,7 @@ def main():
             stubs += [f"{s}: Any", ""]
     text = "\n".join(stubs)
     ast.parse(text)  # the stub must at least be valid Python
-    (PKG / "__init__.pyi").write_text(text, encoding="utf-8")
+    (PKG / "__init__.pyi").write_text(text, encoding="utf-8", newline="\n")
     total = stats["typed"] + stats["any"]
     print(f"{len(public)} public symbols; {stats['typed']}/{total} signatures typed, {stats['any']} fall back to Any")
 

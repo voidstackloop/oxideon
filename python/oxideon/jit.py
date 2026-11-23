@@ -255,9 +255,13 @@ class CompiledCallable:
         self.backend = backend
         self.fullgraph = fullgraph
         self._cache: Dict[Tuple[Any, ...], Any] = {}
+        self._eager_keys: set = set()  # input signatures whose tracing failed, so they run eagerly
         functools.update_wrapper(self, fn)
-        # True once a call has been traced into a graph; stays False while every call runs eagerly (tracing failed)
-        self._compiled = False
+
+    @property
+    def _compiled(self) -> bool:
+        """True while every input signature seen so far has been traced into a graph (and there is at least one)."""
+        return bool(self._cache) and not self._eager_keys
 
     def _sig(self, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
         sig = []
@@ -279,12 +283,12 @@ class CompiledCallable:
             from .fx import symbolic_trace
             gm = symbolic_trace(self.fn)
             self._cache[key] = gm
-            self._compiled = True
             return gm(*args)
         except Exception:
             if self.fullgraph:
                 raise
             self._cache[key] = self.fn
+            self._eager_keys.add(key)
             return self.fn(*args)
 
 

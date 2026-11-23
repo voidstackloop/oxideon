@@ -61,7 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     defaults:
       run:
         shell: bash
@@ -83,8 +83,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
+      # ubuntu-latest is now 26.04, which setup-python has no Python 3.9 for: the wheel jobs are pinned to 24.04
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest, macos-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         exclude:
           # Not verified that actions/setup-python offers 3.9 for the Apple Silicon runners; remove to try it.
@@ -109,7 +110,7 @@ jobs:
           python tests/test_python_package.py
           python tests/test_python_ergonomics.py
       - name: Stub freshness
-        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        if: matrix.os == 'ubuntu-24.04' && matrix.python == '3.12'
         run: |
           python tools/gen_stubs.py
           git diff --exit-code -- python/oxideon

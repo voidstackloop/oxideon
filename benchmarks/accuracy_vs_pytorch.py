@@ -13,6 +13,7 @@ Set OXIDEON_PRECISION=fastest|balanced|highest to choose oxideon's matmul mode (
 """
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -200,6 +201,13 @@ def verdict_of(bw, bm):
 def measure(only=()):
     """Runs the cases (all, or the names in `only`); returns {name: (worst_ox, worst_torch, x_better, mean_ox, mean_torch, x_better, verdict)}."""
     work = Path(tempfile.mkdtemp(prefix="oxideon_accuracy_"))
+    try:
+        return _measure(only, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)  # the inputs and outputs are tens of megabytes per run
+
+
+def _measure(only, work):
     manifest = []
     selected = {k: v for k, v in cases.items() if not only or k in only}
     for name, (inputs, _, _) in selected.items():

@@ -9,6 +9,9 @@ use oxideon_core::{DType, Device, Tensor};
 fn ready() -> bool {
     let ok = oxideon_core::backend::cuda_rt::available();
     if !ok {
+        // a machine that is meant to run these tests (CI with a GPU) sets OXIDEON_REQUIRE_CUDA so that a missing NVRTC fails them
+        // instead of letting every test in this file pass without running
+        assert!(std::env::var_os("OXIDEON_REQUIRE_CUDA").is_none(), "OXIDEON_REQUIRE_CUDA is set but there is no CUDA device / NVRTC");
         eprintln!("skipped: no CUDA device / NVRTC");
     }
     ok
@@ -341,11 +344,14 @@ fn fused_attention_matches_the_composed_path() {
     same_on_both("attention with gradients", &[rnd(&[2, 5, 8], 11.0), rnd(&[2, 6, 8], 12.0), rnd(&[2, 6, 8], 13.0)], |x| sdpa(&x[0], &x[1], &x[2], None, false, None).unwrap(), 5e-5);
 }
 
-/// A masked-fill on the CUDA device whose GPU kernel declines (broadcast mask) must still return CUDA storage: its result feeds a
-/// matmul, which fails with "cuda:0 vs cuda:0" if the fallback hands back a host-backed tensor.
+/// A masked fill on the CUDA device must return CUDA storage whether the GPU kernel runs or not: without NVRTC the operation takes the
+/// host fallback, and its result feeds a matmul, which failed with "cuda:0 vs cuda:0" when the fallback handed back a host-backed
+/// tensor. The test needs a CUDA device only, so it covers both the kernel (NVRTC present) and the fallback (NVRTC missing).
 #[test]
-fn where_cond_fallback_stays_on_the_cuda_storage() {
-    if !ready() {
+fn where_cond_result_stays_on_the_cuda_storage() {
+    if !oxideon_core::backend::cuda_driver::cuda_available() {
+        assert!(std::env::var_os("OXIDEON_REQUIRE_CUDA").is_none(), "OXIDEON_REQUIRE_CUDA is set but there is no CUDA device");
+        eprintln!("skipped: no CUDA device");
         return;
     }
     let (l, e) = (64usize, 16usize);

@@ -29,6 +29,8 @@ fn fast_conv_paths_match_the_generic_path() {
         (1, 8, 6, 6, 8, 3, 1, 3, 1, false),    // winograd, padding wider than a tile
         (5, 9, 5, 30, 11, 3, 1, 0, 1, true),    // winograd, wide, batch > micro-batch
         (1, 72, 6, 6, 70, 3, 1, 1, 1, false),   // winograd, channels too large for the small-product kernel
+        (1, 32, 9, 9, 32, 3, 1, 1, 1, true),    // winograd, small kernel with 8-deep channel chains
+        (2, 36, 8, 10, 5, 3, 1, 1, 1, false),   // winograd, 8-deep chains plus a short last chain, c_out % 4 != 0
         (2, 8, 15, 15, 8, 3, 2, 1, 1, true),    // strided
         (2, 6, 14, 14, 5, 3, 1, 2, 2, true),    // dilated
         (4, 5, 6, 6, 7, 1, 1, 0, 1, true),      // 1x1
@@ -55,5 +57,20 @@ fn fast_conv_paths_match_the_generic_path() {
         if let (Some(a), Some(b)) = (gb32, gb64) {
             assert!(max_err(&a, &b) < 5e-4, "{tag}: grad bias {}", max_err(&a, &b));
         }
+    }
+}
+
+/// The Winograd path sums the input channels in chains (4 deep below 32 channels, 8 deep from 32) whose totals are combined with
+/// TwoSum, the error of each combination starting the next chain. The result must stay within about a float32 half-ulp budget of the
+/// exact one (measured 0.6e-6 to 1.1e-6 on this scale, mostly from the transforms; a lost carry or a chain that skips the TwoSum shows
+/// up as several times that). It does not tell `Balanced` from `Fastest`: `benchmarks/accuracy_vs_pytorch.py` does.
+#[test]
+fn winograd_channel_chains_stay_accurate() {
+    for (ci, co) in [(16usize, 32usize), (64, 30), (33, 7)] {
+        let x = rnd(&[2, ci, 12, 12], 1.0);
+        let wt = rnd(&[co, ci, 3, 3], 2.0).mul_scalar(0.3).unwrap();
+        let run = |dt: DType| x.to_dtype(dt).unwrap().conv2d(&wt.to_dtype(dt).unwrap(), None, (1, 1), (1, 1), (1, 1)).unwrap();
+        let err = max_err(&run(DType::F32), &run(DType::F64));
+        assert!(err < 2e-6, "c_in {ci}, c_out {co}: error {err}");
     }
 }
