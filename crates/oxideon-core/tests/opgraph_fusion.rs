@@ -47,7 +47,7 @@ fn conv_bn_relu_followed_by_more_ops_and_with_other_consumers() {
         let y = eager_conv_bn(&x, &w, &b, &g, &be, &m, &v, eps).relu().unwrap();
         y.mul_scalar(3.0).unwrap().add(&y).unwrap()
     };
-    close("conv+bn+relu then more ops", &comp.run(&[x.clone()]).unwrap()[0], &want);
+    close("conv+bn+relu then more ops", &comp.run(std::slice::from_ref(&x)).unwrap()[0], &want);
     // a second input must work too (the fusion folded constants, not data)
     let x2 = rnd(&[2, 3, 6, 6], 50.0);
     let want2 = {

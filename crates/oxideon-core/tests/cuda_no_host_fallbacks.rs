@@ -66,7 +66,7 @@ fn cumprod_runs_on_the_gpu_including_zeros() {
     v[24] = 0.0;
     let x = Tensor::from_slice(&v, &[2, 6, 3]).unwrap();
     for axis in [0isize, 1, 2, -1] {
-        check(&format!("cumprod axis {axis}"), &[x.clone()], |t| t[0].cumprod(axis).unwrap());
+        check(&format!("cumprod axis {axis}"), std::slice::from_ref(&x), |t| t[0].cumprod(axis).unwrap());
     }
 }
 

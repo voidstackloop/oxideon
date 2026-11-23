@@ -48,8 +48,8 @@ fn second_derivatives_still_work() {
     // d²/dx² tanh(x) = -2 tanh(x) (1 - tanh(x)²)
     let x = rnd(100, 2.0).detach().requires_grad_(true);
     let y = x.tanh().unwrap().sum().unwrap();
-    let g = grad(&[y], &[x.clone()], None, true).unwrap().remove(0).unwrap();
-    let gg = grad(&[g.sum().unwrap()], &[x.clone()], None, false).unwrap().remove(0).unwrap();
+    let g = grad(&[y], std::slice::from_ref(&x), None, true).unwrap().remove(0).unwrap();
+    let gg = grad(&[g.sum().unwrap()], std::slice::from_ref(&x), None, false).unwrap().remove(0).unwrap();
     let t = x.detach().tanh().unwrap();
     let want = t.mul_scalar(-2.0).unwrap().mul(&t.square().unwrap().neg().unwrap().add_scalar(1.0).unwrap()).unwrap();
     close(&gg, &want, 1e-5, "tanh second derivative");
