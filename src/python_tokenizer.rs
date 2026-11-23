@@ -433,7 +433,7 @@ impl PyAutoTokenizer {
             crate::tokenizer::json::Json::parse(&text).map_err(err)
         };
         let msgs = to_json(&messages)?;
-        let tools_j = tools.as_ref().map(|t| to_json(t)).transpose()?;
+        let tools_j = tools.as_ref().map(&to_json).transpose()?;
         let mut extra: Vec<(String, crate::tokenizer::json::Json)> = Vec::new();
         if let Some(k) = kwargs {
             for (key, val) in k.iter() {
