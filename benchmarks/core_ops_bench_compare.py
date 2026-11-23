@@ -4,7 +4,7 @@ the numerical error of the same operation against a float64 reference (from `acc
 divided by oxideon's, so above 1 oxideon is more accurate).
 
     cargo build --release --example core_ops_bench --example accuracy_dump
-    python benchmarks/core_ops_bench_compare.py [--no-accuracy]
+    python benchmarks/core_ops_bench_compare.py [--no-accuracy] [--markdown]
 
 The accuracy case is the one named in the last column; its shape is not always the benchmark's. Operations whose result is one
 correctly rounded IEEE operation (add, mul, relu, copies ...) are `exact` in both libraries.
@@ -63,8 +63,23 @@ def error_columns(name):
     return f"{fx(bw):>9}{fx(bm):>9}  {case}"
 
 
-print(f"{'op':<28}{'oxideon us':>12}{'torch us':>12}{'ratio':>8}" + (f"{'err worst':>11}{'err mean':>9}  accuracy case" if acc else ""))
+MARKDOWN = "--markdown" in sys.argv
+if MARKDOWN:
+    print("| operation | Oxideon us | PyTorch us | ratio | error worst (x better) | error mean (x better) |")
+    print("|---|---:|---:|---:|---:|---:|")
+else:
+    print(f"{'op':<28}{'oxideon us':>12}{'torch us':>12}{'ratio':>8}" + (f"{'err worst':>11}{'err mean':>9}  accuracy case" if acc else ""))
 for n in NAMES:
     o = one([str(EXE)], n)
     t = one([sys.executable, str(ROOT / "benchmarks/core_ops_bench_torch.py")], n)
-    print(f"{n:<28}{o:>12.1f}{t:>12.1f}{o / t:>8.2f}{error_columns(n) if acc else ''}", flush=True)
+    if MARKDOWN:
+        case = ACCURACY.get(n)
+        if case == "exact":
+            w = m = "exact"
+        elif case in acc:
+            w, m = fx(acc[case][2]), fx(acc[case][5])
+        else:
+            w = m = "-"
+        print(f"| {n} | {o:.1f} | {t:.1f} | {o / t:.2f} | {w} | {m} |", flush=True)
+    else:
+        print(f"{n:<28}{o:>12.1f}{t:>12.1f}{o / t:>8.2f}{error_columns(n) if acc else ''}", flush=True)

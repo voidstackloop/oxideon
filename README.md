@@ -198,6 +198,114 @@ oxideon/
 
 ---
 
+## Accuracy and Speed vs PyTorch
+
+Measured against PyTorch 2.15 (CPU) on the same machine: float32 on the CPU (13th-gen Core i7, 10 cores, AVX2/FMA, a thermally limited laptop), Oxideon in its default `Balanced` precision mode. Every number below is reproducible with the commands at the end of this section.
+
+### Numerical error
+
+The error of each result is measured against a float64 reference on identical inputs, in units of 2^-24 (half an ulp at 1.0): relative to the true value for element-wise functions, and relative to the sum of the absolute terms for sums, matrix products and convolutions (so cancellation cannot hide an error). "x better" is PyTorch's error divided by Oxideon's, so above 1 Oxideon is more accurate.
+
+**40 operations: Oxideon is more accurate in 21 (12 of them by 2x or more), equal within 5% in 19, and less accurate in 0.**
+
+<details>
+<summary>All 40 operations (worst and mean error)</summary>
+
+| operation | worst: Oxideon | PyTorch | x better | mean: Oxideon | PyTorch | x better |
+|---|---:|---:|---:|---:|---:|---:|
+| `sum_1M` | 0.0001 | 0.0004 | tie | 0.0001 | 0.0004 | tie |
+| `sum_16M_offset` | 0.423 | 1.76 | 4.17x | 0.423 | 1.76 | 4.17x |
+| `mean_4M_offset` | 0.253 | 1.39 | 5.47x | 0.253 | 1.39 | 5.47x |
+| `sum_axis0` | 0.640 | 2.26 | 3.53x | 0.313 | 0.624 | 2.00x |
+| `sum_axis1` | 0.639 | 2.44 | 3.82x | 0.316 | 0.660 | 2.09x |
+| `dot_4M` | 0.0001 | 0.0033 | 55.75x | 0.0001 | 0.0033 | 55.75x |
+| `norm_4M` | 0.056 | 1271 | 22680.31x | 0.056 | 1271 | 22680.31x |
+| `matmul_512` | 1.02 | 2.40 | 2.35x | 0.127 | 0.211 | 1.66x |
+| `matmul_k8192` | 0.180 | 0.295 | 1.64x | 0.038 | 0.060 | 1.58x |
+| `softmax` | 8.93 | 68.78 | 7.70x | 1.40 | 11.98 | 8.54x |
+| `log_softmax` | 1.42 | 2814 | 1981.95x | 0.366 | 0.602 | 1.65x |
+| `logsumexp` | 0.972 | 1.02 | 1.05x | 0.368 | 0.369 | 1.00x |
+| `layer_norm_offset` | 12.91 | 4969 | 384.80x | 0.534 | 363 | 680.76x |
+| `exp` | 1.10 | 1.17 | 1.06x | 0.368 | 0.365 | 0.99x |
+| `tanh` | 0.996 | 0.996 | 1.00x | 0.133 | 0.133 | 1.00x |
+| `sigmoid` | 1.000 | 2.46 | 2.46x | 0.307 | 0.506 | 1.65x |
+| `gelu` | 7.55e+05 | 1.69e+07 | 22.32x | 2960 | 2.68e+06 | 905.37x |
+| `erf` | 0.998 | 1.12 | 1.13x | 0.283 | 0.284 | 1.00x |
+| `ln` | 1.01 | 1.32 | 1.30x | 0.358 | 0.360 | 1.01x |
+| `sqrt` | 1.000 | 1.000 | 1.00x | 0.360 | 0.360 | 1.00x |
+| `conv2d_16ch` | 2.06 | 5.56 | 2.69x | 0.218 | 0.336 | 1.54x |
+| `conv2d_64ch` | 1.09 | 4.97 | 4.58x | 0.124 | 0.331 | 2.67x |
+| `cumsum_1M` | 0.727 | 0.727 | 1.00x | 0.196 | 0.196 | 1.00x |
+| `sin` | 1.000 | 1.09 | 1.09x | 0.325 | 0.329 | 1.01x |
+| `cos` | 1.000 | 1.09 | 1.09x | 0.325 | 0.329 | 1.01x |
+| `log1p` | 1.00 | 1.04 | 1.04x | 0.360 | 0.360 | 1.00x |
+| `expm1` | 0.999 | 1.38 | 1.38x | 0.359 | 0.359 | 1.00x |
+| `softplus` | 0.999 | 2.00 | 2.00x | 0.323 | 0.389 | 1.20x |
+| `silu` | 1.00 | 2.79 | 2.78x | 0.353 | 0.523 | 1.48x |
+| `sinh` | 0.999 | 0.999 | 1.00x | 0.361 | 0.361 | 1.00x |
+| `cosh` | 1.000 | 1.000 | 1.00x | 0.368 | 0.368 | 1.00x |
+| `atan` | 0.997 | 1.38 | 1.38x | 0.335 | 0.337 | 1.01x |
+| `rsqrt` | 1.50 | 1.50 | 1.00x | 0.496 | 0.496 | 1.00x |
+| `pow_2_5` | 1.00 | 1.00 | 1.00x | 0.360 | 0.361 | 1.00x |
+| `var_offset` | 0.993 | 0.993 | 1.00x | 0.373 | 0.373 | 1.00x |
+| `batch_norm_offset` | 7.29 | 2034 | 278.83x | 0.533 | 480 | 900.52x |
+| `group_norm_offset` | 5.27 | 1882 | 357.13x | 0.521 | 521 | 1000.91x |
+| `cosine_sim` | 0.994 | 2294 | 2307.97x | 0.362 | 6.78 | 18.71x |
+| `normalize_l2` | 0.999 | 3.22 | 3.22x | 0.361 | 0.625 | 1.73x |
+| `mse` | 0.261 | 0.261 | 1.00x | 0.261 | 0.261 | 1.00x |
+
+The `gelu` row is dominated by the relative error deep in the negative tail, where the result is about 1e-15; both libraries are far from the floor there.
+
+</details>
+
+Matrix products and convolutions trade accuracy for speed through one switch, `oxideon.set_precision_mode("fastest" | "balanced" | "highest")` (or `OXIDEON_PRECISION`): `Fastest` is PyTorch-class in accuracy and time, `Balanced` (default) is 1.5-2.4x more accurate, `Highest` 6-19x. Details: [docs/NUMERICAL_ACCURACY.md](docs/NUMERICAL_ACCURACY.md).
+
+### Speed
+
+Best of several runs, microseconds, each benchmark in its own process (so power throttling of a long run does not distort later rows). `ratio` is Oxideon's time divided by PyTorch's (below 1 is faster). The last columns repeat the numerical error of the same operation from the table above.
+
+op                            oxideon us    torch us   ratio
+add 1M                              40.6        47.2    0.86
+mul 1M                              39.2        48.0    0.82
+add broadcast row 1M                36.6        26.5    1.38
+mul_scalar 1M                       33.1        29.6    1.12
+exp 1M                              68.3        42.6    1.60
+tanh 1M                            182.6       247.1    0.74
+gelu 1M                            182.8       108.3    1.69
+relu 1M                             33.3        28.2    1.18
+sum 1M                              21.1        24.4    0.86
+sum axis0 1M                        38.1        37.9    1.01
+sum axis1 1M                        24.9        28.1    0.89
+max axis1 1M                        54.4       105.4    0.52
+softmax 1M                         120.2       129.1    0.93
+transpose+contiguous 1M            484.9       764.5    0.63
+add transposed 1M                  258.2       344.9    0.75
+matmul 512                         390.8       392.0    1.00
+matmul 1024                       3312.6      3045.3    1.09
+matmul 256x4096x256                955.6       803.5    1.19
+conv2d 8x16x64x64 k3               685.5       521.9    1.31
+max_pool2d                          96.8       206.6    0.47
+layer_norm 32x128x256               51.6        79.5    0.65
+index_select 4096 rows             155.6       127.7    1.22
+cat 2x1M                            57.3        72.4    0.79
+small add 64 (overhead)              0.6         1.2    0.50
+small matmul 8x8                     1.1         3.5    0.31
+mlp train step b256                992.9       832.3    1.19
+autograd elementwise chain         661.5       892.7    0.74
+
+Operations whose result is a single correctly rounded IEEE operation (add, mul, relu, copies ...) are `exact` in both libraries. Run-to-run noise is about 10-15%.
+
+### Reproduce
+
+```bash
+cargo build --release --example core_ops_bench --example accuracy_dump
+python benchmarks/core_ops_bench_compare.py        # speed and error, side by side
+python benchmarks/accuracy_vs_pytorch.py           # all error cases
+OXIDEON_PRECISION=highest python benchmarks/accuracy_vs_pytorch.py matmul_512 conv2d_64ch
+```
+
+---
+
 ## Running Tests
 
 ```bash
