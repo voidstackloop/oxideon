@@ -4963,22 +4963,78 @@ impl_py_layer_params!(PyLinear, "Linear", opt_bias);
 #[pyclass(name = "Embedding", module = "oxideon")]
 pub struct PyEmbedding {
     inner: Embedding,
+    padding_idx: Option<usize>,
 }
 
 #[pymethods]
 impl PyEmbedding {
     #[new]
-    pub fn new(num_embeddings: usize, embedding_dim: usize) -> PyResult<Self> {
-        Ok(Self {
-            inner: Embedding::new(num_embeddings, embedding_dim).map_err(to_py_err)?,
-        })
+    #[pyo3(signature = (num_embeddings, embedding_dim, padding_idx=None))]
+    pub fn new(num_embeddings: usize, embedding_dim: usize, padding_idx: Option<isize>) -> PyResult<Self> {
+        let pad = match padding_idx {
+            None => None,
+            Some(p) => {
+                let n = num_embeddings as isize;
+                let idx = if p < 0 { n + p } else { p };
+                if idx < 0 || idx >= n {
+                    return Err(PyValueError::new_err(format!(
+                        "padding_idx ({p}) must be within [-{num_embeddings}, {num_embeddings})"
+                    )));
+                }
+                Some(idx as usize)
+            }
+        };
+        let mut inner = Embedding::new(num_embeddings, embedding_dim).map_err(to_py_err)?;
+        if let Some(p) = pad {
+            let mut m = vec![1.0f64; num_embeddings];
+            m[p] = 0.0;
+            let mask = Tensor::from_slice_on(&m, &[num_embeddings, 1], &inner.weight.device())
+                .map_err(to_py_err)?
+                .to_dtype(inner.weight.dtype())
+                .map_err(to_py_err)?;
+            let zeroed = crate::tensor::no_grad(|| inner.weight.mul(&mask)).map_err(to_py_err)?;
+            inner.weight = zeroed.requires_grad_(true);
+        }
+        Ok(Self { inner, padding_idx: pad })
     }
 
     pub fn forward(&self, py: Python<'_>, indices: &PyTensor) -> PyResult<PyTensor> {
+        let pad = self.padding_idx;
         let out = py
-            .detach(|| self.inner.forward(&indices.inner))
+            .detach(|| {
+                if let Some(p) = pad {
+                    let v = self.inner.num_embeddings();
+                    let mut m = vec![1.0f64; v];
+                    m[p] = 0.0;
+                    let mask = Tensor::from_slice_on(&m, &[v, 1], &self.inner.weight.device())?
+                        .to_dtype(self.inner.weight.dtype())?;
+                    let keep_inv = Tensor::from_slice_on(
+                        &m.iter().map(|&x| 1.0 - x).collect::<Vec<_>>(),
+                        &[v, 1],
+                        &self.inner.weight.device(),
+                    )?
+                    .to_dtype(self.inner.weight.dtype())?;
+                    let w_eff = self
+                        .inner
+                        .weight
+                        .mul(&mask)?
+                        .add(&self.inner.weight.detach().mul(&keep_inv)?)?;
+                    let idx_flat = indices.inner.reshape(&[indices.inner.numel()])?;
+                    let picked = w_eff.index_select(0, &idx_flat)?;
+                    let mut out_shape = indices.inner.shape().to_vec();
+                    out_shape.push(self.inner.embedding_dim());
+                    picked.reshape(&out_shape)
+                } else {
+                    self.inner.forward(&indices.inner)
+                }
+            })
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
+    }
+
+    #[getter]
+    pub fn padding_idx(&self) -> Option<usize> {
+        self.padding_idx
     }
 
     pub fn __call__(&self, py: Python<'_>, indices: &PyTensor) -> PyResult<PyTensor> {
@@ -5381,6 +5437,7 @@ impl PyMLP {
 #[pyclass(name = "Conv2d", module = "oxideon")]
 pub struct PyConv2d {
     inner: Conv2d,
+    extra_pad: [usize; 4], // (top, bottom, left, right) for odd padding='same'
 }
 
 #[pymethods]
@@ -5403,10 +5460,6 @@ impl PyConv2d {
             Some(v) => extract_pair2(v, "stride")?,
             None => (1, 1),
         };
-        let p = match padding {
-            Some(v) => extract_pair2(v, "padding")?,
-            None => (0, 0),
-        };
         let d = match dilation {
             Some(v) => extract_pair2(v, "dilation")?,
             None => (1, 1),
@@ -5414,17 +5467,65 @@ impl PyConv2d {
         if d.0 == 0 || d.1 == 0 {
             return Err(PyValueError::new_err(format!("dilation must be positive, got {d:?}")));
         }
+        let mut extra_pad = [0usize; 4];
+        let p = match padding {
+            None => (0, 0),
+            Some(v) => {
+                if let Ok(mode) = v.extract::<String>() {
+                    match mode.to_ascii_lowercase().as_str() {
+                        "valid" => (0, 0),
+                        "same" => {
+                            if s != (1, 1) {
+                                return Err(PyValueError::new_err(format!(
+                                    "padding='same' is not supported when stride != (1, 1), got {s:?}"
+                                )));
+                            }
+                            let th = d.0 * (k.0 - 1);
+                            let tw = d.1 * (k.1 - 1);
+                            if th % 2 == 0 && tw % 2 == 0 {
+                                (th / 2, tw / 2)
+                            } else {
+                                extra_pad = [th / 2, th - th / 2, tw / 2, tw - tw / 2];
+                                (0, 0)
+                            }
+                        }
+                        other => {
+                            return Err(PyValueError::new_err(format!(
+                                "invalid padding string '{other}', expected 'same' or 'valid'"
+                            )));
+                        }
+                    }
+                } else {
+                    extract_pair2(v, "padding")?
+                }
+            }
+        };
         let mut inner = Conv2d::with_groups(in_channels, out_channels, k, s, p, groups).map_err(to_py_err)?;
         inner.dilation = d;
         if !bias {
             inner.bias = None;
         }
-        Ok(Self { inner })
+        Ok(Self { inner, extra_pad })
     }
 
     pub fn forward(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> {
+        let ep = self.extra_pad;
         let out = py
-            .detach(|| self.inner.forward(&x.inner))
+            .detach(|| {
+                if ep == [0, 0, 0, 0] {
+                    self.inner.forward(&x.inner)
+                } else {
+                    let mut pads = vec![(0usize, 0usize); x.inner.ndim()];
+                    let nd = pads.len();
+                    if nd < 2 {
+                        return self.inner.forward(&x.inner);
+                    }
+                    pads[nd - 2] = (ep[0], ep[1]);
+                    pads[nd - 1] = (ep[2], ep[3]);
+                    let padded = x.inner.pad(&pads, 0.0)?;
+                    self.inner.forward(&padded)
+                }
+            })
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }

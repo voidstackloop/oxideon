@@ -122,9 +122,14 @@ def relu6(input: _Tensor) -> _Tensor:
     return input.clamp(0.0, 6.0)
 
 
-def gelu(input: _Tensor) -> _Tensor:
+def gelu(input: _Tensor, approximate: str = "none") -> _Tensor:
     """Applies Gaussian Error Linear Units function element-wise."""
-    return input.gelu()
+    if approximate == "none":
+        return input.gelu()
+    if approximate == "tanh":
+        c = math.sqrt(2.0 / math.pi)
+        return 0.5 * input * (1.0 + (c * (input + 0.044715 * input.pow(3.0))).tanh())
+    raise ValueError(f"gelu: approximate must be 'none' or 'tanh', got {approximate!r}")
 
 
 def silu(input: _Tensor) -> _Tensor:
@@ -497,17 +502,55 @@ def feature_alpha_dropout(input: _Tensor, p: float = 0.5, training: bool = True)
 # Convolutions
 # ---------------------------------------------------------------------------
 
+def _resolve_conv_padding(
+    padding: Any,
+    strides: Sequence[int],
+    kernels: Sequence[int],
+    dilations: Sequence[int],
+    op_name: str,
+) -> Tuple[Tuple[int, ...], Optional[List[Tuple[int, int]]]]:
+    if isinstance(padding, str):
+        mode = padding.lower()
+        if mode == "valid":
+            return tuple(0 for _ in kernels), None
+        if mode == "same":
+            if any(s != 1 for s in strides):
+                raise ValueError(f"{op_name}: padding='same' is not supported when any stride != 1 (got {tuple(strides)})")
+            sym = []
+            asym = []
+            has_asym = False
+            for k, d in zip(kernels, dilations):
+                tot = int(d) * (int(k) - 1)
+                left = tot // 2
+                right = tot - left
+                sym.append(left)
+                asym.append((left, right))
+                if left != right:
+                    has_asym = True
+            if has_asym:
+                return tuple(0 for _ in kernels), asym
+            return tuple(sym), None
+        raise ValueError(f"{op_name}: invalid padding string {padding!r}, expected 'same' or 'valid'")
+    p_tuple = tuple(int(padding) for _ in kernels) if isinstance(padding, int) else tuple(int(v) for v in padding)
+    return p_tuple, None
+
+
 def conv1d(
     input: _Tensor,
     weight: _Tensor,
     bias: Optional[_Tensor] = None,
     stride: int = 1,
-    padding: int = 0,
+    padding: Union[int, str] = 0,
     dilation: int = 1,
     groups: int = 1,
 ) -> _Tensor:
     """Applies a 1D convolution over an input signal composed of several input planes."""
-    return _native_conv1d(input, weight, bias, stride, padding, dilation, groups)
+    x = _as_tensor(input)
+    w = _as_tensor(weight)
+    p_sym, p_asym = _resolve_conv_padding(padding, (stride,), (w.shape[2],), (dilation,), "conv1d")
+    if p_asym is not None:
+        x = _diff_pad_nd(x, p_asym)
+    return _native_conv1d(x, w, bias, stride, p_sym[0], dilation, groups)
 
 
 def conv2d(
@@ -515,15 +558,19 @@ def conv2d(
     weight: _Tensor,
     bias: Optional[_Tensor] = None,
     stride: Union[int, Tuple[int, int]] = 1,
-    padding: Union[int, Tuple[int, int]] = 0,
+    padding: Union[int, Tuple[int, int], str] = 0,
     dilation: Union[int, Tuple[int, int]] = 1,
     groups: int = 1,
 ) -> _Tensor:
     """Applies a 2D convolution over an input image composed of several input planes."""
+    x = _as_tensor(input)
+    w = _as_tensor(weight)
     s = (stride, stride) if isinstance(stride, int) else tuple(stride)
-    p = (padding, padding) if isinstance(padding, int) else tuple(padding)
     d = (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
-    return _native_conv2d(input, weight, bias, s, p, d, groups)
+    p_sym, p_asym = _resolve_conv_padding(padding, s, (w.shape[2], w.shape[3]), d, "conv2d")
+    if p_asym is not None:
+        x = _diff_pad_nd(x, p_asym)
+    return _native_conv2d(x, w, bias, s, p_sym, d, groups)
 
 
 def conv3d(
@@ -565,6 +612,18 @@ def conv3d(
     return _wrap(res, like=input)
 
 
+def _grouped_conv_t_matmul(x_pt: _Tensor, w_pt: _Tensor, groups: int) -> _Tensor:
+    """Grouped linear projection [N, C_in] @ [C_in, C_out_per_group] -> [N, C_out_per_group * groups]."""
+    if groups == 1:
+        return x_pt.matmul(w_pt)
+    n, c_in = int(x_pt.shape[0]), int(x_pt.shape[1])
+    c_in_g = c_in // groups
+    c_out_g = int(w_pt.shape[1])
+    xg = x_pt.reshape([n, groups, c_in_g]).transpose(0, 1)
+    wg = w_pt.reshape([groups, c_in_g, c_out_g])
+    return xg.matmul(wg).transpose(0, 1).reshape([n, groups * c_out_g])
+
+
 def conv_transpose1d(
     input: _Tensor,
     weight: _Tensor,
@@ -589,7 +648,7 @@ def conv_transpose1d(
         for k in range(K):
             pos = start + k * dilation
             if 0 <= pos < L_out:
-                contrib = x[:, :, i].matmul(w[:, :, k])
+                contrib = _grouped_conv_t_matmul(x[:, :, i], w[:, :, k], groups)
                 mask = np.zeros((L_out,), dtype=dt)
                 mask[pos] = 1
                 out = out + contrib[:, :, None] * _from_numpy(mask)
@@ -607,20 +666,21 @@ def conv_transpose2d(
     padding: Union[int, Tuple[int, int]] = 0,
     output_padding: Union[int, Tuple[int, int]] = 0,
     groups: int = 1,
-    dilation: int = 1,
+    dilation: Union[int, Tuple[int, int]] = 1,
 ) -> _Tensor:
     """Applies a 2D transposed convolution operator over an input image."""
     # Differentiable masked accumulation (stays in the autograd graph).
     s = (stride, stride) if isinstance(stride, int) else stride
     p = (padding, padding) if isinstance(padding, int) else padding
     op = (output_padding, output_padding) if isinstance(output_padding, int) else output_padding
+    d = (dilation, dilation) if isinstance(dilation, int) else dilation
 
     x = _as_tensor(input)
     w = _as_tensor(weight)
     N, C_in, H_in, W_in = (int(v) for v in x.shape)
     _, C_out, kH, kW = (int(v) for v in w.shape)
-    H_out = (H_in - 1) * s[0] - 2 * p[0] + (kH - 1) * dilation + op[0] + 1
-    W_out = (W_in - 1) * s[1] - 2 * p[1] + (kW - 1) * dilation + op[1] + 1
+    H_out = (H_in - 1) * s[0] - 2 * p[0] + (kH - 1) * d[0] + op[0] + 1
+    W_out = (W_in - 1) * s[1] - 2 * p[1] + (kW - 1) * d[1] + op[1] + 1
 
     dt = _to_np(x).dtype
     out = _from_numpy(np.zeros((N, C_out * groups, H_out, W_out), dtype=dt))
@@ -630,10 +690,10 @@ def conv_transpose2d(
             w_start = w_idx * s[1] - p[1]
             for kh in range(kH):
                 for kw in range(kW):
-                    pos_h = h_start + kh * dilation
-                    pos_w = w_start + kw * dilation
+                    pos_h = h_start + kh * d[0]
+                    pos_w = w_start + kw * d[1]
                     if 0 <= pos_h < H_out and 0 <= pos_w < W_out:
-                        contrib = x[:, :, h, w_idx].matmul(w[:, :, kh, kw])
+                        contrib = _grouped_conv_t_matmul(x[:, :, h, w_idx], w[:, :, kh, kw], groups)
                         mask = np.zeros((H_out, W_out), dtype=dt)
                         mask[pos_h, pos_w] = 1
                         out = out + contrib[:, :, None, None] * _from_numpy(mask)
@@ -679,7 +739,7 @@ def conv_transpose3d(
                             ph = h_pos + kh * dilation
                             pw = w_pos + kw * dilation
                             if 0 <= pd < D_out and 0 <= ph < H_out and 0 <= pw < W_out:
-                                contrib = x[:, :, d, h, w_idx].matmul(w[:, :, kd, kh, kw])
+                                contrib = _grouped_conv_t_matmul(x[:, :, d, h, w_idx], w[:, :, kd, kh, kw], groups)
                                 mask = np.zeros((D_out, H_out, W_out), dtype=dt)
                                 mask[pd, ph, pw] = 1
                                 out = out + contrib[:, :, None, None, None] * _from_numpy(mask)

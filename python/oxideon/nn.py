@@ -1243,10 +1243,12 @@ class GELU(Module):
     """Gaussian Error Linear Units activation function."""
     def __init__(self, approximate: str = "none"):
         super().__init__()
+        if approximate not in ("none", "tanh"):
+            raise ValueError(f"GELU: approximate must be 'none' or 'tanh', got {approximate!r}")
         self.approximate = approximate
 
     def forward(self, input):
-        return input.gelu()
+        return functional.gelu(input, approximate=self.approximate)
 
 
 class SiLU(Module):
@@ -1795,12 +1797,20 @@ def _batch_norm_train_stats(x, num_features):
 
 class BatchNorm1d(Module):
     """1D Batch Normalization over 2D or 3D input."""
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
 
         if affine:
             self.weight = Parameter(_Tensor.ones([num_features]))
@@ -1809,15 +1819,20 @@ class BatchNorm1d(Module):
             self.weight = None
             self.bias = None
 
-        self.running_mean = np.zeros(num_features, dtype=np.float32)
-        self.running_var = np.ones(num_features, dtype=np.float32)
+        if track_running_stats:
+            self.running_mean = np.zeros(num_features, dtype=np.float32)
+            self.running_var = np.ones(num_features, dtype=np.float32)
+        else:
+            self.running_mean = None
+            self.running_var = None
 
     def forward(self, x):
         bshape = [1, self.num_features] + [1] * (len(x.shape) - 2)
-        if self.training:
+        if self.training or not self.track_running_stats:
             mean_b, var_b, mean_c, uvar_c = _batch_norm_train_stats(x, self.num_features)
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c
+            if self.training and self.track_running_stats:
+                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c
+                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c
         else:
             mean_b = _from_numpy(np.ascontiguousarray(self.running_mean.reshape(bshape), dtype=np.float32))
             var_b = _from_numpy(np.ascontiguousarray(self.running_var.reshape(bshape), dtype=np.float32))
@@ -1835,12 +1850,20 @@ class BatchNorm1d(Module):
 
 class BatchNorm2d(Module):
     """2D Batch Normalization over 4D NCHW input."""
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
 
         if affine:
             self.weight = Parameter(_Tensor.ones([num_features]))
@@ -1849,15 +1872,20 @@ class BatchNorm2d(Module):
             self.weight = None
             self.bias = None
 
-        self.running_mean = np.zeros(num_features, dtype=np.float32)
-        self.running_var = np.ones(num_features, dtype=np.float32)
+        if track_running_stats:
+            self.running_mean = np.zeros(num_features, dtype=np.float32)
+            self.running_var = np.ones(num_features, dtype=np.float32)
+        else:
+            self.running_mean = None
+            self.running_var = None
 
     def forward(self, x):
         bshape = (1, self.num_features, 1, 1)
-        if self.training:
+        if self.training or not self.track_running_stats:
             mean_b, var_b, mean_c, uvar_c = _batch_norm_train_stats(x, self.num_features)
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(self.num_features)
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(self.num_features)
+            if self.training and self.track_running_stats:
+                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(self.num_features)
+                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(self.num_features)
         else:
             mean_b = _from_numpy(np.ascontiguousarray(self.running_mean.reshape(bshape), dtype=np.float32))
             var_b = _from_numpy(np.ascontiguousarray(self.running_var.reshape(bshape), dtype=np.float32))
@@ -1870,12 +1898,13 @@ class BatchNorm2d(Module):
 
 class LazyBatchNorm1d(BatchNorm1d):
     """1D Batch Normalization with lazy initialization of num_features."""
-    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True):
+    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True, track_running_stats: bool = True):
         Module.__init__(self)
         self.num_features = None
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
         self.weight = None
         self.bias = None
         self.running_mean = None
@@ -1887,8 +1916,9 @@ class LazyBatchNorm1d(BatchNorm1d):
         if self.affine:
             self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
             self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
-        self.running_mean = np.zeros(num_features, dtype=np.float32)
-        self.running_var = np.ones(num_features, dtype=np.float32)
+        if self.track_running_stats:
+            self.running_mean = np.zeros(num_features, dtype=np.float32)
+            self.running_var = np.ones(num_features, dtype=np.float32)
 
     def forward(self, x):
         if self.num_features is None:
@@ -1898,12 +1928,13 @@ class LazyBatchNorm1d(BatchNorm1d):
 
 class LazyBatchNorm2d(BatchNorm2d):
     """2D Batch Normalization with lazy initialization of num_features."""
-    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True):
+    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True, track_running_stats: bool = True):
         Module.__init__(self)
         self.num_features = None
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
         self.weight = None
         self.bias = None
         self.running_mean = None
@@ -1915,8 +1946,9 @@ class LazyBatchNorm2d(BatchNorm2d):
         if self.affine:
             self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
             self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
-        self.running_mean = np.zeros(num_features, dtype=np.float32)
-        self.running_var = np.ones(num_features, dtype=np.float32)
+        if self.track_running_stats:
+            self.running_mean = np.zeros(num_features, dtype=np.float32)
+            self.running_var = np.ones(num_features, dtype=np.float32)
 
     def forward(self, x):
         if self.num_features is None:
@@ -2293,45 +2325,59 @@ class EmbeddingBag(Module):
 
 class BatchNorm3d(Module):
     """3D Batch Normalization over 5D NCDHW input."""
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
         if affine:
-            self.weight = Parameter(_Tensor.ones([1, num_features, 1, 1, 1]))
-            self.bias = Parameter(_Tensor.zeros([1, num_features, 1, 1, 1]))
+            self.weight = Parameter(_Tensor.ones([num_features]))
+            self.bias = Parameter(_Tensor.zeros([num_features]))
         else:
             self.weight = None
             self.bias = None
-        self.running_mean = np.zeros((1, num_features, 1, 1, 1), dtype=np.float32)
-        self.running_var = np.ones((1, num_features, 1, 1, 1), dtype=np.float32)
+        if track_running_stats:
+            self.running_mean = np.zeros(num_features, dtype=np.float32)
+            self.running_var = np.ones(num_features, dtype=np.float32)
+        else:
+            self.running_mean = None
+            self.running_var = None
 
     def forward(self, x):
-        if self.training:
+        bshape = (1, self.num_features, 1, 1, 1)
+        if self.training or not self.track_running_stats:
             mean_b, var_b, mean_c, uvar_c = _batch_norm_train_stats(x, self.num_features)
-            rshape = self.running_mean.shape
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(rshape)
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(rshape)
+            if self.training and self.track_running_stats:
+                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(self.num_features)
+                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(self.num_features)
         else:
-            mean_b = _from_numpy(np.ascontiguousarray(self.running_mean, dtype=np.float32))
-            var_b = _from_numpy(np.ascontiguousarray(self.running_var, dtype=np.float32))
+            mean_b = _from_numpy(np.ascontiguousarray(self.running_mean.reshape(bshape), dtype=np.float32))
+            var_b = _from_numpy(np.ascontiguousarray(self.running_var.reshape(bshape), dtype=np.float32))
 
         out = (x - mean_b) / (var_b + self.eps).sqrt()
         if self.affine:
-            out = out * self.weight + self.bias
+            out = out * self.weight.reshape(list(bshape)) + self.bias.reshape(list(bshape))
         return out
 
 
 class LazyBatchNorm3d(BatchNorm3d):
     """3D Batch Normalization with lazy initialization of num_features."""
-    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True):
+    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True, track_running_stats: bool = True):
         Module.__init__(self)
         self.num_features = None
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
         self.weight = None
         self.bias = None
         self.running_mean = None
@@ -2341,10 +2387,11 @@ class LazyBatchNorm3d(BatchNorm3d):
         num_features = input.shape[1]
         self.num_features = num_features
         if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([1, num_features, 1, 1, 1])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([1, num_features, 1, 1, 1])))
-        self.running_mean = np.zeros((1, num_features, 1, 1, 1), dtype=np.float32)
-        self.running_var = np.ones((1, num_features, 1, 1, 1), dtype=np.float32)
+            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
+            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
+        if self.track_running_stats:
+            self.running_mean = np.zeros(num_features, dtype=np.float32)
+            self.running_var = np.ones(num_features, dtype=np.float32)
 
     def forward(self, x):
         if self.num_features is None:

@@ -639,3 +639,107 @@ def test_rmsnorm_mha_transformer_and_pylayer_module_interface():
         layer.train()
         layer.eval()
         layer.zero_grad()
+
+
+def test_gelu_approximate_and_padding_same_valid():
+    import oxideon.nn as nn
+    import oxideon.nn.functional as F
+    import torch.nn as tnn
+    import torch.nn.functional as tF
+
+    rng = np.random.RandomState(43)
+    x_np = rng.randn(3, 8).astype(np.float64)
+    for approx in ("none", "tanh"):
+        ox_x = T(x_np.copy()).requires_grad_(True)
+        pt_x = torch.from_numpy(x_np.copy()).requires_grad_(True)
+        oy = F.gelu(ox_x, approximate=approx)
+        py = tF.gelu(pt_x, approximate=approx)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-6)
+        (oy * oy).sum().backward()
+        (py * py).sum().backward()
+        np.testing.assert_allclose(A(ox_x.grad), pt_x.grad.numpy(), atol=1e-5)
+        assert tuple(nn.GELU(approximate=approx)(ox_x).shape) == (3, 8)
+
+    x4 = rng.randn(2, 4, 7, 7).astype(np.float32)
+    x3 = x4[:, :, 0, :]
+    for ks, pad in [(3, "same"), (2, "same"), (3, "valid")]:
+        om2 = nn.Conv2d(4, 5, ks, padding=pad)
+        tm2 = tnn.Conv2d(4, 5, ks, padding=pad)
+        om2.load_state_dict({"weight": T(tm2.weight.detach().numpy().copy()), "bias": T(tm2.bias.detach().numpy().copy())})
+        ox_i = T(x4.copy()).requires_grad_(True)
+        pt_i = torch.from_numpy(x4.copy()).requires_grad_(True)
+        oy = om2(ox_i)
+        py = tm2(pt_i)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-5)
+        oy.sum().backward()
+        py.sum().backward()
+        np.testing.assert_allclose(A(ox_i.grad), pt_i.grad.numpy(), atol=1e-5)
+
+        om1 = nn.Conv1d(4, 5, ks, padding=pad)
+        tm1 = tnn.Conv1d(4, 5, ks, padding=pad)
+        om1.load_state_dict({"weight": T(tm1.weight.detach().numpy().copy()), "bias": T(tm1.bias.detach().numpy().copy())})
+        ox_1 = T(x3.copy()).requires_grad_(True)
+        pt_1 = torch.from_numpy(x3.copy()).requires_grad_(True)
+        oy1 = om1(ox_1)
+        py1 = tm1(pt_1)
+        np.testing.assert_allclose(A(oy1), py1.detach().numpy(), atol=1e-5)
+
+
+def test_conv_transpose_groups_batchnorm_track_lr_plateau_and_embedding_padding_idx():
+    import oxideon.nn as nn
+    import torch.nn as tnn
+
+    rng = np.random.RandomState(47)
+    x4 = rng.randn(2, 4, 5, 5).astype(np.float32)
+    om_ct2 = nn.ConvTranspose2d(4, 6, 3, dilation=2, groups=2, bias=False)
+    tm_ct2 = tnn.ConvTranspose2d(4, 6, 3, dilation=2, groups=2, bias=False)
+    om_ct2.load_state_dict({"weight": T(tm_ct2.weight.detach().numpy().copy())})
+    ox_i = T(x4.copy()).requires_grad_(True)
+    pt_i = torch.from_numpy(x4.copy()).requires_grad_(True)
+    oy = om_ct2(ox_i)
+    py = tm_ct2(pt_i)
+    np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-5)
+    oy.sum().backward()
+    py.sum().backward()
+    np.testing.assert_allclose(A(ox_i.grad), pt_i.grad.numpy(), atol=1e-5)
+    np.testing.assert_allclose(A(om_ct2.weight.grad), tm_ct2.weight.grad.numpy(), atol=1e-5)
+
+    for cls, inp in [
+        (nn.BatchNorm1d, x4[:, :, 0, :]),
+        (nn.BatchNorm2d, x4),
+        (nn.BatchNorm3d, rng.randn(2, 4, 3, 3, 3).astype(np.float32)),
+    ]:
+        m = cls(4, affine=False, track_running_stats=False)
+        assert m.running_mean is None and m.running_var is None
+        m.eval()
+        assert tuple(m(T(inp)).shape) == inp.shape
+
+    ow = ox.ones(2, requires_grad=True)
+    pw = torch.ones(2, requires_grad=True)
+    oo = ox.optim.SGD([ow], lr=0.05)
+    po = torch.optim.SGD([pw], lr=0.05)
+    os_ = ox.optim.lr_scheduler.ReduceLROnPlateau(oo, factor=0.5, patience=2)
+    ps_ = torch.optim.lr_scheduler.ReduceLROnPlateau(po, factor=0.5, patience=2)
+    for _ in range(8):
+        oo.step()
+        po.step()
+        os_.step(1.0)
+        ps_.step(1.0)
+        np.testing.assert_allclose(os_.get_last_lr()[0], ps_.get_last_lr()[0], rtol=1e-5)
+        np.testing.assert_allclose(oo.param_groups[0]["lr"], po.param_groups[0]["lr"], rtol=1e-5)
+
+    res = ox.zeros(4).scatter_reduce(0, T(np.array([0, 1], dtype=np.int64)), T(np.array([3.0, 4.0], dtype=np.float32)), "sum", True)
+    np.testing.assert_allclose(A(res), [3.0, 4.0, 0.0, 0.0])
+
+    oe = nn.Embedding(6, 4, padding_idx=0)
+    np.testing.assert_allclose(A(oe.weight)[0], np.zeros(4))
+    pe = tnn.Embedding(6, 4, padding_idx=0)
+    oe.load_state_dict({"weight": T(pe.weight.detach().numpy().copy())})
+    idx = np.array([[0, 2, 0, 5], [1, 0, 3, 4]], dtype=np.int64)
+    oy_e = oe(T(idx))
+    py_e = pe(torch.from_numpy(idx))
+    np.testing.assert_allclose(A(oy_e), py_e.detach().numpy(), atol=1e-5)
+    (oy_e * oy_e).sum().backward()
+    (py_e * py_e).sum().backward()
+    np.testing.assert_allclose(A(oe.weight.grad), pe.weight.grad.numpy(), atol=1e-5)
+    np.testing.assert_allclose(A(oe.weight.grad)[0], np.zeros(4))

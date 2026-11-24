@@ -486,7 +486,7 @@ def renorm(x: _Tensor, p: float, dim: int, maxnorm: float) -> _Tensor:
     return x * scale
 
 
-def scatter_reduce(x: _Tensor, dim: int, index: _Tensor, src: _Tensor, reduce: str, *, include_self: bool = True) -> _Tensor:
+def scatter_reduce(x: _Tensor, dim: int, index: _Tensor, src: _Tensor, reduce: str, include_self: bool = True) -> _Tensor:
     """Reduces the values of `src` into a copy of `x` at the positions in `index` along `dim`, with `reduce` one of
     "sum", "prod", "mean", "amax", "amin". With `include_self=False` the original values of `x` at the touched positions
     do not take part. Computed in Rust; "sum" and "mean" are differentiable. `src` may be larger than `index` (only the

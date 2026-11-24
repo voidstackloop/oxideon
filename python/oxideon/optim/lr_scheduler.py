@@ -391,6 +391,18 @@ class ReduceLROnPlateau:
         self.best = math.inf if mode == "min" else -math.inf
         self.num_bad_epochs = 0
         self.last_epoch = 0
+        groups = getattr(optimizer, "param_groups", None)
+        if isinstance(groups, (list, tuple)) and len(groups) > 0:
+            self._last_lr = [float(g["lr"]) for g in groups]
+        elif hasattr(optimizer, "lr"):
+            cur = optimizer.lr
+            self._last_lr = [float(cur() if callable(cur) else cur)]
+        else:
+            self._last_lr = [0.0]
+
+    def get_last_lr(self) -> List[float]:
+        """Return last computed learning rate by current scheduler."""
+        return list(self._last_lr)
 
     def _is_better(self, current: float) -> bool:
         if self.threshold_mode == "rel":
@@ -420,8 +432,17 @@ class ReduceLROnPlateau:
     def _reduce_lr(self) -> None:
         groups = getattr(self.optimizer, "param_groups", None)
         if isinstance(groups, (list, tuple)) and len(groups) > 0:
+            new_lrs = []
             for g in groups:
-                g["lr"] = max(float(g["lr"]) * self.factor, self.min_lr)
+                nlr = max(float(g["lr"]) * self.factor, self.min_lr)
+                g["lr"] = nlr
+                new_lrs.append(nlr)
+            if hasattr(self.optimizer, "set_learning_rate") and callable(self.optimizer.set_learning_rate):
+                try:
+                    self.optimizer.set_learning_rate(new_lrs[0])
+                except Exception:
+                    pass
+            self._last_lr = new_lrs
             return
         if hasattr(self.optimizer, "lr"):
             cur = self.optimizer.lr
@@ -434,6 +455,7 @@ class ReduceLROnPlateau:
                     self.optimizer.lr = new_lr
                 except AttributeError:
                     pass
+            self._last_lr = [new_lr]
 
 
 class WarmupCosineScheduler(_LRScheduler):
