@@ -457,3 +457,185 @@ def test_py_layers_state_dict_conv2d_norms_pools_and_rnns():
             base, layer = pk.rsplit("_l", 1)
             ok = f"cells.{layer}.{base}"
             np.testing.assert_allclose(A(dict(om.named_parameters())[ok].grad), tp.grad.numpy(), atol=1e-5)
+
+
+def test_softmax_and_log_softmax_empty_and_zero_d():
+    for fn in ("softmax", "log_softmax"):
+        oe = T(np.empty((3, 0), dtype=np.float32)).requires_grad_(True)
+        oy = getattr(oe, fn)(-1)
+        assert tuple(oy.shape) == (3, 0)
+        oy.sum().backward()
+        assert tuple(oe.grad.shape) == (3, 0)
+
+        for ax in (-1, 0):
+            o0 = T(np.array(2.0, dtype=np.float32)).requires_grad_(True)
+            p0 = torch.tensor(2.0, dtype=torch.float32, requires_grad=True)
+            oy0 = getattr(o0, fn)(ax)
+            py0 = getattr(p0, fn)(ax)
+            np.testing.assert_allclose(A(oy0), py0.detach().numpy())
+            oy0.backward()
+            py0.backward()
+            np.testing.assert_allclose(A(o0.grad), p0.grad.numpy())
+
+
+def test_scatter_reduce_gradients_all_modes():
+    for red in ("sum", "mean", "prod", "amax", "amin"):
+        for inc in (True, False):
+            x_np = np.array([2.0 if inc else -1.0, 1.0, 3.0, 5.0], dtype=np.float64)
+            s_np = np.array([2.0, 2.0, 0.0, 4.0], dtype=np.float64)
+            idx_np = np.array([0, 0, 1, 2], dtype=np.int64)
+            w_np = np.array([1.2, 0.7, 2.1, -0.5], dtype=np.float64)
+
+            ox_x = T(x_np.copy()).requires_grad_(True)
+            ox_s = T(s_np.copy()).requires_grad_(True)
+            pt_x = torch.from_numpy(x_np.copy()).requires_grad_(True)
+            pt_s = torch.from_numpy(s_np.copy()).requires_grad_(True)
+
+            oy = ox_x.scatter_reduce(0, T(idx_np), ox_s, reduce=red, include_self=inc)
+            py = pt_x.scatter_reduce(0, torch.from_numpy(idx_np), pt_s, reduce=red, include_self=inc)
+            np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-12)
+            (oy * T(w_np)).sum().backward()
+            (py * torch.from_numpy(w_np)).sum().backward()
+            np.testing.assert_allclose(A(ox_x.grad), pt_x.grad.numpy(), atol=1e-12)
+            np.testing.assert_allclose(A(ox_s.grad), pt_s.grad.numpy(), atol=1e-12)
+
+
+def test_einsum_ellipsis_and_gradients():
+    rng = np.random.RandomState(31)
+    a_np = rng.randn(1, 2, 3, 4)
+    b_np = rng.randn(5, 2, 4, 3)
+    m_np = rng.randn(2, 4, 4)
+    for eq, arrs in [
+        ("...ij,...jk->...ik", [a_np, b_np]),
+        ("...ij,...jk", [a_np, b_np]),
+        ("...ii->...i", [m_np]),
+        ("...ii", [m_np]),
+    ]:
+        ox_ts = [T(x.copy()).requires_grad_(True) for x in arrs]
+        pt_ts = [torch.from_numpy(x.copy()).requires_grad_(True) for x in arrs]
+        oy = ox.einsum(eq, *ox_ts)
+        py = torch.einsum(eq, *pt_ts)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-12)
+        (oy * oy).sum().backward()
+        (py * py).sum().backward()
+        for ot, pt in zip(ox_ts, pt_ts):
+            np.testing.assert_allclose(A(ot.grad), pt.grad.numpy(), atol=1e-11)
+
+
+def test_cross_entropy_and_five_losses_full_parity():
+    import oxideon.nn.functional as F
+    import torch.nn.functional as tF
+
+    rng = np.random.RandomState(37)
+    logits = rng.randn(4, 5).astype(np.float32)
+    targets = np.array([0, 2, -100, 4], dtype=np.int64)
+    weight = np.array([1.0, 2.0, 0.5, 1.5, 0.8], dtype=np.float32)
+    for red in ("none", "mean", "sum"):
+        ox_l = T(logits.copy()).requires_grad_(True)
+        pt_l = torch.from_numpy(logits.copy()).requires_grad_(True)
+        oy = F.cross_entropy(ox_l, T(targets), weight=T(weight), ignore_index=-100, label_smoothing=0.15, reduction=red)
+        py = tF.cross_entropy(pt_l, torch.from_numpy(targets), weight=torch.from_numpy(weight), ignore_index=-100, label_smoothing=0.15, reduction=red)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-5)
+        oy.sum().backward()
+        py.sum().backward()
+        np.testing.assert_allclose(A(ox_l.grad), pt_l.grad.numpy(), atol=1e-5)
+
+    logits3d = rng.randn(2, 5, 4).astype(np.float32)
+    targets2d = np.array([[0, 1, -100, 4], [2, 3, 1, 0]], dtype=np.int64)
+    np.testing.assert_allclose(
+        A(F.cross_entropy(T(logits3d), T(targets2d))),
+        tF.cross_entropy(torch.from_numpy(logits3d), torch.from_numpy(targets2d)).numpy(),
+        atol=1e-5,
+    )
+    probs3d = tF.softmax(torch.from_numpy(rng.randn(2, 5, 4).astype(np.float32)), dim=1).numpy()
+    np.testing.assert_allclose(
+        A(F.cross_entropy(T(logits3d), T(probs3d), weight=T(weight), label_smoothing=0.1)),
+        tF.cross_entropy(torch.from_numpy(logits3d), torch.from_numpy(probs3d), weight=torch.from_numpy(weight), label_smoothing=0.1).numpy(),
+        atol=1e-5,
+    )
+
+    x1 = rng.randn(4, 6).astype(np.float32)
+    x2 = rng.randn(4, 6).astype(np.float32)
+    x3 = rng.randn(4, 6).astype(np.float32)
+    y_pm = np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32)
+    for red in ("none", "mean", "sum"):
+        np.testing.assert_allclose(A(F.cosine_embedding_loss(T(x1), T(x2), T(y_pm), reduction=red)), tF.cosine_embedding_loss(torch.from_numpy(x1), torch.from_numpy(x2), torch.from_numpy(y_pm), reduction=red).numpy(), atol=1e-5)
+        np.testing.assert_allclose(A(F.triplet_margin_loss(T(x1), T(x2), T(x3), swap=True, reduction=red)), tF.triplet_margin_loss(torch.from_numpy(x1), torch.from_numpy(x2), torch.from_numpy(x3), swap=True, reduction=red).numpy(), atol=1e-5)
+        np.testing.assert_allclose(A(F.margin_ranking_loss(T(x1[:, 0]), T(x2[:, 0]), T(y_pm), reduction=red)), tF.margin_ranking_loss(torch.from_numpy(x1[:, 0]), torch.from_numpy(x2[:, 0]), torch.from_numpy(y_pm), reduction=red).numpy(), atol=1e-5)
+        np.testing.assert_allclose(A(F.hinge_embedding_loss(T(x1[:, 0]), T(y_pm), reduction=red)), tF.hinge_embedding_loss(torch.from_numpy(x1[:, 0]), torch.from_numpy(y_pm), reduction=red).numpy(), atol=1e-5)
+        np.testing.assert_allclose(A(F.soft_margin_loss(T(x1), T(np.sign(x2)), reduction=red)), tF.soft_margin_loss(torch.from_numpy(x1), torch.from_numpy(np.sign(x2)), reduction=red).numpy(), atol=1e-5)
+
+
+def test_rmsnorm_mha_transformer_and_pylayer_module_interface():
+    import oxideon.nn as nn
+    import torch.nn as tnn
+
+    rng = np.random.RandomState(41)
+    x_np = rng.randn(2, 5, 8).astype(np.float32)
+    om_rms = nn.RMSNorm(8)
+    tm_rms = tnn.RMSNorm(8)
+    ox_i = T(x_np.copy()).requires_grad_(True)
+    pt_i = torch.from_numpy(x_np.copy()).requires_grad_(True)
+    oy = om_rms(ox_i)
+    py = tm_rms(pt_i)
+    np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-5)
+    oy.sum().backward()
+    py.sum().backward()
+    np.testing.assert_allclose(A(ox_i.grad), pt_i.grad.numpy(), atol=1e-5)
+
+    mask = np.triu(np.full((5, 5), -np.inf, dtype=np.float32), k=1)
+    kpm = np.array([[False, False, False, True, True], [False, False, True, True, True]])
+    om = nn.TransformerEncoderLayer(8, 2, dim_feedforward=16, dropout=0.0, batch_first=True)
+    tm = tnn.TransformerEncoderLayer(8, 2, dim_feedforward=16, dropout=0.0, batch_first=True)
+    tsd = tm.state_dict()
+    osd = {}
+    for k, v in tsd.items():
+        arr = v.detach().numpy().copy()
+        if k == "self_attn.in_proj_weight":
+            osd["self_attn.q_proj.weight"] = T(arr[:8].copy())
+            osd["self_attn.k_proj.weight"] = T(arr[8:16].copy())
+            osd["self_attn.v_proj.weight"] = T(arr[16:].copy())
+        elif k == "self_attn.in_proj_bias":
+            osd["self_attn.q_proj.bias"] = T(arr[:8].copy())
+            osd["self_attn.k_proj.bias"] = T(arr[8:16].copy())
+            osd["self_attn.v_proj.bias"] = T(arr[16:].copy())
+        else:
+            osd[k] = T(arr)
+    om.load_state_dict(osd)
+    oo = om(T(x_np.copy()), src_mask=T(mask), src_key_padding_mask=T(kpm))
+    po = tm(torch.from_numpy(x_np.copy()), src_mask=torch.from_numpy(mask), src_key_padding_mask=torch.from_numpy(kpm))
+    np.testing.assert_allclose(A(oo), po.detach().numpy(), atol=1e-5)
+
+    enc = nn.TransformerEncoder(nn.TransformerEncoderLayer(8, 2, dim_feedforward=16, dropout=0.0, batch_first=True), num_layers=2)
+    assert enc.layers[0] is not enc.layers[1]
+
+    for cls_name, args, sample in [
+        ("Dropout", (0.0,), ox.ones(2, 4)),
+        ("DropPath", (0.0,), ox.ones(2, 4)),
+        ("Maxout", (2,), ox.ones(2, 4)),
+        ("Snake", (4,), ox.ones(2, 4)),
+        ("Swish", (), ox.ones(2, 4)),
+        ("Upsample2d", ((4, 4),), ox.ones(1, 2, 2, 2)),
+        ("ReLU", (), ox.ones(2, 4)),
+        ("ReLU6", (), ox.ones(2, 4)),
+        ("Hardtanh", (), ox.ones(2, 4)),
+        ("Softshrink", (), ox.ones(2, 4)),
+        ("Hardshrink", (), ox.ones(2, 4)),
+        ("LogSigmoid", (), ox.ones(2, 4)),
+        ("MLP", ([4, 3, 2],), ox.ones(2, 4)),
+        ("SpectralNormLinear", (4, 3), ox.ones(2, 4)),
+        ("WeightNormLinear", (4, 3), ox.ones(2, 4)),
+        ("MaxPool1d", (2,), ox.ones(1, 2, 4)),
+        ("AvgPool1d", (2,), ox.ones(1, 2, 4)),
+        ("ConvTranspose3d", (2, 3, 2), ox.ones(1, 2, 3, 3, 3)),
+        ("EmbeddingBag", (6, 4), T(np.array([[0, 1], [2, 3]], dtype=np.int64))),
+    ]:
+        cls = getattr(nn, cls_name, None) or getattr(ox, cls_name)
+        layer = cls(*args)
+        _ = layer(sample)
+        sd = layer.state_dict()
+        assert set(sd.keys()) == set(dict(layer.named_parameters()).keys()), cls_name
+        layer.load_state_dict(sd)
+        layer.train()
+        layer.eval()
+        layer.zero_grad()

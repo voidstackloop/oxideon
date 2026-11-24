@@ -7,6 +7,7 @@ ModuleList, ModuleDict).
 """
 
 from collections import OrderedDict
+import copy
 import itertools
 import math
 import operator
@@ -47,19 +48,14 @@ from . import (
     fused_rotary_qk as _fused_rotary_qk,
     fused_layernorm as _fused_layernorm,
     barlow_twins_loss,
-    cosine_embedding_loss,
     ctc_loss,
     dpo_loss,
     focal_loss,
     grpo_loss,
-    hinge_embedding_loss,
     info_nce_loss,
-    margin_ranking_loss,
     ppo_clipped_loss,
     siglip_loss,
     simpo_loss,
-    soft_margin_loss,
-    triplet_margin_loss,
     vicreg_loss,
 )
 from .serialization import save_file, load_file, save, load
@@ -76,6 +72,11 @@ binary_cross_entropy_with_logits = functional.binary_cross_entropy_with_logits
 huber_loss = functional.huber_loss
 kl_div_loss = functional.kl_div_loss
 nll_loss = functional.nll_loss
+cosine_embedding_loss = functional.cosine_embedding_loss
+triplet_margin_loss = functional.triplet_margin_loss
+margin_ranking_loss = functional.margin_ranking_loss
+hinge_embedding_loss = functional.hinge_embedding_loss
+soft_margin_loss = functional.soft_margin_loss
 from . import init
 
 F = functional
@@ -1469,13 +1470,21 @@ class MultiheadAttention(Module):
         self.v_proj = Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = Linear(embed_dim, embed_dim, bias=bias)
 
-    def forward(self, query, key=None, value=None, attn_mask=None, is_causal: bool = False):
+    def forward(
+        self,
+        query,
+        key=None,
+        value=None,
+        key_padding_mask=None,
+        need_weights: bool = True,
+        attn_mask=None,
+        average_attn_weights: bool = True,
+        is_causal: bool = False,
+    ):
         if key is None:
             key = query
         if value is None:
             value = query
-
-        from . import functional as F
 
         # If 2D (L, E)
         is_2d = len(query.shape) == 2
@@ -1510,19 +1519,29 @@ class MultiheadAttention(Module):
         if attn_mask is not None:
             mask_np = attn_mask.to_numpy() if isinstance(attn_mask, _Tensor) else np.asarray(attn_mask)
             if mask_np.dtype == bool or mask_np.dtype == np.bool_:
-                keep = _from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
+                # In PyTorch MHA, bool attn_mask True entries are masked out (-inf).
+                keep = _from_numpy(np.ascontiguousarray(np.where(mask_np, 0.0, 1.0), dtype=np.float32))
                 scores = scores * keep + (1.0 - keep) * -1e9
             elif isinstance(attn_mask, _Tensor):
                 scores = scores + attn_mask
             else:
                 scores = scores + _from_numpy(np.ascontiguousarray(mask_np, dtype=np.float32))
+        if key_padding_mask is not None:
+            kpm_t = key_padding_mask if isinstance(key_padding_mask, _Tensor) else _from_numpy(np.asarray(key_padding_mask))
+            if is_2d and kpm_t.ndim == 1:
+                kpm_t = kpm_t.unsqueeze(0)
+            if kpm_t.dtype == "bool" or (not isinstance(key_padding_mask, _Tensor) and np.asarray(key_padding_mask).dtype == np.bool_):
+                pad_f = kpm_t.to_dtype(scores.dtype).reshape([B, 1, 1, S])
+                scores = scores + pad_f * -1e9
+            else:
+                scores = scores + kpm_t.to_dtype(scores.dtype).reshape([B, 1, 1, S])
 
         weights = scores.softmax(-1)
 
         attn_out = weights.matmul(v).transpose(1, 2).reshape([B, L, E])
         out = self.out_proj(attn_out)
 
-        attn_weights = weights.mean(dim=1)
+        attn_weights = weights.mean(dim=1) if average_attn_weights else weights
 
         if not batch_first:
             out = out.transpose(0, 1)
@@ -1530,7 +1549,7 @@ class MultiheadAttention(Module):
             out = out.squeeze(0)
             attn_weights = attn_weights.squeeze(0)
 
-        return out, attn_weights
+        return (out, attn_weights) if need_weights else (out, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1716,20 +1735,31 @@ class GRU(RNNBase):
 
 class RMSNorm(Module):
     """Root Mean Square Layer Normalization (RMSNorm)."""
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(
+        self,
+        normalized_shape: Union[int, Sequence[int], None] = None,
+        eps: Optional[float] = None,
+        elementwise_affine: bool = True,
+        *,
+        dim: Union[int, Sequence[int], None] = None,
+    ):
         super().__init__()
+        shape_arg = normalized_shape if normalized_shape is not None else dim
+        if shape_arg is None:
+            raise ValueError("RMSNorm requires normalized_shape (or dim)")
+        if isinstance(shape_arg, int):
+            self.normalized_shape = (shape_arg,)
+        else:
+            self.normalized_shape = tuple(shape_arg)
         self.eps = eps
-        self.weight = Parameter(_Tensor.ones([dim]))
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = Parameter(_Tensor.ones(list(self.normalized_shape)))
+        else:
+            self.weight = None
 
     def forward(self, x):
-        try:
-            return _fused_rmsnorm(x, self.weight, self.eps)
-        except Exception:
-            var = (x * x).mean(-1)
-            rsqrt = (var + self.eps).rsqrt()
-            if len(x.shape) > len(rsqrt.shape):
-                rsqrt = rsqrt.unsqueeze(-1)
-            return (x * rsqrt) * self.weight
+        return functional.rms_norm(x, self.normalized_shape, weight=self.weight, eps=self.eps)
 
 
 class Threshold(Module):
@@ -2779,7 +2809,7 @@ class TransformerEncoderLayer(Module):
         self.batch_first = batch_first
         self.norm_first = norm_first
 
-        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
         self.linear1 = Linear(d_model, dim_feedforward)
         self.linear2 = Linear(dim_feedforward, d_model)
         self.norm1 = LayerNorm(d_model, eps=layer_norm_eps)
@@ -2789,15 +2819,27 @@ class TransformerEncoderLayer(Module):
         self.dropout2 = Dropout(dropout) if dropout > 0 else Identity()
         self.activation = GELU() if activation == "gelu" else ReLU()
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal: bool = False):
         x = src
         if self.norm_first:
-            sa_out, _ = self.self_attn(self.norm1(x))
+            sa_out, _ = self.self_attn(
+                self.norm1(x),
+                attn_mask=src_mask,
+                key_padding_mask=src_key_padding_mask,
+                need_weights=False,
+                is_causal=is_causal,
+            )
             x = x + self.dropout1(sa_out)
             ff_out = self.linear2(self.dropout(self.activation(self.linear1(self.norm2(x)))))
             x = x + self.dropout2(ff_out)
         else:
-            sa_out, _ = self.self_attn(x)
+            sa_out, _ = self.self_attn(
+                x,
+                attn_mask=src_mask,
+                key_padding_mask=src_key_padding_mask,
+                need_weights=False,
+                is_causal=is_causal,
+            )
             x = self.norm1(x + self.dropout1(sa_out))
             ff_out = self.linear2(self.dropout(self.activation(self.linear1(x))))
             x = self.norm2(x + self.dropout2(ff_out))
@@ -2809,14 +2851,17 @@ class TransformerEncoder(Module):
     def __init__(self, encoder_layer: TransformerEncoderLayer, num_layers: int, norm=None):
         super().__init__()
         num_layers = _check_repeats("num_layers", num_layers)
-        self.layers = ModuleList([encoder_layer for _ in range(num_layers)])
+        self.layers = ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.norm = norm
 
-    def forward(self, src, mask=None, src_key_padding_mask=None):
+    def forward(self, src, mask=None, src_key_padding_mask=None, is_causal=None):
         output = src
         for mod in self.layers:
-            output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+            if is_causal is None:
+                output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+            else:
+                output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, is_causal=is_causal)
         if self.norm is not None:
             output = self.norm(output)
         return output
@@ -2843,8 +2888,8 @@ class TransformerDecoderLayer(Module):
         self.batch_first = batch_first
         self.norm_first = norm_first
 
-        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.multihead_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
+        self.multihead_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first)
         self.linear1 = Linear(d_model, dim_feedforward)
         self.linear2 = Linear(dim_feedforward, d_model)
         self.norm1 = LayerNorm(d_model, eps=layer_norm_eps)
@@ -2856,19 +2901,47 @@ class TransformerDecoderLayer(Module):
         self.dropout3 = Dropout(dropout) if dropout > 0 else Identity()
         self.activation = GELU() if activation == "gelu" else ReLU()
 
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, tgt_key_padding_mask=None, memory_key_padding_mask=None, tgt_is_causal: bool = False, memory_is_causal: bool = False):
         x = tgt
         if self.norm_first:
-            sa_out, _ = self.self_attn(self.norm1(x))
+            sa_out, _ = self.self_attn(
+                self.norm1(x),
+                attn_mask=tgt_mask,
+                key_padding_mask=tgt_key_padding_mask,
+                need_weights=False,
+                is_causal=tgt_is_causal,
+            )
             x = x + self.dropout1(sa_out)
-            ma_out, _ = self.multihead_attn(self.norm2(x), memory, memory)
+            ma_out, _ = self.multihead_attn(
+                self.norm2(x),
+                memory,
+                memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=False,
+                is_causal=memory_is_causal,
+            )
             x = x + self.dropout2(ma_out)
             ff_out = self.linear2(self.dropout(self.activation(self.linear1(self.norm3(x)))))
             x = x + self.dropout3(ff_out)
         else:
-            sa_out, _ = self.self_attn(x)
+            sa_out, _ = self.self_attn(
+                x,
+                attn_mask=tgt_mask,
+                key_padding_mask=tgt_key_padding_mask,
+                need_weights=False,
+                is_causal=tgt_is_causal,
+            )
             x = self.norm1(x + self.dropout1(sa_out))
-            ma_out, _ = self.multihead_attn(x, memory, memory)
+            ma_out, _ = self.multihead_attn(
+                x,
+                memory,
+                memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_key_padding_mask,
+                need_weights=False,
+                is_causal=memory_is_causal,
+            )
             x = self.norm2(x + self.dropout2(ma_out))
             ff_out = self.linear2(self.dropout(self.activation(self.linear1(x))))
             x = self.norm3(x + self.dropout3(ff_out))
@@ -2880,7 +2953,7 @@ class TransformerDecoder(Module):
     def __init__(self, decoder_layer: TransformerDecoderLayer, num_layers: int, norm=None):
         super().__init__()
         num_layers = _check_repeats("num_layers", num_layers)
-        self.layers = ModuleList([decoder_layer for _ in range(num_layers)])
+        self.layers = ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.norm = norm
 

@@ -595,18 +595,20 @@ impl Tensor {
                 Tensor::where_cond(&touched, &result, self)
             }
             "prod" | "amax" | "amin" => {
-                if self.requires_grad() || src.requires_grad() {
-                    return Err(Error::Msg(format!("scatter_reduce({reduce}): gradients are not supported")));
-                }
                 let mut out = self.to_vec::<f64>()?;
+                let self_v = out.clone();
                 let shape = self.shape().to_vec();
                 let sstr = strides_of(&shape);
                 let ishape = index.shape().to_vec();
                 let idx = index.to_vec::<i64>()?;
                 let sv = src.to_vec::<f64>()?;
                 let mut touched = vec![false; out.len()];
+                let mut dst_of_k = vec![0usize; sv.len()];
                 let istr = strides_of(&ishape);
                 for (flat, (&ix, &s)) in idx.iter().zip(&sv).enumerate() {
+                    if ix < 0 {
+                        return Err(Error::Msg("scatter_reduce: index out of range".into()));
+                    }
                     let mut dst = 0usize;
                     for d in 0..ishape.len() {
                         let coord = (flat / istr[d]) % ishape[d];
@@ -616,6 +618,7 @@ impl Tensor {
                         }
                         dst += c * sstr[d];
                     }
+                    dst_of_k[flat] = dst;
                     let cur = out[dst];
                     out[dst] = if !include_self && !touched[dst] {
                         s
@@ -628,7 +631,111 @@ impl Tensor {
                     };
                     touched[dst] = true;
                 }
-                Tensor::from_slice_on(&out, &shape, &self.device())?.to_dtype(self.dtype())
+                let res = Tensor::from_slice_on(&out, &shape, &self.device())?.to_dtype(self.dtype())?;
+                let self_req = self.requires_grad();
+                let src_req = src.requires_grad();
+                if !crate::tensor::is_grad_enabled() || (!self_req && !src_req) {
+                    return Ok(res);
+                }
+
+                let mut self_factor = vec![0.0f64; out.len()];
+                let mut src_factor = vec![0.0f64; sv.len()];
+                if reduce == "prod" {
+                    let mut slots = vec![Vec::<usize>::new(); out.len()];
+                    for (k, &dst) in dst_of_k.iter().enumerate() {
+                        slots[dst].push(k);
+                    }
+                    for dst in 0..out.len() {
+                        let ks = &slots[dst];
+                        if ks.is_empty() {
+                            self_factor[dst] = 1.0;
+                            continue;
+                        }
+                        let mut vals = Vec::with_capacity(ks.len() + usize::from(include_self));
+                        if include_self {
+                            vals.push(self_v[dst]);
+                        }
+                        for &k in ks {
+                            vals.push(sv[k]);
+                        }
+                        let mut pref = Vec::with_capacity(vals.len());
+                        let mut acc = 1.0f64;
+                        for &v in &vals {
+                            pref.push(acc);
+                            acc *= v;
+                        }
+                        let mut suf = 1.0f64;
+                        let mut facs = vec![0.0f64; vals.len()];
+                        for j in (0..vals.len()).rev() {
+                            facs[j] = pref[j] * suf;
+                            suf *= vals[j];
+                        }
+                        let offset = if include_self {
+                            self_factor[dst] = facs[0];
+                            1
+                        } else {
+                            0
+                        };
+                        for (pos, &k) in ks.iter().enumerate() {
+                            src_factor[k] = facs[offset + pos];
+                        }
+                    }
+                } else {
+                    let mut win_count = vec![0usize; out.len()];
+                    let mut self_wins = vec![false; out.len()];
+                    let mut src_wins = vec![false; sv.len()];
+                    for dst in 0..out.len() {
+                        if (include_self || !touched[dst]) && self_v[dst] == out[dst] {
+                            self_wins[dst] = true;
+                            win_count[dst] += 1;
+                        }
+                    }
+                    for (k, (&s, &dst)) in sv.iter().zip(&dst_of_k).enumerate() {
+                        if s == out[dst] {
+                            src_wins[k] = true;
+                            win_count[dst] += 1;
+                        }
+                    }
+                    for dst in 0..out.len() {
+                        if self_wins[dst] && win_count[dst] > 0 {
+                            self_factor[dst] = 1.0 / (win_count[dst] as f64);
+                        }
+                    }
+                    for k in 0..sv.len() {
+                        let dst = dst_of_k[k];
+                        if src_wins[k] && win_count[dst] > 0 {
+                            src_factor[k] = 1.0 / (win_count[dst] as f64);
+                        }
+                    }
+                }
+
+                let self_shape = shape;
+                let src_shape = ishape;
+                let self_dtype = self.dtype();
+                let src_dtype = src.dtype();
+                let dev = self.device();
+                Ok(Tensor::from_op(
+                    res.storage().clone(),
+                    res.layout().clone(),
+                    "scatter_reduce",
+                    vec![self.clone(), src.clone()],
+                    move |g| {
+                        let gv = g.to_vec::<f64>()?;
+                        let gx = if self_req {
+                            let v: Vec<f64> = gv.iter().zip(&self_factor).map(|(&gi, &f)| gi * f).collect();
+                            Some(Tensor::from_slice_on(&v, &self_shape, &dev)?.to_dtype(self_dtype)?)
+                        } else {
+                            None
+                        };
+                        let gsrc = if src_req {
+                            let v: Vec<f64> = dst_of_k.iter().zip(&src_factor).map(|(&dst, &f)| gv[dst] * f).collect();
+                            Some(Tensor::from_slice_on(&v, &src_shape, &dev)?.to_dtype(src_dtype)?)
+                        } else {
+                            None
+                        };
+                        Ok(vec![gx, gsrc])
+                    },
+                ))
             }
             other => Err(Error::Msg(format!("scatter_reduce: unknown reduction '{other}'"))),
         }

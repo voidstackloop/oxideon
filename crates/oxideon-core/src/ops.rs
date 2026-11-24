@@ -2686,11 +2686,47 @@ impl Tensor {
         if let Some(x) = crate::amp::fp32_input(self)? {
             return x.log_softmax(axis);
         }
+        if self.ndim() == 0 {
+            if axis != 0 && axis != -1 {
+                return Err(Error::InvalidAxis {
+                    op: "log_softmax",
+                    axis,
+                    ndim: 0,
+                });
+            }
+            let out_val = self.zeros_like()?;
+            let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+            if !needs_grad {
+                return Ok(out_val);
+            }
+            return Ok(Tensor::from_op(
+                out_val.storage().clone(),
+                out_val.layout().clone(),
+                "log_softmax",
+                vec![self.clone()],
+                move |g| Ok(vec![Some(g.zeros_like()?)]),
+            ));
+        }
+        let ax = normalize_axis("log_softmax", axis, self.ndim())?;
+        if self.numel() == 0 {
+            let out_val = self.zeros_like()?;
+            let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+            if !needs_grad {
+                return Ok(out_val);
+            }
+            return Ok(Tensor::from_op(
+                out_val.storage().clone(),
+                out_val.layout().clone(),
+                "log_softmax",
+                vec![self.clone()],
+                move |g| Ok(vec![Some(g.zeros_like()?)]),
+            ));
+        }
         if !self.dtype().is_floating_point() {
             return self.sub(&self.logsumexp(axis, true)?);
         }
         // CUDA tensors: one fused kernel for the whole row (rows with a non-finite maximum are checked when recording gradients)
-        if self.ndim() > 0 && normalize_axis("log_softmax", axis, self.ndim())? == self.ndim() - 1 {
+        if ax == self.ndim() - 1 {
             let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
             if let Some(out_storage) = self.storage().try_log_softmax_last_axis(self.layout(), needs_grad) {
                 let out_layout = Layout::contiguous(self.shape());
@@ -2749,9 +2785,43 @@ impl Tensor {
         if let Some(x) = crate::amp::fp32_input(self)? {
             return x.softmax(axis);
         }
+        if self.ndim() == 0 {
+            if axis != 0 && axis != -1 {
+                return Err(Error::InvalidAxis {
+                    op: "softmax",
+                    axis,
+                    ndim: 0,
+                });
+            }
+            let out_val = self.ones_like()?;
+            let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+            if !needs_grad {
+                return Ok(out_val);
+            }
+            return Ok(Tensor::from_op(
+                out_val.storage().clone(),
+                out_val.layout().clone(),
+                "softmax",
+                vec![self.clone()],
+                move |g| Ok(vec![Some(g.zeros_like()?)]),
+            ));
+        }
         let ax = normalize_axis("softmax", axis, self.ndim())?;
-        if self.ndim() > 0
-            && ax == self.ndim() - 1
+        if self.numel() == 0 {
+            let out_val = self.zeros_like()?;
+            let needs_grad = crate::tensor::is_grad_enabled() && self.requires_grad();
+            if !needs_grad {
+                return Ok(out_val);
+            }
+            return Ok(Tensor::from_op(
+                out_val.storage().clone(),
+                out_val.layout().clone(),
+                "softmax",
+                vec![self.clone()],
+                move |g| Ok(vec![Some(g.zeros_like()?)]),
+            ));
+        }
+        if ax == self.ndim() - 1
             && let Some(out_storage) = self.storage().try_softmax_last_axis(self.layout(), crate::tensor::is_grad_enabled() && self.requires_grad())
         {
             let out_layout = Layout::contiguous(self.shape());
@@ -3919,40 +3989,17 @@ impl Tensor {
     /// Automatically differentiates through any 1- or 2-operand `einsum`!
     pub fn einsum(equation: &str, operands: &[&Tensor]) -> Result<Tensor> {
         let eq: String = equation.chars().filter(|c| !c.is_whitespace()).collect();
-        let (lhs_str, rhs_str) = match eq.split_once("->") {
-            Some((l, r)) => (l.to_string(), r.to_string()),
-            None => {
-                // Implicit output: sorted unique indices that appear exactly once.
-                let mut counts = HashMap::<char, usize>::new();
-                for c in eq.chars().filter(|&c| c != ',') {
-                    *counts.entry(c).or_insert(0) += 1;
-                }
-                let mut implicit: Vec<char> = counts
-                    .into_iter()
-                    .filter(|&(_, cnt)| cnt == 1)
-                    .map(|(c, _)| c)
-                    .collect();
-                implicit.sort_unstable();
-                (eq, implicit.into_iter().collect())
-            }
-        };
+        let (in_specs_owned, rhs_str, bcast_ops): (Vec<String>, String, Vec<Tensor>) =
+            expand_einsum_specs(&eq, operands)?;
+        let op_refs: Vec<&Tensor> = bcast_ops.iter().collect();
+        let in_specs: Vec<&str> = in_specs_owned.iter().map(|s| s.as_str()).collect();
 
-        let in_specs: Vec<&str> = lhs_str.split(',').collect();
-        if in_specs.len() != operands.len() {
-            return Err(Error::Msg(format!(
-                "einsum: equation expects {} operands, got {}",
-                in_specs.len(),
-                operands.len()
-            )));
-        }
-
-        if let Some(t) = einsum_composed(&in_specs, &rhs_str, operands)? {
+        if let Some(t) = einsum_composed(&in_specs, &rhs_str, &op_refs)? {
             return Ok(t);
         }
-        let out_val = no_grad(|| eval_einsum_forward(&in_specs, &rhs_str, operands))?;
-        let owned_ops: Vec<Tensor> = operands.iter().map(|&t| t.clone()).collect();
-        let in_specs_owned: Vec<String> = in_specs.iter().map(|s| (*s).to_string()).collect();
-        let out_spec = rhs_str.clone();
+        let out_val = no_grad(|| eval_einsum_forward(&in_specs, &rhs_str, &op_refs))?;
+        let owned_ops = bcast_ops;
+        let out_spec = rhs_str;
 
         Ok(Tensor::from_op(
             out_val.storage().clone(),
@@ -7354,6 +7401,177 @@ struct Fold2dGeo {
 /// output needs it. A label repeated inside one operand (a diagonal, as in `ii->i`) is folded with an identity mask and a
 /// sum; operands of different float/integer dtypes are cast to the widest one. Returns `None` (so the scalar loop below
 /// reports the error) for malformed equations, operands on different devices, or bool/complex data.
+fn expand_einsum_specs(
+    eq: &str,
+    operands: &[&Tensor],
+) -> Result<(Vec<String>, String, Vec<Tensor>)> {
+    let (lhs_str, rhs_opt) = match eq.split_once("->") {
+        Some((l, r)) => (l, Some(r)),
+        None => (eq, None),
+    };
+    let raw_specs: Vec<&str> = lhs_str.split(',').collect();
+    if raw_specs.len() != operands.len() {
+        return Err(Error::Msg(format!(
+            "einsum: equation expects {} operands, got {}",
+            raw_specs.len(),
+            operands.len()
+        )));
+    }
+    let has_dots = raw_specs.iter().any(|s| s.contains('.'))
+        || rhs_opt.is_some_and(|r| r.contains('.'));
+    if !has_dots {
+        let out = match rhs_opt {
+            Some(r) => r.to_string(),
+            None => {
+                let mut counts = HashMap::<char, usize>::new();
+                for c in lhs_str.chars().filter(|&c| c != ',') {
+                    *counts.entry(c).or_insert(0) += 1;
+                }
+                let mut implicit: Vec<char> = counts
+                    .into_iter()
+                    .filter(|&(_, cnt)| cnt == 1)
+                    .map(|(c, _)| c)
+                    .collect();
+                implicit.sort_unstable();
+                implicit.into_iter().collect()
+            }
+        };
+        return Ok((
+            raw_specs.into_iter().map(|s| s.to_string()).collect(),
+            out,
+            operands.iter().map(|&t| t.clone()).collect(),
+        ));
+    }
+
+    let parse_spec = |spec: &str| -> Result<Option<(String, String)>> {
+        if !spec.contains('.') {
+            return Ok(None);
+        }
+        let parts: Vec<&str> = spec.split("...").collect();
+        if parts.len() != 2 || parts[0].contains('.') || parts[1].contains('.') {
+            return Err(Error::Msg(format!(
+                "einsum: invalid ellipsis in subscript '{spec}'"
+            )));
+        }
+        Ok(Some((parts[0].to_string(), parts[1].to_string())))
+    };
+
+    let mut parsed_in = Vec::with_capacity(raw_specs.len());
+    let mut bcast_rank = 0usize;
+    for (&spec, &t) in raw_specs.iter().zip(operands) {
+        let p = parse_spec(spec)?;
+        if let Some((ref pre, ref post)) = p {
+            let fixed = pre.chars().count() + post.chars().count();
+            if fixed > t.ndim() {
+                return Err(Error::Msg(format!(
+                    "einsum: subscript '{spec}' has at least {fixed} labels for tensor of rank {}",
+                    t.ndim()
+                )));
+            }
+            bcast_rank = bcast_rank.max(t.ndim() - fixed);
+        }
+        parsed_in.push(p);
+    }
+
+    let mut bcast_shape = vec![1usize; bcast_rank];
+    for (p, &t) in parsed_in.iter().zip(operands) {
+        if let Some((ref pre, ref post)) = *p {
+            let pre_len = pre.chars().count();
+            let ell_len = t.ndim() - pre_len - post.chars().count();
+            let offset = bcast_rank - ell_len;
+            for (i, &d) in t.shape()[pre_len..pre_len + ell_len].iter().enumerate() {
+                let target = &mut bcast_shape[offset + i];
+                if *target == 1 {
+                    *target = d;
+                } else if d != 1 && d != *target {
+                    return Err(Error::Msg(format!(
+                        "einsum: ellipsis broadcast dimension mismatch ({} vs {d})",
+                        *target
+                    )));
+                }
+            }
+        }
+    }
+
+    let used_chars: Vec<char> = eq.chars().collect();
+    let mut ell_labels = Vec::with_capacity(bcast_rank);
+    let mut code = 0xE000u32;
+    while ell_labels.len() < bcast_rank {
+        let ch = char::from_u32(code).expect("valid PUA char");
+        code += 1;
+        if !used_chars.contains(&ch) {
+            ell_labels.push(ch);
+        }
+    }
+    let ell_str: String = ell_labels.iter().collect();
+
+    let mut expanded_specs = Vec::with_capacity(raw_specs.len());
+    let mut expanded_ops = Vec::with_capacity(operands.len());
+    for ((p, &spec), &t) in parsed_in.iter().zip(&raw_specs).zip(operands) {
+        match p {
+            None => {
+                expanded_specs.push(spec.to_string());
+                expanded_ops.push(t.clone());
+            }
+            Some((pre, post)) => {
+                let pre_len = pre.chars().count();
+                let post_len = post.chars().count();
+                let ell_len = t.ndim() - pre_len - post_len;
+                let mut reshaped_shape = Vec::with_capacity(pre_len + bcast_rank + post_len);
+                let mut target_shape = Vec::with_capacity(pre_len + bcast_rank + post_len);
+                reshaped_shape.extend_from_slice(&t.shape()[..pre_len]);
+                reshaped_shape.extend(std::iter::repeat_n(1usize, bcast_rank - ell_len));
+                reshaped_shape.extend_from_slice(&t.shape()[pre_len..pre_len + ell_len]);
+                reshaped_shape.extend_from_slice(&t.shape()[pre_len + ell_len..]);
+
+                target_shape.extend_from_slice(&t.shape()[..pre_len]);
+                target_shape.extend_from_slice(&bcast_shape);
+                target_shape.extend_from_slice(&t.shape()[pre_len + ell_len..]);
+
+                let mut cur = if reshaped_shape != t.shape() {
+                    t.reshape(&reshaped_shape)?
+                } else {
+                    t.clone()
+                };
+                if target_shape != cur.shape() {
+                    cur = cur.broadcast_to(&target_shape)?;
+                }
+                expanded_ops.push(cur);
+                expanded_specs.push(format!("{pre}{ell_str}{post}"));
+            }
+        }
+    }
+
+    let out_spec = match rhs_opt {
+        Some(r) => match parse_spec(r)? {
+            Some((pre, post)) => format!("{pre}{ell_str}{post}"),
+            None => r.to_string(),
+        },
+        None => {
+            let mut counts = HashMap::<char, usize>::new();
+            for (p, &spec) in parsed_in.iter().zip(&raw_specs) {
+                let non_ell = match p {
+                    Some((pre, post)) => pre.chars().chain(post.chars()).collect::<Vec<_>>(),
+                    None => spec.chars().collect::<Vec<_>>(),
+                };
+                for c in non_ell {
+                    *counts.entry(c).or_insert(0) += 1;
+                }
+            }
+            let mut implicit: Vec<char> = counts
+                .into_iter()
+                .filter(|&(_, cnt)| cnt == 1)
+                .map(|(c, _)| c)
+                .collect();
+            implicit.sort_unstable();
+            let rest: String = implicit.into_iter().collect();
+            format!("{ell_str}{rest}")
+        }
+    };
+
+    Ok((expanded_specs, out_spec, expanded_ops))
+}
+
 fn einsum_composed(in_specs: &[&str], out_spec: &str, ops: &[&Tensor]) -> Result<Option<Tensor>> {
     let mut labels: Vec<Vec<char>> = in_specs.iter().map(|s| s.chars().collect()).collect();
     let out: Vec<char> = out_spec.chars().collect();
@@ -7441,10 +7659,10 @@ fn eval_einsum_forward(in_specs: &[&str], out_spec: &str, ops: &[&Tensor]) -> Re
     let mut all_labels = Vec::<char>::new();
 
     for (&spec, &t) in in_specs.iter().zip(ops) {
-        if spec.len() != t.ndim() {
+        let label_count = spec.chars().count();
+        if label_count != t.ndim() {
             return Err(Error::Msg(format!(
-                "einsum: subscript '{spec}' has {} labels for tensor of rank {}",
-                spec.len(),
+                "einsum: subscript '{spec}' has {label_count} labels for tensor of rank {}",
                 t.ndim()
             )));
         }

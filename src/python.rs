@@ -4735,8 +4735,8 @@ fn extract_pair2(val: &Bound<'_, PyAny>, name: &str) -> PyResult<(usize, usize)>
 
 trait PyLayerParams {
     const OWNER: &'static str;
-    fn param_pairs(&self) -> Vec<(&'static str, &Tensor)>;
-    fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)>;
+    fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)>;
+    fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)>;
 }
 
 fn layer_state_dict<L: PyLayerParams>(
@@ -4747,7 +4747,7 @@ fn layer_state_dict<L: PyLayerParams>(
     let dict = pyo3::types::PyDict::new(py);
     for (k, t) in layer.param_pairs() {
         let key = if prefix.is_empty() {
-            k.to_string()
+            k.into_owned()
         } else {
             format!("{prefix}{k}")
         };
@@ -4762,7 +4762,7 @@ fn layer_named_parameters<L: PyLayerParams>(layer: &L, prefix: &str) -> Vec<(Str
         .into_iter()
         .map(|(k, t)| {
             let key = if prefix.is_empty() {
-                k.to_string()
+                k.into_owned()
             } else {
                 format!("{prefix}{k}")
             };
@@ -4785,23 +4785,24 @@ fn layer_load_state_dict<L: PyLayerParams>(
         .filter_map(|k| k.extract::<String>().ok())
         .collect();
     for (name, dst) in layer.param_pairs_mut() {
-        if let Some(val) = state_dict.get_item(name)? {
-            unexpected.retain(|k| k != name);
+        let name_ref = name.as_ref();
+        if let Some(val) = state_dict.get_item(name_ref)? {
+            unexpected.retain(|k| k != name_ref);
             let src = val.extract::<PyRef<'_, PyTensor>>()?;
             if dst.shape() != src.inner.shape() {
                 return Err(PyRuntimeError::new_err(format!(
-                    "Error(s) in loading state_dict for {owner}:\n\tWhile copying '{name}': shape mismatch (expected {:?}, got {:?})",
+                    "Error(s) in loading state_dict for {owner}:\n\tWhile copying '{name_ref}': shape mismatch (expected {:?}, got {:?})",
                     dst.shape(),
                     src.inner.shape()
                 )));
             }
             crate::tensor::no_grad(|| dst.copy_(&src.inner)).map_err(|e| {
                 PyRuntimeError::new_err(format!(
-                    "Error(s) in loading state_dict for {owner}:\n\tWhile copying '{name}': {e}"
+                    "Error(s) in loading state_dict for {owner}:\n\tWhile copying '{name_ref}': {e}"
                 ))
             })?;
         } else {
-            missing.push(name.to_string());
+            missing.push(name_ref.to_string());
         }
     }
     if strict && (!missing.is_empty() || !unexpected.is_empty()) {
@@ -4832,25 +4833,25 @@ macro_rules! impl_py_layer_params {
     ($ty:ty, $owner:literal, weight_only) => {
         impl PyLayerParams for $ty {
             const OWNER: &'static str = $owner;
-            fn param_pairs(&self) -> Vec<(&'static str, &Tensor)> {
-                vec![("weight", &self.inner.weight)]
+            fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> {
+                vec![(std::borrow::Cow::Borrowed("weight"), &self.inner.weight)]
             }
-            fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)> {
-                vec![("weight", &mut self.inner.weight)]
+            fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> {
+                vec![(std::borrow::Cow::Borrowed("weight"), &mut self.inner.weight)]
             }
         }
     };
     ($ty:ty, $owner:literal, opt_bias) => {
         impl PyLayerParams for $ty {
             const OWNER: &'static str = $owner;
-            fn param_pairs(&self) -> Vec<(&'static str, &Tensor)> {
-                let mut pairs = vec![("weight", &self.inner.weight)];
-                if let Some(b) = &self.inner.bias { pairs.push(("bias", b)); }
+            fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> {
+                let mut pairs = vec![(std::borrow::Cow::Borrowed("weight"), &self.inner.weight)];
+                if let Some(b) = &self.inner.bias { pairs.push((std::borrow::Cow::Borrowed("bias"), b)); }
                 pairs
             }
-            fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)> {
-                let mut pairs = vec![("weight", &mut self.inner.weight)];
-                if let Some(b) = self.inner.bias.as_mut() { pairs.push(("bias", b)); }
+            fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> {
+                let mut pairs = vec![(std::borrow::Cow::Borrowed("weight"), &mut self.inner.weight)];
+                if let Some(b) = self.inner.bias.as_mut() { pairs.push((std::borrow::Cow::Borrowed("bias"), b)); }
                 pairs
             }
         }
@@ -4858,11 +4859,29 @@ macro_rules! impl_py_layer_params {
     ($ty:ty, $owner:literal, req_bias) => {
         impl PyLayerParams for $ty {
             const OWNER: &'static str = $owner;
-            fn param_pairs(&self) -> Vec<(&'static str, &Tensor)> {
-                vec![("weight", &self.inner.weight), ("bias", &self.inner.bias)]
+            fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> {
+                vec![(std::borrow::Cow::Borrowed("weight"), &self.inner.weight), (std::borrow::Cow::Borrowed("bias"), &self.inner.bias)]
             }
-            fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)> {
-                vec![("weight", &mut self.inner.weight), ("bias", &mut self.inner.bias)]
+            fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> {
+                vec![(std::borrow::Cow::Borrowed("weight"), &mut self.inner.weight), (std::borrow::Cow::Borrowed("bias"), &mut self.inner.bias)]
+            }
+        }
+    };
+    ($ty:ty, $owner:literal, empty) => {
+        impl PyLayerParams for $ty {
+            const OWNER: &'static str = $owner;
+            fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> { Vec::new() }
+            fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> { Vec::new() }
+        }
+    };
+    ($ty:ty, $owner:literal, field $name:literal, $field:ident) => {
+        impl PyLayerParams for $ty {
+            const OWNER: &'static str = $owner;
+            fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> {
+                vec![(std::borrow::Cow::Borrowed($name), &self.inner.$field)]
+            }
+            fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> {
+                vec![(std::borrow::Cow::Borrowed($name), &mut self.inner.$field)]
             }
         }
     };
@@ -5152,7 +5171,16 @@ impl PyDropout {
     pub fn parameters(&self) -> Vec<PyTensor> {
         Vec::new()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyDropout, "Dropout", empty);
 
 /// Rectified linear unit, `max(x, 0)`, as a layer.
 #[pyclass(name = "ReLU", module = "oxideon")]
@@ -5178,7 +5206,19 @@ impl PyReLU {
     pub fn parameters(&self) -> Vec<PyTensor> {
         Vec::new()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyReLU, "ReLU", empty);
 
 /// Multi-Layer Perceptron that can execute both single forward passes and **entire multi-epoch
 /// training loops (`train_epochs_in_rust`) 100% inside native Rust** with the Python GIL released.
@@ -5292,6 +5332,36 @@ impl PyMLP {
             Ok::<Vec<f64>, Error>(history)
         })
         .map_err(to_py_err)
+    }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
+}
+
+impl PyLayerParams for PyMLP {
+    const OWNER: &'static str = "MLP";
+    fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> {
+        let mut p = Vec::new();
+        for (i, l) in self.layers.iter().enumerate() {
+            p.push((std::borrow::Cow::Owned(format!("layers.{i}.weight")), &l.weight));
+            if let Some(b) = &l.bias { p.push((std::borrow::Cow::Owned(format!("layers.{i}.bias")), b)); }
+        }
+        p
+    }
+    fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> {
+        let mut p = Vec::new();
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            p.push((std::borrow::Cow::Owned(format!("layers.{i}.weight")), &mut l.weight));
+            if let Some(b) = l.bias.as_mut() { p.push((std::borrow::Cow::Owned(format!("layers.{i}.bias")), b)); }
+        }
+        p
     }
 }
 
@@ -5516,7 +5586,21 @@ impl PyMaxPool1d {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { Vec::new() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyMaxPool1d, "MaxPool1d", empty);
 
 #[pyclass(name = "AvgPool1d", module = "oxideon")]
 pub struct PyAvgPool1d {
@@ -5540,7 +5624,21 @@ impl PyAvgPool1d {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { Vec::new() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyAvgPool1d, "AvgPool1d", empty);
 
 #[pyclass(name = "ConvTranspose3d", module = "oxideon")]
 pub struct PyConvTranspose3d {
@@ -5585,7 +5683,21 @@ impl PyConvTranspose3d {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { self.inner.parameters().into_iter().map(|inner| PyTensor { inner }).collect() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyConvTranspose3d, "ConvTranspose3d", opt_bias);
 
 #[pyclass(name = "InstanceNorm1d", module = "oxideon")]
 pub struct PyInstanceNorm1d {
@@ -5664,7 +5776,21 @@ impl PyEmbeddingBag {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, indices: &PyTensor) -> PyResult<PyTensor> { self.forward(py, indices) }
+    pub fn parameters(&self) -> Vec<PyTensor> { vec![PyTensor { inner: self.inner.weight.clone() }] }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyEmbeddingBag, "EmbeddingBag", weight_only);
 
 #[pyclass(name = "ReLU6", module = "oxideon")]
 #[derive(Default)]
@@ -5685,7 +5811,21 @@ impl PyReLU6 {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { Vec::new() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyReLU6, "ReLU6", empty);
 
 #[pyclass(name = "Hardtanh", module = "oxideon")]
 pub struct PyHardtanh {
@@ -5708,7 +5848,21 @@ impl PyHardtanh {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { Vec::new() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyHardtanh, "Hardtanh", empty);
 
 #[pyclass(name = "Softshrink", module = "oxideon")]
 pub struct PySoftshrink {
@@ -5731,7 +5885,21 @@ impl PySoftshrink {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { Vec::new() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PySoftshrink, "Softshrink", empty);
 
 #[pyclass(name = "Hardshrink", module = "oxideon")]
 pub struct PyHardshrink {
@@ -5754,7 +5922,21 @@ impl PyHardshrink {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { Vec::new() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyHardshrink, "Hardshrink", empty);
 
 #[pyclass(name = "LogSigmoid", module = "oxideon")]
 #[derive(Default)]
@@ -5775,7 +5957,21 @@ impl PyLogSigmoid {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> { self.forward(py, x) }
+    pub fn parameters(&self) -> Vec<PyTensor> { Vec::new() }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyLogSigmoid, "LogSigmoid", empty);
 
 #[pyclass(name = "MarginRankingLoss", module = "oxideon")]
 pub struct PyMarginRankingLoss {
@@ -8751,7 +8947,19 @@ impl PySpectralNormLinear {
             .map(|t| PyTensor { inner: t })
             .collect()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { self.inner.train(mode); }
+    pub fn eval(&self) { self.inner.train(false); }
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PySpectralNormLinear, "SpectralNormLinear", opt_bias);
 
 #[pyclass(name = "WeightNormLinear", module = "oxideon")]
 pub struct PyWeightNormLinear {
@@ -8785,6 +8993,36 @@ impl PyWeightNormLinear {
             .into_iter()
             .map(|t| PyTensor { inner: t })
             .collect()
+    }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
+}
+
+impl PyLayerParams for PyWeightNormLinear {
+    const OWNER: &'static str = "WeightNormLinear";
+    fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> {
+        let mut p = vec![
+            (std::borrow::Cow::Borrowed("weight_g"), &self.inner.weight_g),
+            (std::borrow::Cow::Borrowed("weight_v"), &self.inner.weight_v),
+        ];
+        if let Some(b) = &self.inner.bias { p.push((std::borrow::Cow::Borrowed("bias"), b)); }
+        p
+    }
+    fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> {
+        let mut p = vec![
+            (std::borrow::Cow::Borrowed("weight_g"), &mut self.inner.weight_g),
+            (std::borrow::Cow::Borrowed("weight_v"), &mut self.inner.weight_v),
+        ];
+        if let Some(b) = self.inner.bias.as_mut() { p.push((std::borrow::Cow::Borrowed("bias"), b)); }
+        p
     }
 }
 
@@ -8821,7 +9059,19 @@ impl PyMaxout {
     pub fn parameters(&self) -> Vec<PyTensor> {
         Vec::new()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyMaxout, "Maxout", empty);
 
 /// Snake activation `x + sin(alpha x)^2 / alpha` with a learnable per-feature `alpha`.
 #[pyclass(name = "Snake", module = "oxideon")]
@@ -8867,7 +9117,19 @@ impl PySnake {
             inner: self.inner.alpha.clone(),
         }]
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PySnake, "Snake", field "alpha", alpha);
 
 /// Swish `x * sigmoid(beta x)` with a learnable scalar `beta`.
 #[pyclass(name = "Swish", module = "oxideon")]
@@ -8913,7 +9175,19 @@ impl PySwish {
             inner: self.inner.beta.clone(),
         }]
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PySwish, "Swish", field "beta", beta);
 
 /// Stochastic Depth / DropPath (`timm.layers.DropPath`, Huang et al. / ConvNeXt / ViT).
 #[pyclass(name = "DropPath", module = "oxideon")]
@@ -8959,7 +9233,16 @@ impl PyDropPath {
     pub fn parameters(&self) -> Vec<PyTensor> {
         Vec::new()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyDropPath, "DropPath", empty);
 
 /// Applies Alpha Dropout over the input tensor (Klambauer et al., SELU networks).
 #[pyclass(name = "AlphaDropout", module = "oxideon")]
@@ -9196,7 +9479,19 @@ impl PyUpsample2d {
     pub fn parameters(&self) -> Vec<PyTensor> {
         Vec::new()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyUpsample2d, "Upsample2d", empty);
 
 /// An Elman RNN cell with tanh or ReLU non-linearity.
 #[pyclass(name = "RNNCell", module = "oxideon")]

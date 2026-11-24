@@ -1887,67 +1887,85 @@ def cross_entropy(
     input: _Tensor,
     target: Any,
     weight: Optional[_Tensor] = None,
-    reduction: str = "mean",
+    size_average: Optional[bool] = None,
     ignore_index: int = -100,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
     label_smoothing: float = 0.0,
 ) -> _Tensor:
-    """Cross entropy loss supporting PyTorch-compatible reduction modes, arbitrary batch/spatial dimensions, and label smoothing."""
+    """Cross entropy loss supporting PyTorch-compatible reductions, ignore_index, weights, soft targets, and label smoothing."""
     if reduction not in ("mean", "sum", "none"):
         raise ValueError(f"cross_entropy: reduction must be 'mean', 'sum' or 'none', got {reduction!r}")
+    if not (0.0 <= label_smoothing < 1.0):
+        raise ValueError(f"cross_entropy: label_smoothing must be in [0.0, 1.0), got {label_smoothing}")
+    if target is None or isinstance(target, (str, bytes)):
+        raise TypeError(f"cross_entropy: target must be a Tensor or sequence of numbers, got {type(target).__name__}")
+    if not isinstance(target, _Tensor):
+        t_probe = np.asarray(target)
+        if t_probe.dtype.kind not in ("i", "u", "f", "b"):
+            raise TypeError(f"cross_entropy: target elements must be numeric, got dtype {t_probe.dtype}")
+
+    tgt_is_float = (
+        (isinstance(target, _Tensor) and target.dtype in ("f16", "bf16", "f32", "f64"))
+        or (isinstance(target, np.ndarray) and np.issubdtype(target.dtype, np.floating))
+    )
 
     # 1. Empty batch handling
     if input.shape[0] == 0 or input.numel() == 0:
+        out_dt = np.float64 if input.dtype == "f64" else np.float32
         if reduction == "none":
-            t_shape = target.shape if isinstance(target, _Tensor) else ()
-            return _from_numpy(np.zeros(t_shape, dtype=np.float32)).to(input.device)
-        elif reduction == "mean":
-            return _from_numpy(np.array(float("nan"), dtype=np.float32)).to(input.device)
-        else:
-            return _from_numpy(np.array(0.0, dtype=np.float32)).to(input.device)
+            if tgt_is_float and input.ndim >= 2:
+                t_shape = [input.shape[0]] + list(input.shape[2:])
+            else:
+                t_shape = list(target.shape) if isinstance(target, _Tensor) else []
+            return _from_numpy(np.zeros(t_shape, dtype=out_dt)).to(input.device)
+        if reduction == "mean":
+            return _from_numpy(np.array(float("nan"), dtype=out_dt)).to(input.device)
+        return _from_numpy(np.array(0.0, dtype=out_dt)).to(input.device)
 
     # 2. Unbatched 1D logits [C] -> unsqueeze to [1, C]
     if input.ndim == 1:
-        if isinstance(target, int):
-            tgt_1d = _from_numpy(np.array([target], dtype=np.int64)).to(input.device)
+        if tgt_is_float:
+            tgt_t = _as_tensor(target).to(input.device).unsqueeze(0)
+        elif isinstance(target, int):
+            tgt_t = _from_numpy(np.array([target], dtype=np.int64)).to(input.device)
         elif isinstance(target, _Tensor):
             if target.numel() != 1:
                 raise RuntimeError(f"cross_entropy: unbatched 1D logits [C={input.shape[0]}] expects 0D or 1-element target, got {target.shape}")
-            tgt_1d = target.reshape([1])
+            tgt_t = target.reshape([1])
         else:
             t_arr = np.asarray(target, dtype=np.int64)
             if t_arr.size != 1:
                 raise RuntimeError(f"cross_entropy: unbatched 1D logits [C={input.shape[0]}] expects 0D or 1-element target, got {t_arr.size} elements")
-            tgt_1d = _from_numpy(t_arr.reshape([1])).to(input.device)
-        inp_2d = input.unsqueeze(0)
+            tgt_t = _from_numpy(t_arr.reshape([1])).to(input.device)
         res = cross_entropy(
-            inp_2d,
-            tgt_1d,
+            input.unsqueeze(0),
+            tgt_t,
             weight=weight,
             reduction=reduction,
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
         )
-        if reduction == "none":
-            return res.squeeze(0)
-        return res
+        return res.squeeze(0) if reduction == "none" else res
 
     # 3. K-D segmentation logits [N, C, d1, d2, ...]
     if input.ndim > 2:
         c = input.shape[1]
         perm = [0] + list(range(2, input.ndim)) + [1]
-        inp_perm = input.permute(perm)
-        inp_flat = inp_perm.reshape([-1, c])
-        if isinstance(target, _Tensor):
-            target_shape = list(target.shape)
-            if target.numel() != inp_flat.shape[0]:
-                raise RuntimeError(f"cross_entropy: target elements ({target.numel()}) does not match input spatial elements ({inp_flat.shape[0]})")
-            tgt_flat = target.reshape([-1])
+        inp_flat = input.permute(perm).reshape([-1, c])
+        tgt_raw = target if isinstance(target, _Tensor) else _from_numpy(
+            np.asarray(target, dtype=np.float32 if tgt_is_float else np.int64)
+        ).to(input.device)
+        if tgt_is_float:
+            if list(tgt_raw.shape) != list(input.shape):
+                raise RuntimeError(f"cross_entropy: soft target shape {tgt_raw.shape} does not match input shape {input.shape}")
+            out_shape = [input.shape[0]] + list(input.shape[2:])
+            tgt_flat = tgt_raw.permute(perm).reshape([-1, c])
         else:
-            t_arr = np.asarray(target, dtype=np.int64)
-            target_shape = list(t_arr.shape)
-            if t_arr.size != inp_flat.shape[0]:
-                raise RuntimeError(f"cross_entropy: target elements ({t_arr.size}) does not match input spatial elements ({inp_flat.shape[0]})")
-            tgt_flat = _from_numpy(t_arr.reshape([-1])).to(input.device)
+            out_shape = list(tgt_raw.shape)
+            if tgt_raw.numel() != inp_flat.shape[0]:
+                raise RuntimeError(f"cross_entropy: target elements ({tgt_raw.numel()}) does not match input spatial elements ({inp_flat.shape[0]})")
+            tgt_flat = tgt_raw.reshape([-1])
         res = cross_entropy(
             inp_flat,
             tgt_flat,
@@ -1956,33 +1974,60 @@ def cross_entropy(
             ignore_index=ignore_index,
             label_smoothing=label_smoothing,
         )
-        if reduction == "none":
-            return res.reshape(target_shape)
-        return res
+        return res.reshape(out_shape) if reduction == "none" else res
 
     # 4. Standard 2D [N, C]
-    if weight is None and ignore_index == -100 and reduction != "none":
-        base = _native_cross_entropy(input, target, label_smoothing=label_smoothing)
-        if reduction == "mean":
-            return base
-        if reduction == "sum":
-            return base * float(input.shape[0])
-
+    num_classes = input.shape[1]
     log_probs = input.log_softmax(-1)
-    t_np = _to_np(target).astype(np.int64)
-    b = input.shape[0]
-    losses = []
-    for i in range(b):
-        idx = int(t_np[i]) if t_np.ndim > 0 else int(t_np)
-        if idx == ignore_index:
-            losses.append(_from_numpy(np.array(0.0, dtype=np.float32)).to(input.device))
-        else:
-            val = -log_probs[i, idx] if log_probs.ndim > 1 else -log_probs[idx]
-            if weight is not None:
-                val = val * weight[idx]
-            losses.append(val)
-    loss_t = _native_stack(losses, dim=0) if len(losses) > 0 else input.sum() * 0.0
-    return _apply_reduction(loss_t, reduction, "cross_entropy")
+    w_t = _as_tensor(weight).to(input.device) if weight is not None else None
+
+    if tgt_is_float:
+        t_prob = _as_tensor(target).to(input.device)
+        if list(t_prob.shape) != list(input.shape):
+            raise RuntimeError(
+                f"cross_entropy: target shape {list(t_prob.shape)} must match input shape {list(input.shape)}"
+            )
+        if float(label_smoothing) > 0.0:
+            ls = float(label_smoothing)
+            t_prob = t_prob * (1.0 - ls) + (ls / float(num_classes))
+        loss_terms = -(t_prob * log_probs)
+        if w_t is not None:
+            loss_terms = loss_terms * w_t.reshape([1, num_classes])
+        loss_t = loss_terms.sum(dim=-1)
+        return _apply_reduction(loss_t, reduction, "cross_entropy")
+
+    tgt_t = target if isinstance(target, _Tensor) else _from_numpy(np.asarray(target, dtype=np.int64)).to(input.device)
+    if tgt_t.ndim != 1 or tgt_t.shape[0] != input.shape[0]:
+        raise RuntimeError(
+            f"cross_entropy: expected target shape [{input.shape[0]}], got {list(tgt_t.shape)}"
+        )
+    valid = tgt_t != int(ignore_index)
+    if np.any(_to_np(valid & (tgt_t < 0))):
+        raise ValueError("cross_entropy: class index must be >= 0 (unless equal to ignore_index)")
+    safe_tgt = _ox_where(valid, tgt_t, 0)
+    nll_picked = -log_probs.gather(1, safe_tgt.unsqueeze(1)).squeeze(1)
+
+    if w_t is not None:
+        w_elem = w_t.gather(0, safe_tgt)
+        nll_picked = nll_picked * w_elem
+        denom = _ox_where(valid, w_elem, 0.0).sum()
+    else:
+        denom = valid.to_dtype(input.dtype).sum()
+
+    if float(label_smoothing) > 0.0:
+        ls = float(label_smoothing)
+        lp_weighted = log_probs * w_t.reshape([1, num_classes]) if w_t is not None else log_probs
+        smooth = -lp_weighted.sum(dim=-1) / float(num_classes)
+        per_sample = (1.0 - ls) * nll_picked + ls * smooth
+    else:
+        per_sample = nll_picked
+
+    per_sample = _ox_where(valid, per_sample, 0.0)
+    if reduction == "none":
+        return per_sample
+    if reduction == "sum":
+        return per_sample.sum()
+    return per_sample.sum() / denom
 
 
 def binary_cross_entropy_with_logits(
@@ -2133,6 +2178,8 @@ def nll_loss(
 
     tgt_t = target if isinstance(target, _Tensor) else _from_numpy(np.asarray(target, dtype=np.int64)).to(input.device)
     valid = tgt_t != int(ignore_index)
+    if np.any(_to_np(valid & (tgt_t < 0))):
+        raise ValueError("cross_entropy: class index must be >= 0 (unless equal to ignore_index)")
     safe_tgt = _ox_where(valid, tgt_t, 0)
     picked = -input.gather(1, safe_tgt.unsqueeze(1)).squeeze(1)
     picked = _ox_where(valid, picked, 0.0)
@@ -2151,11 +2198,98 @@ def nll_loss(
 
 
 focal_loss = _native_focal_loss
-cosine_embedding_loss = _native_cosine_embedding_loss
-triplet_margin_loss = _native_triplet_margin_loss
-margin_ranking_loss = _native_margin_ranking_loss
-hinge_embedding_loss = _native_hinge_embedding_loss
-soft_margin_loss = _native_soft_margin_loss
+
+
+def cosine_embedding_loss(
+    input1: _Tensor,
+    input2: _Tensor,
+    target: _Tensor,
+    margin: float = 0.0,
+    size_average: Optional[bool] = None,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
+) -> _Tensor:
+    """Cosine embedding loss supporting margin and reduction ('none', 'mean', 'sum')."""
+    a, b, y = _as_tensor(input1), _as_tensor(input2), _as_tensor(target)
+    dim = 0 if a.ndim == 1 else 1
+    num = (a * b).sum(dim=dim)
+    denom = (a.pow(2.0).sum(dim=dim).sqrt() * b.pow(2.0).sum(dim=dim).sqrt()).clamp_min(1e-12)
+    cos = num / denom
+    pos_loss = 1.0 - cos
+    neg_loss = (cos - float(margin)).clamp_min(0.0)
+    loss = _ox_where(y > 0.0, pos_loss, neg_loss)
+    return _apply_reduction(loss, reduction, "cosine_embedding_loss")
+
+
+def triplet_margin_loss(
+    anchor: _Tensor,
+    positive: _Tensor,
+    negative: _Tensor,
+    margin: float = 1.0,
+    p: float = 2.0,
+    eps: float = 1e-6,
+    swap: bool = False,
+    size_average: Optional[bool] = None,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
+) -> _Tensor:
+    """Triplet margin loss supporting p-norm, eps, swap, margin, and reduction."""
+    a, pos, neg = _as_tensor(anchor), _as_tensor(positive), _as_tensor(negative)
+    was_1d = a.ndim == 1
+    if was_1d:
+        a, pos, neg = a.unsqueeze(0), pos.unsqueeze(0), neg.unsqueeze(0)
+    d_pos = pairwise_distance(a, pos, p=float(p), eps=float(eps), keepdim=False)
+    d_neg = pairwise_distance(a, neg, p=float(p), eps=float(eps), keepdim=False)
+    if swap:
+        d_swap = pairwise_distance(pos, neg, p=float(p), eps=float(eps), keepdim=False)
+        d_neg = _ox_where(d_swap < d_neg, d_swap, d_neg)
+    loss = (d_pos - d_neg + float(margin)).clamp_min(0.0)
+    if was_1d:
+        loss = loss.squeeze(0)
+    return _apply_reduction(loss, reduction, "triplet_margin_loss")
+
+
+def margin_ranking_loss(
+    input1: _Tensor,
+    input2: _Tensor,
+    target: _Tensor,
+    margin: float = 0.0,
+    size_average: Optional[bool] = None,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
+) -> _Tensor:
+    """Margin ranking loss: max(0, -y * (x1 - x2) + margin)."""
+    x1, x2, y = _as_tensor(input1), _as_tensor(input2), _as_tensor(target)
+    loss = (-y * (x1 - x2) + float(margin)).clamp_min(0.0)
+    return _apply_reduction(loss, reduction, "margin_ranking_loss")
+
+
+def hinge_embedding_loss(
+    input: _Tensor,
+    target: _Tensor,
+    margin: float = 1.0,
+    size_average: Optional[bool] = None,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
+) -> _Tensor:
+    """Hinge embedding loss: x if y == 1 else max(0, margin - x)."""
+    x, y = _as_tensor(input), _as_tensor(target)
+    neg = (float(margin) - x).clamp_min(0.0)
+    loss = _ox_where(y > 0.0, x, neg)
+    return _apply_reduction(loss, reduction, "hinge_embedding_loss")
+
+
+def soft_margin_loss(
+    input: _Tensor,
+    target: _Tensor,
+    size_average: Optional[bool] = None,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
+) -> _Tensor:
+    """Soft margin loss: log(1 + exp(-y * x))."""
+    x, y = _as_tensor(input), _as_tensor(target)
+    loss = (-y * x).softplus()
+    return _apply_reduction(loss, reduction, "soft_margin_loss")
 
 
 def smooth_l1_loss(input: _Tensor, target: _Tensor, beta: float = 1.0, reduction: str = "mean") -> _Tensor:
@@ -2281,22 +2415,19 @@ def _finfo_eps(dtype: Any) -> float:
 
 def rms_norm(
     input: _Tensor,
-    normalized_shape: Sequence[int],
+    normalized_shape: Union[int, Sequence[int]],
     weight: Optional[_Tensor] = None,
     eps: Optional[float] = None,
 ) -> _Tensor:
     """Applies Root Mean Square Layer Normalization."""
     x = _as_tensor(input)
     eps_val = _finfo_eps(x.dtype) if eps is None else float(eps)
-    norm_dims = len(normalized_shape)
+    norm_dims = 1 if isinstance(normalized_shape, int) else len(normalized_shape)
     if norm_dims == 1:
         variance = x.pow(2.0).mean(dim=-1, keepdim=True)
     else:
-        # reduce over trailing norm_dims
-        v = x.pow(2.0)
-        for _ in range(norm_dims):
-            v = v.mean(dim=-1, keepdim=True)
-        variance = v
+        axes = tuple(range(x.ndim - norm_dims, x.ndim))
+        variance = x.pow(2.0).mean(dim=axes, keepdim=True)
     r = x / (variance + eps_val).sqrt()
     if weight is not None:
         r = r * _as_tensor(weight)
