@@ -1,0 +1,17 @@
+name: Feature Request
+description: Propose a new op, backend kernel, exporter, or API improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What capability or API would you like added?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Use case & context
+      description: Why is this useful, and how does PyTorch or another Rust crate handle it?

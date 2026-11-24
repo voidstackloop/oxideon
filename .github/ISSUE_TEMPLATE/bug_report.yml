@@ -1,0 +1,23 @@
+name: Bug Report
+description: Report a crash, incorrect gradient/output, or build issue in Oxideon
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Paste a small Rust or Python snippet reproducing the issue.
+      render: python
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, CPU/GPU, Rust version (`rustc --version`), Python version, and Oxideon version (`pip show oxideon` or commit SHA).
