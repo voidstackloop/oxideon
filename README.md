@@ -6,8 +6,9 @@
 
 **A fast, Hackable Deep Learning & Tensor Library in Rust — with a PyTorch-friendly Python API.**
 
-[![Browser demo](https://img.shields.io/badge/browser%20demo-run%20Oxideon%20in%20your%20browser-brightgreen.svg)](https://voidstackloop.github.io/oxideon/)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/voidstackloop/oxideon/blob/main/examples/oxideon_quickstart.ipynb)
+<a href="https://voidstackloop.github.io/oxideon/"><img src="https://img.shields.io/badge/▶_RUN_IN_YOUR_BROWSER-Live_WebAssembly_Demo-10b981?style=for-the-badge&logo=webassembly&logoColor=white" alt="Run Oxideon in your browser"></a>
+<a href="https://colab.research.google.com/github/voidstackloop/oxideon/blob/main/examples/oxideon_quickstart.ipynb"><img src="https://img.shields.io/badge/OPEN_IN_GOOGLE_COLAB-Interactive_Showcase_Notebook-F9AB00?style=for-the-badge&logo=googlecolab&logoColor=white" alt="Open In Google Colab"></a>
+
 [![Portfolio](https://img.shields.io/badge/portfolio-voidstackloop-blueviolet.svg)](https://github.com/voidstackloop/portfolio)
 
 [![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](https://github.com/voidstackloop/oxideon/releases/tag/v0.1.0)
