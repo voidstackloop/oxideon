@@ -68,6 +68,8 @@ def view_as_complex(input: Any) -> Any:
 
 
 def _as_complex_pair(t: _Tensor) -> Tuple[_Tensor, bool]:
+    if str(t.dtype) in ("c64", "c128"):
+        return _Tensor.stack([t.real(), t.imag()], dim=-1), True
     if t.ndim >= 1 and t.shape[-1] == 2:
         return t, True
     zeros = _Tensor.zeros(list(t.shape), dtype=t.dtype, device=t.device)

@@ -4721,6 +4721,153 @@ impl PyTensor {
 // Neural Network Layers, Foundation Models & Whole-Loop Native Rust Trainer
 // ---------------------------------------------------------------------------
 
+fn extract_pair2(val: &Bound<'_, PyAny>, name: &str) -> PyResult<(usize, usize)> {
+    if let Ok(v) = val.extract::<usize>() {
+        return Ok((v, v));
+    }
+    if let Ok((a, b)) = val.extract::<(usize, usize)>() {
+        return Ok((a, b));
+    }
+    Err(PyValueError::new_err(format!(
+        "{name} must be an int or a 2-tuple of ints"
+    )))
+}
+
+trait PyLayerParams {
+    const OWNER: &'static str;
+    fn param_pairs(&self) -> Vec<(&'static str, &Tensor)>;
+    fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)>;
+}
+
+fn layer_state_dict<L: PyLayerParams>(
+    layer: &L,
+    py: Python<'_>,
+    prefix: &str,
+) -> PyResult<Py<pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    for (k, t) in layer.param_pairs() {
+        let key = if prefix.is_empty() {
+            k.to_string()
+        } else {
+            format!("{prefix}{k}")
+        };
+        dict.set_item(key, PyTensor { inner: t.clone() })?;
+    }
+    Ok(dict.into())
+}
+
+fn layer_named_parameters<L: PyLayerParams>(layer: &L, prefix: &str) -> Vec<(String, PyTensor)> {
+    layer
+        .param_pairs()
+        .into_iter()
+        .map(|(k, t)| {
+            let key = if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{prefix}{k}")
+            };
+            (key, PyTensor { inner: t.clone() })
+        })
+        .collect()
+}
+
+fn layer_load_state_dict<L: PyLayerParams>(
+    layer: &mut L,
+    py: Python<'_>,
+    state_dict: &Bound<'_, pyo3::types::PyDict>,
+    strict: bool,
+) -> PyResult<Py<pyo3::types::PyDict>> {
+    let owner = L::OWNER;
+    let mut missing = Vec::new();
+    let mut unexpected: Vec<String> = state_dict
+        .keys()
+        .iter()
+        .filter_map(|k| k.extract::<String>().ok())
+        .collect();
+    for (name, dst) in layer.param_pairs_mut() {
+        if let Some(val) = state_dict.get_item(name)? {
+            unexpected.retain(|k| k != name);
+            let src = val.extract::<PyRef<'_, PyTensor>>()?;
+            if dst.shape() != src.inner.shape() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "Error(s) in loading state_dict for {owner}:\n\tWhile copying '{name}': shape mismatch (expected {:?}, got {:?})",
+                    dst.shape(),
+                    src.inner.shape()
+                )));
+            }
+            crate::tensor::no_grad(|| dst.copy_(&src.inner)).map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "Error(s) in loading state_dict for {owner}:\n\tWhile copying '{name}': {e}"
+                ))
+            })?;
+        } else {
+            missing.push(name.to_string());
+        }
+    }
+    if strict && (!missing.is_empty() || !unexpected.is_empty()) {
+        let mut msg = String::new();
+        if !missing.is_empty() {
+            msg.push_str(&format!("Missing key(s) in state_dict: {missing:?}. "));
+        }
+        if !unexpected.is_empty() {
+            msg.push_str(&format!("Unexpected key(s) in state_dict: {unexpected:?}."));
+        }
+        return Err(PyRuntimeError::new_err(format!(
+            "Error(s) in loading state_dict for {owner}:\n\t{msg}"
+        )));
+    }
+    let out = pyo3::types::PyDict::new(py);
+    out.set_item("missing_keys", missing)?;
+    out.set_item("unexpected_keys", unexpected)?;
+    Ok(out.into())
+}
+
+fn layer_zero_grad<L: PyLayerParams>(layer: &L) {
+    for (_, p) in layer.param_pairs() {
+        p.zero_grad();
+    }
+}
+
+macro_rules! impl_py_layer_params {
+    ($ty:ty, $owner:literal, weight_only) => {
+        impl PyLayerParams for $ty {
+            const OWNER: &'static str = $owner;
+            fn param_pairs(&self) -> Vec<(&'static str, &Tensor)> {
+                vec![("weight", &self.inner.weight)]
+            }
+            fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)> {
+                vec![("weight", &mut self.inner.weight)]
+            }
+        }
+    };
+    ($ty:ty, $owner:literal, opt_bias) => {
+        impl PyLayerParams for $ty {
+            const OWNER: &'static str = $owner;
+            fn param_pairs(&self) -> Vec<(&'static str, &Tensor)> {
+                let mut pairs = vec![("weight", &self.inner.weight)];
+                if let Some(b) = &self.inner.bias { pairs.push(("bias", b)); }
+                pairs
+            }
+            fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)> {
+                let mut pairs = vec![("weight", &mut self.inner.weight)];
+                if let Some(b) = self.inner.bias.as_mut() { pairs.push(("bias", b)); }
+                pairs
+            }
+        }
+    };
+    ($ty:ty, $owner:literal, req_bias) => {
+        impl PyLayerParams for $ty {
+            const OWNER: &'static str = $owner;
+            fn param_pairs(&self) -> Vec<(&'static str, &Tensor)> {
+                vec![("weight", &self.inner.weight), ("bias", &self.inner.bias)]
+            }
+            fn param_pairs_mut(&mut self) -> Vec<(&'static str, &mut Tensor)> {
+                vec![("weight", &mut self.inner.weight), ("bias", &mut self.inner.bias)]
+            }
+        }
+    };
+}
+
 #[pyclass(name = "Linear", module = "oxideon")]
 pub struct PyLinear {
     inner: Linear,
@@ -4779,7 +4926,19 @@ impl PyLinear {
             .map(|inner| PyTensor { inner })
             .collect()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyLinear, "Linear", opt_bias);
 
 /// Lookup table of `num_embeddings` vectors of size `embedding_dim`; the input is an integer tensor of indices.
 #[pyclass(name = "Embedding", module = "oxideon")]
@@ -4834,7 +4993,19 @@ impl PyEmbedding {
     pub fn embedding_dim(&self) -> usize {
         self.inner.embedding_dim()
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyEmbedding, "Embedding", weight_only);
 
 /// Layer normalization over dimensions (`normalized_shape` is an int or a list/tuple).
 #[pyclass(name = "LayerNorm", module = "oxideon")]
@@ -4923,7 +5094,19 @@ impl PyLayerNorm {
     pub fn __repr__(&self) -> String {
         format!("LayerNorm({:?}, eps={}, elementwise_affine=true)", self.normalized_shape, self.inner.eps)
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyLayerNorm, "LayerNorm", req_bias);
 
 /// Zeroes each element with probability `p` (scaling the rest by `1 / (1 - p)`) while in training mode.
 #[pyclass(name = "Dropout", module = "oxideon")]
@@ -5133,24 +5316,40 @@ pub struct PyConv2d {
 #[pymethods]
 impl PyConv2d {
     #[new]
-    #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=1, padding=0))]
+    #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=None, padding=None, dilation=None, groups=1, bias=true))]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         in_channels: usize,
         out_channels: usize,
-        kernel_size: usize,
-        stride: usize,
-        padding: usize,
+        kernel_size: &Bound<'_, PyAny>,
+        stride: Option<&Bound<'_, PyAny>>,
+        padding: Option<&Bound<'_, PyAny>>,
+        dilation: Option<&Bound<'_, PyAny>>,
+        groups: usize,
+        bias: bool,
     ) -> PyResult<Self> {
-        Ok(Self {
-            inner: Conv2d::new(
-                in_channels,
-                out_channels,
-                (kernel_size, kernel_size),
-                (stride, stride),
-                (padding, padding),
-            )
-            .map_err(to_py_err)?,
-        })
+        let k = extract_pair2(kernel_size, "kernel_size")?;
+        let s = match stride {
+            Some(v) => extract_pair2(v, "stride")?,
+            None => (1, 1),
+        };
+        let p = match padding {
+            Some(v) => extract_pair2(v, "padding")?,
+            None => (0, 0),
+        };
+        let d = match dilation {
+            Some(v) => extract_pair2(v, "dilation")?,
+            None => (1, 1),
+        };
+        if d.0 == 0 || d.1 == 0 {
+            return Err(PyValueError::new_err(format!("dilation must be positive, got {d:?}")));
+        }
+        let mut inner = Conv2d::with_groups(in_channels, out_channels, k, s, p, groups).map_err(to_py_err)?;
+        inner.dilation = d;
+        if !bias {
+            inner.bias = None;
+        }
+        Ok(Self { inner })
     }
 
     pub fn forward(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> {
@@ -5198,7 +5397,19 @@ impl PyConv2d {
         }
         p
     }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyConv2d, "Conv2d", opt_bias);
 
 #[pyclass(name = "Conv3d", module = "oxideon")]
 pub struct PyConv3d {
@@ -5240,7 +5451,48 @@ impl PyConv3d {
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
+
+    pub fn __call__(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(py, x)
+    }
+
+    #[getter]
+    pub fn weight(&self) -> PyTensor {
+        PyTensor {
+            inner: self.inner.weight.clone(),
+        }
+    }
+
+    #[getter]
+    pub fn bias(&self) -> Option<PyTensor> {
+        self.inner
+            .bias
+            .as_ref()
+            .map(|b| PyTensor { inner: b.clone() })
+    }
+
+    pub fn parameters(&self) -> Vec<PyTensor> {
+        let mut p = vec![PyTensor {
+            inner: self.inner.weight.clone(),
+        }];
+        if let Some(b) = &self.inner.bias {
+            p.push(PyTensor { inner: b.clone() });
+        }
+        p
+    }
+    #[pyo3(signature = (prefix=""))]
+    pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
+    #[pyo3(signature = (prefix=""))]
+    pub fn state_dict(&self, py: Python<'_>, prefix: &str) -> PyResult<Py<pyo3::types::PyDict>> { layer_state_dict(self, py, prefix) }
+    #[pyo3(signature = (state_dict, strict=true))]
+    pub fn load_state_dict(&mut self, py: Python<'_>, state_dict: &Bound<'_, pyo3::types::PyDict>, strict: bool) -> PyResult<Py<pyo3::types::PyDict>> { layer_load_state_dict(self, py, state_dict, strict) }
+    #[pyo3(signature = (mode=true))]
+    pub fn train(&self, mode: bool) { let _ = mode; }
+    pub fn eval(&self) {}
+    pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
+
+impl_py_layer_params!(PyConv3d, "Conv3d", opt_bias);
 
 #[pyclass(name = "MaxPool1d", module = "oxideon")]
 pub struct PyMaxPool1d {
@@ -10255,12 +10507,33 @@ pub struct PyAdamW {
 #[pymethods]
 impl PyAdamW {
     #[new]
-    #[pyo3(signature = (params, lr=1e-3, weight_decay=1e-2))]
-    pub fn new(params: Vec<PyTensor>, lr: f64, weight_decay: f64) -> PyResult<Self> {
+    #[pyo3(signature = (params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=false, maximize=false))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        params: Vec<PyTensor>,
+        lr: f64,
+        betas: (f64, f64),
+        eps: f64,
+        weight_decay: f64,
+        amsgrad: bool,
+        maximize: bool,
+    ) -> PyResult<Self> {
         non_negative("lr", lr)?;
+        non_negative("eps", eps)?;
         non_negative("weight_decay", weight_decay)?;
+        for (name, b) in [("betas[0]", betas.0), ("betas[1]", betas.1)] {
+            if !(0.0..1.0).contains(&b) {
+                return Err(PyValueError::new_err(format!(
+                    "{name} must be in [0, 1), got {b}"
+                )));
+            }
+        }
         Ok(Self {
-            inner: Adam::adamw(require_params(params)?, lr, weight_decay),
+            inner: Adam::adamw(require_params(params)?, lr, weight_decay)
+                .betas(betas.0, betas.1)
+                .eps(eps)
+                .amsgrad(amsgrad)
+                .maximize(maximize),
         })
     }
 
@@ -10308,23 +10581,51 @@ fn require_params(params: Vec<PyTensor>) -> PyResult<Vec<Tensor>> {
 pub struct PySGD {
     inner: Sgd,
     momentum: f64,
+    dampening: f64,
     weight_decay: f64,
+    nesterov: bool,
+    maximize: bool,
 }
 
 #[pymethods]
 impl PySGD {
     #[new]
-    #[pyo3(signature = (params, lr=1e-2, momentum=0.0, weight_decay=0.0))]
-    pub fn new(params: Vec<PyTensor>, lr: f64, momentum: f64, weight_decay: f64) -> PyResult<Self> {
+    #[pyo3(signature = (params, lr=1e-2, momentum=0.0, dampening=0.0, weight_decay=0.0, nesterov=false, maximize=false))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        params: Vec<PyTensor>,
+        lr: f64,
+        momentum: f64,
+        dampening: f64,
+        weight_decay: f64,
+        nesterov: bool,
+        maximize: bool,
+    ) -> PyResult<Self> {
         non_negative("lr", lr)?;
         non_negative("momentum", momentum)?;
         non_negative("weight_decay", weight_decay)?;
+        if !dampening.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "dampening must be finite, got {dampening}"
+            )));
+        }
+        if nesterov && (momentum <= 0.0 || dampening != 0.0) {
+            return Err(PyValueError::new_err(
+                "Nesterov momentum requires a momentum and zero dampening",
+            ));
+        }
         Ok(Self {
             inner: Sgd::new(require_params(params)?, lr)
                 .momentum(momentum)
-                .weight_decay(weight_decay),
+                .dampening(dampening)
+                .weight_decay(weight_decay)
+                .nesterov(nesterov)
+                .maximize(maximize),
             momentum,
+            dampening,
             weight_decay,
+            nesterov,
+            maximize,
         })
     }
 
@@ -10352,7 +10653,10 @@ impl PySGD {
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("lr", self.lr())?;
         dict.set_item("momentum", self.momentum)?;
+        dict.set_item("dampening", self.dampening)?;
         dict.set_item("weight_decay", self.weight_decay)?;
+        dict.set_item("nesterov", self.nesterov)?;
+        dict.set_item("maximize", self.maximize)?;
         let list = pyo3::types::PyList::new(py, &[dict])?;
         Ok(list.into())
     }
@@ -10367,13 +10671,16 @@ pub struct PyAdam {
 #[pymethods]
 impl PyAdam {
     #[new]
-    #[pyo3(signature = (params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0), text_signature = "(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)")]
+    #[pyo3(signature = (params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, amsgrad=false, maximize=false), text_signature = "(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, amsgrad=False, maximize=False)")]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         params: Vec<PyTensor>,
         lr: f64,
         betas: (f64, f64),
         eps: f64,
         weight_decay: f64,
+        amsgrad: bool,
+        maximize: bool,
     ) -> PyResult<Self> {
         non_negative("lr", lr)?;
         non_negative("eps", eps)?;
@@ -10389,7 +10696,9 @@ impl PyAdam {
             inner: Adam::new(require_params(params)?, lr)
                 .betas(betas.0, betas.1)
                 .eps(eps)
-                .weight_decay(weight_decay),
+                .weight_decay(weight_decay)
+                .amsgrad(amsgrad)
+                .maximize(maximize),
         })
     }
 

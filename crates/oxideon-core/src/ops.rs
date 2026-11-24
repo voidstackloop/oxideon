@@ -2759,11 +2759,18 @@ impl Tensor {
                 return Ok(Tensor::from_parts(out_storage, out_layout, false, None));
             }
             let x_saved = self.clone();
+            let x_inp = self.clone();
             let y_val = Tensor::from_parts(out_storage.clone(), out_layout.clone(), false, None);
             let backward: crate::tensor::BackwardFn = Box::new(move |g: &Tensor| {
-                let gy = g.mul(&y_val)?;
+                // Recompute via differentiable elementary ops only when recording a higher-order graph (`create_graph=True`).
+                let y = if crate::tensor::is_grad_enabled() {
+                    x_saved.softmax_differentiable(ax as isize)?
+                } else {
+                    y_val.clone()
+                };
+                let gy = g.mul(&y)?;
                 let sum_gy = gy.sum_axis(ax as isize, true)?;
-                let gx = gy.sub(&Tensor::mul(&y_val, &sum_gy)?)?;
+                let gx = gy.sub(&Tensor::mul(&y, &sum_gy)?)?;
                 Ok(vec![Some(gx)])
             });
             return Ok(Tensor::from_parts(
@@ -2772,11 +2779,15 @@ impl Tensor {
                 true,
                 Some(crate::tensor::Node {
                     op: "softmax",
-                    inputs: vec![x_saved],
+                    inputs: vec![x_inp],
                     backward,
                 }),
             ));
         }
+        self.softmax_differentiable(axis)
+    }
+
+    fn softmax_differentiable(&self, axis: isize) -> Result<Tensor> {
         let m = no_grad(|| self.max_axis(axis, true))?;
         let shifted = self.sub(&m)?;
         if !shifted.dtype().is_floating_point() {

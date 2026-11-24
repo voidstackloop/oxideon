@@ -53,11 +53,8 @@ from . import (
     focal_loss,
     grpo_loss,
     hinge_embedding_loss,
-    huber_loss,
     info_nce_loss,
-    kl_div_loss,
     margin_ranking_loss,
-    nll_loss,
     ppo_clipped_loss,
     siglip_loss,
     simpo_loss,
@@ -66,6 +63,7 @@ from . import (
     vicreg_loss,
 )
 from .serialization import save_file, load_file, save, load
+from .primitives import no_grad as _no_grad
 from . import functional
 from . import utils
 from . import rnn_utils as _rnn_utils
@@ -75,6 +73,9 @@ mse_loss = functional.mse_loss
 l1_loss = functional.l1_loss
 cross_entropy = functional.cross_entropy
 binary_cross_entropy_with_logits = functional.binary_cross_entropy_with_logits
+huber_loss = functional.huber_loss
+kl_div_loss = functional.kl_div_loss
+nll_loss = functional.nll_loss
 from . import init
 
 F = functional
@@ -500,7 +501,12 @@ class Module:
         live optimizers keep working). Returns True when copied in place."""
         if isinstance(val, _Tensor) and target is not None and hasattr(target, "copy_"):
             try:
-                target.copy_(val)
+                if list(target.shape) != list(val.shape):
+                    raise RuntimeError(
+                        f"shape mismatch (expected {list(target.shape)}, got {list(val.shape)})"
+                    )
+                with _no_grad():
+                    target.copy_(val)
             except Exception as e:
                 raise RuntimeError(
                     f"Error(s) in loading state_dict for {owner_name}:\n"
@@ -1642,36 +1648,31 @@ class LSTM(RNNBase):
         ])
 
     def forward(self, x, hx=None):
-        arr = x.to_numpy()
-        if not self.batch_first:
-            arr = np.swapaxes(arr, 0, 1)
-
-        batch_size, seq_len, _ = arr.shape
+        x_seq = x if self.batch_first else x.transpose(0, 1)
+        batch_size, seq_len, _ = (int(v) for v in x_seq.shape)
         if hx is None:
-            h_prev = [_Tensor.zeros([batch_size, self.hidden_size]) for _ in range(self.num_layers)]
-            c_prev = [_Tensor.zeros([batch_size, self.hidden_size]) for _ in range(self.num_layers)]
+            h_prev = [_Tensor.zeros([batch_size, self.hidden_size], dtype=x_seq.dtype, device=x_seq.device) for _ in range(self.num_layers)]
+            c_prev = [_Tensor.zeros([batch_size, self.hidden_size], dtype=x_seq.dtype, device=x_seq.device) for _ in range(self.num_layers)]
         else:
-            h_prev, c_prev = hx
+            h0, c0 = hx
+            h_prev = [h0[l] for l in range(self.num_layers)] if isinstance(h0, _Tensor) else list(h0)
+            c_prev = [c0[l] for l in range(self.num_layers)] if isinstance(c0, _Tensor) else list(c0)
 
-        layer_inputs = [arr[:, t, :] for t in range(seq_len)]
-
+        layer_inputs = [x_seq[:, t, :] for t in range(seq_len)]
         for l, cell in enumerate(self.cells):
             next_layer_inputs = []
-            h = h_prev[l]
-            c = c_prev[l]
+            h, c = h_prev[l], c_prev[l]
             for t in range(seq_len):
-                x_t = _from_numpy(np.ascontiguousarray(layer_inputs[t]))
-                h, c = cell(x_t, (h, c))
-                next_layer_inputs.append(h.to_numpy())
+                h, c = cell(layer_inputs[t], (h, c))
+                next_layer_inputs.append(h)
             layer_inputs = next_layer_inputs
             h_prev[l] = h
             c_prev[l] = c
 
-        out = np.stack(layer_inputs, axis=1)
+        out = _Tensor.stack(layer_inputs, dim=1)
         if not self.batch_first:
-            out = np.swapaxes(out, 0, 1)
-
-        return _from_numpy(np.ascontiguousarray(out, dtype=np.float32)), (h_prev, c_prev)
+            out = out.transpose(0, 1)
+        return out, (_Tensor.stack(h_prev, dim=0), _Tensor.stack(c_prev, dim=0))
 
 
 class GRU(RNNBase):
@@ -1686,33 +1687,27 @@ class GRU(RNNBase):
         ])
 
     def forward(self, x, hx=None):
-        arr = x.to_numpy()
-        if not self.batch_first:
-            arr = np.swapaxes(arr, 0, 1)
-
-        batch_size, seq_len, _ = arr.shape
+        x_seq = x if self.batch_first else x.transpose(0, 1)
+        batch_size, seq_len, _ = (int(v) for v in x_seq.shape)
         if hx is None:
-            h_prev = [_Tensor.zeros([batch_size, self.hidden_size]) for _ in range(self.num_layers)]
+            h_prev = [_Tensor.zeros([batch_size, self.hidden_size], dtype=x_seq.dtype, device=x_seq.device) for _ in range(self.num_layers)]
         else:
-            h_prev = hx
+            h_prev = [hx[l] for l in range(self.num_layers)] if isinstance(hx, _Tensor) else list(hx)
 
-        layer_inputs = [arr[:, t, :] for t in range(seq_len)]
-
+        layer_inputs = [x_seq[:, t, :] for t in range(seq_len)]
         for l, cell in enumerate(self.cells):
             next_layer_inputs = []
             h = h_prev[l]
             for t in range(seq_len):
-                x_t = _from_numpy(np.ascontiguousarray(layer_inputs[t]))
-                h = cell(x_t, h)
-                next_layer_inputs.append(h.to_numpy())
+                h = cell(layer_inputs[t], h)
+                next_layer_inputs.append(h)
             layer_inputs = next_layer_inputs
             h_prev[l] = h
 
-        out = np.stack(layer_inputs, axis=1)
+        out = _Tensor.stack(layer_inputs, dim=1)
         if not self.batch_first:
-            out = np.swapaxes(out, 0, 1)
-
-        return _from_numpy(np.ascontiguousarray(out, dtype=np.float32)), h_prev
+            out = out.transpose(0, 1)
+        return out, _Tensor.stack(h_prev, dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -1818,28 +1813,28 @@ class BatchNorm2d(Module):
         self.affine = affine
 
         if affine:
-            self.weight = Parameter(_Tensor.ones([1, num_features, 1, 1]))
-            self.bias = Parameter(_Tensor.zeros([1, num_features, 1, 1]))
+            self.weight = Parameter(_Tensor.ones([num_features]))
+            self.bias = Parameter(_Tensor.zeros([num_features]))
         else:
             self.weight = None
             self.bias = None
 
-        self.running_mean = np.zeros((1, num_features, 1, 1), dtype=np.float32)
-        self.running_var = np.ones((1, num_features, 1, 1), dtype=np.float32)
+        self.running_mean = np.zeros(num_features, dtype=np.float32)
+        self.running_var = np.ones(num_features, dtype=np.float32)
 
     def forward(self, x):
+        bshape = (1, self.num_features, 1, 1)
         if self.training:
             mean_b, var_b, mean_c, uvar_c = _batch_norm_train_stats(x, self.num_features)
-            rshape = self.running_mean.shape
-            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(rshape)
-            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(rshape)
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(self.num_features)
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(self.num_features)
         else:
-            mean_b = _from_numpy(np.ascontiguousarray(self.running_mean, dtype=np.float32))
-            var_b = _from_numpy(np.ascontiguousarray(self.running_var, dtype=np.float32))
+            mean_b = _from_numpy(np.ascontiguousarray(self.running_mean.reshape(bshape), dtype=np.float32))
+            var_b = _from_numpy(np.ascontiguousarray(self.running_var.reshape(bshape), dtype=np.float32))
 
         out = (x - mean_b) / (var_b + self.eps).sqrt()
         if self.affine:
-            out = out * self.weight + self.bias
+            out = out * self.weight.reshape(list(bshape)) + self.bias.reshape(list(bshape))
         return out
 
 
@@ -1888,10 +1883,10 @@ class LazyBatchNorm2d(BatchNorm2d):
         num_features = input.shape[1]
         self.num_features = num_features
         if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([1, num_features, 1, 1])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([1, num_features, 1, 1])))
-        self.running_mean = np.zeros((1, num_features, 1, 1), dtype=np.float32)
-        self.running_var = np.ones((1, num_features, 1, 1), dtype=np.float32)
+            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
+            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
+        self.running_mean = np.zeros(num_features, dtype=np.float32)
+        self.running_var = np.ones(num_features, dtype=np.float32)
 
     def forward(self, x):
         if self.num_features is None:
@@ -1918,8 +1913,8 @@ class GroupNorm(Module):
         self.affine = affine
 
         if affine:
-            self.weight = Parameter(_Tensor.ones([1, num_channels, 1, 1]))
-            self.bias = Parameter(_Tensor.zeros([1, num_channels, 1, 1]))
+            self.weight = Parameter(_Tensor.ones([num_channels]))
+            self.bias = Parameter(_Tensor.zeros([num_channels]))
         else:
             self.weight = None
             self.bias = None
@@ -1935,14 +1930,15 @@ class GroupNorm(Module):
 
 class MaxPool2d(Module):
     """2D Max Pooling over input planes."""
-    def __init__(self, kernel_size: Union[int, Tuple[int, int]] = 2, stride: Optional[Union[int, Tuple[int, int]]] = None, padding: int = 0):
+    def __init__(self, kernel_size: Union[int, Tuple[int, int]] = 2, stride: Optional[Union[int, Tuple[int, int]]] = None, padding: Union[int, Tuple[int, int]] = 0, ceil_mode: bool = False):
         super().__init__()
         self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
         self.stride = self.kernel_size if stride is None else ((stride, stride) if isinstance(stride, int) else tuple(stride))
         self.padding = padding
+        self.ceil_mode = ceil_mode
 
     def forward(self, x):
-        return functional.max_pool2d(x, self.kernel_size, self.stride, self.padding)
+        return functional.max_pool2d(x, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode)
 
 
 class FractionalMaxPool2d(Module):
@@ -2054,14 +2050,16 @@ class MaxUnpool3d(Module):
 
 class AvgPool2d(Module):
     """2D Average Pooling over input planes."""
-    def __init__(self, kernel_size: Union[int, Tuple[int, int]] = 2, stride: Optional[Union[int, Tuple[int, int]]] = None, padding: int = 0):
+    def __init__(self, kernel_size: Union[int, Tuple[int, int]] = 2, stride: Optional[Union[int, Tuple[int, int]]] = None, padding: Union[int, Tuple[int, int]] = 0, ceil_mode: bool = False, count_include_pad: bool = True):
         super().__init__()
         self.kernel_size = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
         self.stride = self.kernel_size if stride is None else ((stride, stride) if isinstance(stride, int) else tuple(stride))
         self.padding = padding
+        self.ceil_mode = ceil_mode
+        self.count_include_pad = count_include_pad
 
     def forward(self, x):
-        return functional.avg_pool2d(x, self.kernel_size, self.stride, self.padding)
+        return functional.avg_pool2d(x, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, count_include_pad=self.count_include_pad)
 
 
 class AdaptiveAvgPool2d(Module):
@@ -2973,12 +2971,7 @@ class RNNCell(Module):
         if self.bias:
             gates = gates + self.bias_ih + self.bias_hh
 
-        g_np = gates.to_numpy()
-        if self.nonlinearity == "relu":
-            h_next = np.maximum(0.0, g_np)
-        else:
-            h_next = np.tanh(g_np)
-        return _from_numpy(np.ascontiguousarray(h_next, dtype=np.float32))
+        return gates.relu() if self.nonlinearity == "relu" else gates.tanh()
 
 
 class RNN(RNNBase):
@@ -3004,34 +2997,27 @@ class RNN(RNNBase):
         ])
 
     def forward(self, x, hx=None):
-        arr = x.to_numpy()
-        if not self.batch_first:
-            arr = np.swapaxes(arr, 0, 1)
-
-        batch_size, seq_len, _ = arr.shape
+        x_seq = x if self.batch_first else x.transpose(0, 1)
+        batch_size, seq_len, _ = (int(v) for v in x_seq.shape)
         if hx is None:
-            h_prev = [_Tensor.zeros([batch_size, self.hidden_size]) for _ in range(self.num_layers)]
+            h_prev = [_Tensor.zeros([batch_size, self.hidden_size], dtype=x_seq.dtype, device=x_seq.device) for _ in range(self.num_layers)]
         else:
-            h_prev = list(hx)
+            h_prev = [hx[l] for l in range(self.num_layers)] if isinstance(hx, _Tensor) else list(hx)
 
-        layer_inputs = [arr[:, t, :] for t in range(seq_len)]
-
+        layer_inputs = [x_seq[:, t, :] for t in range(seq_len)]
         for l, cell in enumerate(self.cells):
             next_layer_inputs = []
             h = h_prev[l]
             for t in range(seq_len):
-                x_t = _from_numpy(np.ascontiguousarray(layer_inputs[t]))
-                h = cell(x_t, h)
-                next_layer_inputs.append(h.to_numpy())
+                h = cell(layer_inputs[t], h)
+                next_layer_inputs.append(h)
             layer_inputs = next_layer_inputs
             h_prev[l] = h
 
-        out = np.stack(layer_inputs, axis=1)
+        out = _Tensor.stack(layer_inputs, dim=1)
         if not self.batch_first:
-            out = np.swapaxes(out, 0, 1)
-
-        h_n = _Tensor.from_numpy(np.ascontiguousarray(np.stack([h.to_numpy() for h in h_prev], axis=0), dtype=np.float32))
-        return _from_numpy(np.ascontiguousarray(out, dtype=np.float32)), h_n
+            out = out.transpose(0, 1)
+        return out, _Tensor.stack(h_prev, dim=0)
 
 
 class _AdaptiveLogSoftmaxOutput:

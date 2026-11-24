@@ -707,11 +707,21 @@ def max_pool1d(input: _Tensor, kernel_size: int, stride: Optional[int] = None, p
     return _native_stack(cols, dim=-1)
 
 
+def _pool2d_out_dim(size: int, k: int, s: int, p: int, ceil_mode: bool) -> int:
+    if ceil_mode:
+        out = (size + 2 * p - k + s - 1) // s + 1
+        if (out - 1) * s >= size + p:
+            out -= 1
+        return max(out, 0)
+    return (size + 2 * p - k) // s + 1
+
+
 def max_pool2d(
     input: _Tensor,
     kernel_size: Union[int, Tuple[int, int]],
     stride: Optional[Union[int, Tuple[int, int]]] = None,
     padding: Union[int, Tuple[int, int]] = 0,
+    ceil_mode: bool = False,
 ) -> _Tensor:
     """Applies a 2D max pooling over an input image."""
     # Differentiable window loop (stays in the autograd graph).
@@ -719,15 +729,20 @@ def max_pool2d(
     s = k if stride is None else ((stride, stride) if isinstance(stride, int) else stride)
     p = (padding, padding) if isinstance(padding, int) else padding
 
-    x = _diff_pad_nd(_as_tensor(input), [(p[0], p[0]), (p[1], p[1])], value=float("-inf"))
-    n, c, h, w = (int(v) for v in x.shape)
+    orig = _as_tensor(input)
+    n, c, h0, w0 = (int(v) for v in orig.shape)
     kh, kw = k
-    oh, ow = (h - kh) // s[0] + 1, (w - kw) // s[1] + 1
+    oh = _pool2d_out_dim(h0, kh, s[0], p[0], ceil_mode)
+    ow = _pool2d_out_dim(w0, kw, s[1], p[1], ceil_mode)
+    x = _diff_pad_nd(orig, [(p[0], p[0]), (p[1], p[1])], value=float("-inf"))
+    _, _, h, w = (int(v) for v in x.shape)
     rows = []
     for i in range(oh):
+        hs, he = i * s[0], min(i * s[0] + kh, h)
         cols = []
         for j in range(ow):
-            win = x[:, :, i * s[0] : i * s[0] + kh, j * s[1] : j * s[1] + kw]
+            ws, we = j * s[1], min(j * s[1] + kw, w)
+            win = x[:, :, hs:he, ws:we]
             cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
         rows.append(_native_stack(cols, dim=-1))
     return _native_stack(rows, dim=2)
@@ -972,6 +987,8 @@ def avg_pool2d(
     kernel_size: Union[int, Tuple[int, int]],
     stride: Optional[Union[int, Tuple[int, int]]] = None,
     padding: Union[int, Tuple[int, int]] = 0,
+    ceil_mode: bool = False,
+    count_include_pad: bool = True,
 ) -> _Tensor:
     """Applies a 2D average pooling over an input image."""
     # Differentiable window loop (stays in the autograd graph).
@@ -979,15 +996,26 @@ def avg_pool2d(
     s = k if stride is None else ((stride, stride) if isinstance(stride, int) else stride)
     p = (padding, padding) if isinstance(padding, int) else padding
 
-    x = _diff_pad_nd(_as_tensor(input), [(p[0], p[0]), (p[1], p[1])])
-    n, c, h, w = (int(v) for v in x.shape)
+    orig = _as_tensor(input)
+    n, c, h0, w0 = (int(v) for v in orig.shape)
     kh, kw = k
-    oh, ow = (h - kh) // s[0] + 1, (w - kw) // s[1] + 1
+    oh = _pool2d_out_dim(h0, kh, s[0], p[0], ceil_mode)
+    ow = _pool2d_out_dim(w0, kw, s[1], p[1], ceil_mode)
+    src = orig if not count_include_pad else _diff_pad_nd(orig, [(p[0], p[0]), (p[1], p[1])])
+    _, _, h, w = (int(v) for v in src.shape)
     rows = []
     for i in range(oh):
+        if count_include_pad:
+            hs, he = i * s[0], min(i * s[0] + kh, h)
+        else:
+            hs, he = max(0, i * s[0] - p[0]), min(h0, i * s[0] - p[0] + kh)
         cols = []
         for j in range(ow):
-            win = x[:, :, i * s[0] : i * s[0] + kh, j * s[1] : j * s[1] + kw]
+            if count_include_pad:
+                ws, we = j * s[1], min(j * s[1] + kw, w)
+            else:
+                ws, we = max(0, j * s[1] - p[1]), min(w0, j * s[1] - p[1] + kw)
+            win = src[:, :, hs:he, ws:we]
             cols.append(win.reshape([n, c, -1]).mean(dim=-1))
         rows.append(_native_stack(cols, dim=-1))
     return _native_stack(rows, dim=2)
@@ -1982,11 +2010,147 @@ def binary_cross_entropy_with_logits(
     return _apply_reduction(loss, reduction, "binary_cross_entropy_with_logits")
 
 
-huber_loss = _native_huber_loss
+def huber_loss(
+    input: _Tensor,
+    target: _Tensor,
+    reduction: Union[str, float] = "mean",
+    delta: float = 1.0,
+) -> _Tensor:
+    """Computes Huber loss with transition threshold `delta` and PyTorch-compatible `reduction`."""
+    if isinstance(reduction, (int, float)):
+        delta = float(reduction)
+        reduction = "mean"
+    if delta <= 0.0 or not math.isfinite(delta):
+        raise ValueError(f"huber_loss requires a positive finite delta, got {delta}")
+    if reduction == "mean":
+        return _native_huber_loss(input, target, delta=float(delta))
+    if reduction == "sum":
+        return _native_huber_loss(input, target, delta=float(delta)) * float(input.numel())
+    if reduction != "none":
+        raise ValueError(f"huber_loss: reduction must be 'mean', 'sum' or 'none', got {reduction!r}")
+    diff = (input - target).abs()
+    d = float(delta)
+    quad = 0.5 * (diff * diff)
+    lin = d * (diff - 0.5 * d)
+    return _ox_where(diff <= d, quad, lin)
+
+
+def _kl_div_impl(
+    input: _Tensor,
+    target: _Tensor,
+    reduction: str = "mean",
+    log_target: bool = False,
+) -> _Tensor:
+    if reduction not in ("mean", "batchmean", "sum", "none"):
+        raise ValueError(
+            f"kl_div: reduction must be 'mean', 'batchmean', 'sum' or 'none', got {reduction!r}"
+        )
+    if log_target:
+        loss = target.exp() * (target - input)
+    else:
+        pos = target > 0
+        safe_t = _ox_where(pos, target, 1.0)
+        loss = _ox_where(pos, target * (safe_t.ln() - input), 0.0)
+    if reduction == "none":
+        return loss
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "batchmean":
+        batch = float(input.shape[0]) if input.ndim > 0 and input.shape[0] > 0 else 1.0
+        return loss.sum() / batch
+    return loss.mean()
+
+
+def kl_div(
+    input: _Tensor,
+    target: _Tensor,
+    size_average: Optional[bool] = None,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
+    log_target: bool = False,
+) -> _Tensor:
+    """Computes the Kullback-Leibler divergence loss matching `torch.nn.functional.kl_div`."""
+    if size_average is False or reduce is False:
+        reduction = "sum" if reduce is True else ("none" if reduce is False else "sum")
+    return _kl_div_impl(input, target, reduction=reduction, log_target=log_target)
+
+
+def kl_div_loss(
+    log_probs: _Tensor,
+    target_probs: _Tensor,
+    reduction: str = "batchmean",
+    log_target: bool = False,
+) -> _Tensor:
+    """KL divergence matching the native `loss::kl_div_loss` convention (`batchmean` by default)."""
+    if reduction == "batchmean" and not log_target:
+        return _native_kl_div_loss(log_probs, target_probs)
+    return _kl_div_impl(log_probs, target_probs, reduction=reduction, log_target=log_target)
+
+
+def nll_loss(
+    input: _Tensor,
+    target: Any,
+    weight: Optional[_Tensor] = None,
+    size_average: Optional[bool] = None,
+    ignore_index: int = -100,
+    reduce: Optional[bool] = None,
+    reduction: str = "mean",
+) -> _Tensor:
+    """Negative log likelihood loss supporting `reduction` ('mean', 'sum', 'none'), `weight`, and `ignore_index`."""
+    if reduce is False:
+        reduction = "none"
+    elif size_average is False:
+        reduction = "sum"
+    if reduction not in ("mean", "sum", "none"):
+        raise ValueError(f"nll_loss: reduction must be 'mean', 'sum' or 'none', got {reduction!r}")
+
+    if input.ndim == 2 and weight is None and reduction in ("mean", "sum"):
+        t_arr = target.to_numpy() if isinstance(target, _Tensor) else np.asarray(target)
+        if not np.any(t_arr == int(ignore_index)):
+            base = _native_nll_loss(input, target)
+            return base if reduction == "mean" else base * float(input.shape[0])
+
+    if input.shape[0] == 0 or input.numel() == 0:
+        if reduction == "none":
+            t_shape = target.shape if isinstance(target, _Tensor) else ()
+            return _from_numpy(np.zeros(t_shape, dtype=np.float32)).to(input.device)
+        val = float("nan") if reduction == "mean" else 0.0
+        return _from_numpy(np.array(val, dtype=np.float32)).to(input.device)
+
+    if input.ndim == 1:
+        tgt_1d = target.reshape([1]) if isinstance(target, _Tensor) else _from_numpy(np.asarray(target, dtype=np.int64).reshape([1])).to(input.device)
+        res = nll_loss(input.unsqueeze(0), tgt_1d, weight=weight, ignore_index=ignore_index, reduction=reduction)
+        return res.squeeze(0) if reduction == "none" else res
+
+    if input.ndim > 2:
+        c = input.shape[1]
+        perm = [0] + list(range(2, input.ndim)) + [1]
+        inp_flat = input.permute(perm).reshape([-1, c])
+        tgt_t = target if isinstance(target, _Tensor) else _from_numpy(np.asarray(target, dtype=np.int64)).to(input.device)
+        tgt_shape = list(tgt_t.shape)
+        res = nll_loss(inp_flat, tgt_t.reshape([-1]), weight=weight, ignore_index=ignore_index, reduction=reduction)
+        return res.reshape(tgt_shape) if reduction == "none" else res
+
+    tgt_t = target if isinstance(target, _Tensor) else _from_numpy(np.asarray(target, dtype=np.int64)).to(input.device)
+    valid = tgt_t != int(ignore_index)
+    safe_tgt = _ox_where(valid, tgt_t, 0)
+    picked = -input.gather(1, safe_tgt.unsqueeze(1)).squeeze(1)
+    picked = _ox_where(valid, picked, 0.0)
+    if weight is not None:
+        w_elem = _as_tensor(weight).to(input.device).gather(0, safe_tgt)
+        w_elem = _ox_where(valid, w_elem, 0.0)
+        picked = picked * w_elem
+        denom = w_elem.sum()
+    else:
+        denom = valid.to_dtype(input.dtype).sum()
+    if reduction == "none":
+        return picked
+    if reduction == "sum":
+        return picked.sum()
+    return picked.sum() / denom
+
+
 focal_loss = _native_focal_loss
-kl_div_loss = _native_kl_div_loss
-kl_div = _native_kl_div_loss
-nll_loss = _native_nll_loss
 cosine_embedding_loss = _native_cosine_embedding_loss
 triplet_margin_loss = _native_triplet_margin_loss
 margin_ranking_loss = _native_margin_ranking_loss
@@ -2104,9 +2268,26 @@ def gumbel_softmax(logits: _Tensor, tau: float = 1.0, hard: bool = False, eps: f
     return (y_hard - y_soft).detach() + y_soft
 
 
-def rms_norm(input: _Tensor, normalized_shape: Sequence[int], weight: Optional[_Tensor] = None, eps: float = 1e-5) -> _Tensor:
+def _finfo_eps(dtype: Any) -> float:
+    tag = str(dtype)
+    if tag in ("f64", "float64"):
+        return float(np.finfo(np.float64).eps)
+    if tag in ("f16", "float16"):
+        return float(np.finfo(np.float16).eps)
+    if tag in ("bf16", "bfloat16"):
+        return 0.0078125
+    return float(np.finfo(np.float32).eps)
+
+
+def rms_norm(
+    input: _Tensor,
+    normalized_shape: Sequence[int],
+    weight: Optional[_Tensor] = None,
+    eps: Optional[float] = None,
+) -> _Tensor:
     """Applies Root Mean Square Layer Normalization."""
     x = _as_tensor(input)
+    eps_val = _finfo_eps(x.dtype) if eps is None else float(eps)
     norm_dims = len(normalized_shape)
     if norm_dims == 1:
         variance = x.pow(2.0).mean(dim=-1, keepdim=True)
@@ -2116,7 +2297,7 @@ def rms_norm(input: _Tensor, normalized_shape: Sequence[int], weight: Optional[_
         for _ in range(norm_dims):
             v = v.mean(dim=-1, keepdim=True)
         variance = v
-    r = x / (variance + float(eps)).sqrt()
+    r = x / (variance + eps_val).sqrt()
     if weight is not None:
         r = r * _as_tensor(weight)
     return r

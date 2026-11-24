@@ -234,3 +234,226 @@ def test_zero_d_results_stay_zero_d_through_numpy_backed_functions():
     assert tuple(ox.from_numpy(np.array(3.0)).sum().shape) == ()
     assert tuple(ox.nanmean(T(X3)).shape) == ()
     assert tuple(ox.count_nonzero(T(X3)).shape) == ()
+
+
+def test_softmax_last_axis_second_order_grad_matches_pytorch():
+    rng = np.random.RandomState(7)
+    x_np = rng.randn(3, 5).astype(np.float64)
+    v_np = rng.randn(3, 5).astype(np.float64)
+    x = T(x_np).requires_grad_(True)
+    v = T(v_np)
+    y = x.softmax(-1)
+    g1 = ox.autograd.grad((y * y).sum(), x, create_graph=True)[0]
+    g2 = ox.autograd.grad((g1 * v).sum(), x)[0]
+
+    px = torch.from_numpy(x_np.copy()).requires_grad_(True)
+    pv = torch.from_numpy(v_np.copy())
+    py = torch.softmax(px, dim=-1)
+    pg1 = torch.autograd.grad((py * py).sum(), px, create_graph=True)[0]
+    pg2 = torch.autograd.grad((pg1 * pv).sum(), px)[0]
+    np.testing.assert_allclose(A(g2), pg2.numpy(), atol=1e-10, rtol=1e-10)
+
+
+def test_matmul_mismatch_error_reports_distinct_shapes():
+    a = ox.zeros(5, 4)
+    b = ox.zeros(3, 2)
+    with pytest.raises(Exception, match=r"inner dims 4 != 3"):
+        _ = a @ b
+
+
+def test_optimizers_sgd_adam_adamw_flags_match_pytorch():
+    rng = np.random.RandomState(11)
+    w0 = rng.randn(4, 3).astype(np.float32)
+    g_seq = [rng.randn(4, 3).astype(np.float32) for _ in range(4)]
+
+    # SGD with nesterov / maximize
+    for kwargs in [
+        dict(lr=0.1, momentum=0.9, dampening=0.0, nesterov=True),
+        dict(lr=0.1, momentum=0.5, dampening=0.25, nesterov=False, maximize=True),
+    ]:
+        ow = T(w0.copy()).requires_grad_(True)
+        pw = torch.from_numpy(w0.copy()).requires_grad_(True)
+        oopt = ox.optim.SGD([ow], **kwargs)
+        popt = torch.optim.SGD([pw], **kwargs)
+        for g in g_seq:
+            oopt.zero_grad()
+            popt.zero_grad()
+            (ow * T(g)).sum().backward()
+            (pw * torch.from_numpy(g)).sum().backward()
+            oopt.step()
+            popt.step()
+        np.testing.assert_allclose(A(ow), pw.detach().numpy(), atol=1e-5)
+
+    # Adam / AdamW with amsgrad, maximize, betas, eps
+    for ocls, pcls in [(ox.optim.Adam, torch.optim.Adam), (ox.optim.AdamW, torch.optim.AdamW)]:
+        ow = T(w0.copy()).requires_grad_(True)
+        pw = torch.from_numpy(w0.copy()).requires_grad_(True)
+        kwargs = dict(lr=1e-2, betas=(0.85, 0.99), eps=1e-6, amsgrad=True, maximize=True)
+        oopt = ocls([ow], **kwargs)
+        popt = pcls([pw], **kwargs)
+        for g in g_seq:
+            oopt.zero_grad()
+            popt.zero_grad()
+            (ow * T(g)).sum().backward()
+            (pw * torch.from_numpy(g)).sum().backward()
+            oopt.step()
+            popt.step()
+        np.testing.assert_allclose(A(ow), pw.detach().numpy(), atol=1e-5)
+
+
+def test_addmm_baddbmm_addmv_addr_differentiable_and_beta_zero():
+    rng = np.random.RandomState(13)
+    m_np = rng.randn(3, 4)
+    a_np = rng.randn(3, 5)
+    b_np = rng.randn(5, 4)
+    for beta in (0.0, 0.7):
+        om = T(m_np.copy()).requires_grad_(True)
+        oa = T(a_np.copy()).requires_grad_(True)
+        ob = T(b_np.copy()).requires_grad_(True)
+        pm = torch.from_numpy(m_np.copy()).requires_grad_(True)
+        pa = torch.from_numpy(a_np.copy()).requires_grad_(True)
+        pb = torch.from_numpy(b_np.copy()).requires_grad_(True)
+
+        oy = ox.addmm(om, oa, ob, beta=beta, alpha=1.5)
+        py = torch.addmm(pm, pa, pb, beta=beta, alpha=1.5)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-12)
+        (oy * oy).sum().backward()
+        (py * py).sum().backward()
+        np.testing.assert_allclose(A(oa.grad), pa.grad.numpy(), atol=1e-11)
+        np.testing.assert_allclose(A(ob.grad), pb.grad.numpy(), atol=1e-11)
+        if beta == 0.0:
+            assert om.grad is None or np.allclose(A(om.grad), 0.0)
+        else:
+            np.testing.assert_allclose(A(om.grad), pm.grad.numpy(), atol=1e-11)
+
+
+def test_losses_and_rms_norm_match_pytorch():
+    import oxideon.nn.functional as F
+    import torch.nn.functional as tF
+
+    rng = np.random.RandomState(19)
+    # rms_norm default eps matches finfo(dtype).eps
+    for dtype in (np.float32, np.float64):
+        x_np = rng.randn(2, 4).astype(dtype)
+        w_np = rng.randn(4).astype(dtype)
+        ox_x = T(x_np.copy()).requires_grad_(True)
+        pt_x = torch.from_numpy(x_np.copy()).requires_grad_(True)
+        oy = F.rms_norm(ox_x, (4,), weight=T(w_np.copy()))
+        py = tF.rms_norm(pt_x, (4,), weight=torch.from_numpy(w_np.copy()))
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-6)
+        (oy * oy).sum().backward()
+        (py * py).sum().backward()
+        np.testing.assert_allclose(A(ox_x.grad), pt_x.grad.numpy(), atol=1e-5)
+
+    # huber_loss, kl_div, nll_loss reductions & options
+    inp_np = rng.randn(3, 5).astype(np.float32)
+    tgt_np = rng.randn(3, 5).astype(np.float32)
+    for red in ("none", "mean", "sum"):
+        ox_i = T(inp_np.copy()).requires_grad_(True)
+        pt_i = torch.from_numpy(inp_np.copy()).requires_grad_(True)
+        oy = F.huber_loss(ox_i, T(tgt_np.copy()), reduction=red, delta=1.2)
+        py = tF.huber_loss(pt_i, torch.from_numpy(tgt_np.copy()), reduction=red, delta=1.2)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-5)
+        oy.sum().backward()
+        py.sum().backward()
+        np.testing.assert_allclose(A(ox_i.grad), pt_i.grad.numpy(), atol=1e-5)
+
+    log_p = tF.log_softmax(torch.from_numpy(inp_np), dim=-1).numpy()
+    log_q = tF.log_softmax(torch.from_numpy(tgt_np), dim=-1).numpy()
+    q_prob = np.exp(log_q)
+    for red in ("none", "mean", "sum", "batchmean"):
+        oy = F.kl_div(T(log_p.copy()), T(log_q.copy()), reduction=red, log_target=True)
+        py = tF.kl_div(torch.from_numpy(log_p.copy()), torch.from_numpy(log_q.copy()), reduction=red, log_target=True)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-5)
+        oy2 = F.kl_div_loss(T(log_p.copy()), T(q_prob.copy()), reduction=red)
+        py2 = tF.kl_div(torch.from_numpy(log_p.copy()), torch.from_numpy(q_prob.copy()), reduction=red)
+        np.testing.assert_allclose(A(oy2), py2.detach().numpy(), atol=1e-5)
+
+    targets = np.array([1, -100, 4], dtype=np.int64)
+    wt = np.array([1.0, 2.0, 0.5, 1.5, 3.0], dtype=np.float32)
+    for red in ("none", "mean", "sum"):
+        ox_i = T(log_p.copy()).requires_grad_(True)
+        pt_i = torch.from_numpy(log_p.copy()).requires_grad_(True)
+        oy = F.nll_loss(ox_i, T(targets.copy()), weight=T(wt.copy()), ignore_index=-100, reduction=red)
+        py = tF.nll_loss(pt_i, torch.from_numpy(targets.copy()), weight=torch.from_numpy(wt.copy()), ignore_index=-100, reduction=red)
+        np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-5)
+        oy.sum().backward()
+        py.sum().backward()
+        np.testing.assert_allclose(A(ox_i.grad), pt_i.grad.numpy(), atol=1e-5)
+
+
+def test_fft_accepts_native_complex_tensors():
+    rng = np.random.RandomState(23)
+    c = (rng.randn(4, 8) + 1j * rng.randn(4, 8)).astype(np.complex64)
+    oy = A(ox.fft.fft(T(c)))
+    py = torch.fft.fft(torch.from_numpy(c))
+    np.testing.assert_allclose(oy[..., 0] + 1j * oy[..., 1], py.numpy(), atol=1e-4)
+
+
+def test_py_layers_state_dict_conv2d_norms_pools_and_rnns():
+    import oxideon.nn as nn
+    import oxideon.nn.functional as F
+    import torch.nn as tnn
+    import torch.nn.functional as tF
+
+    for layer in [
+        nn.Linear(4, 3),
+        nn.Embedding(6, 4),
+        nn.LayerNorm(4),
+        nn.Conv2d(4, 6, (3, 2), stride=(1, 2), padding=(1, 0), dilation=(1, 1), groups=2, bias=False),
+        nn.Conv3d(2, 3, 2),
+    ]:
+        sd = layer.state_dict()
+        assert set(sd.keys()) == set(dict(layer.named_parameters()).keys())
+        layer.load_state_dict(sd)
+        layer.train()
+        layer.eval()
+        layer.zero_grad()
+
+    with pytest.raises(Exception):
+        nn.Linear(4, 3).load_state_dict({"weight": ox.zeros(2, 4), "bias": ox.zeros(3)})
+
+    rng = np.random.RandomState(29)
+    x_np = rng.randn(2, 4, 5, 5).astype(np.float32)
+    bn = nn.BatchNorm2d(4)
+    assert tuple(bn.weight.shape) == (4,) and tuple(bn.bias.shape) == (4,)
+    assert tuple(bn.running_mean.shape) == (4,) and tuple(bn.running_var.shape) == (4,)
+    gn = nn.GroupNorm(2, 4)
+    assert tuple(gn.weight.shape) == (4,) and tuple(gn.bias.shape) == (4,)
+
+    assert np.allclose(
+        A(F.max_pool2d(T(x_np), 2, stride=2, ceil_mode=True)),
+        tF.max_pool2d(torch.from_numpy(x_np), 2, stride=2, ceil_mode=True).numpy(),
+        atol=1e-6,
+    )
+    assert np.allclose(
+        A(F.avg_pool2d(T(x_np), 3, stride=2, padding=1, ceil_mode=True, count_include_pad=False)),
+        tF.avg_pool2d(torch.from_numpy(x_np), 3, stride=2, padding=1, ceil_mode=True, count_include_pad=False).numpy(),
+        atol=1e-6,
+    )
+
+    inp_np = rng.randn(2, 4, 3).astype(np.float32)
+    for cls, tcls, extra in [
+        (nn.LSTM, tnn.LSTM, {}),
+        (nn.GRU, tnn.GRU, {}),
+        (nn.RNN, tnn.RNN, {"nonlinearity": "tanh"}),
+    ]:
+        om = cls(3, 5, batch_first=True, **extra)
+        tm = tcls(3, 5, batch_first=True, **extra)
+        sd = {}
+        for pk, pv in tm.state_dict().items():
+            base, layer = pk.rsplit("_l", 1)
+            sd[f"cells.{layer}.{base}"] = T(pv.detach().numpy().copy())
+        om.load_state_dict(sd)
+        ox_i = T(inp_np.copy()).requires_grad_(True)
+        pt_i = torch.from_numpy(inp_np.copy()).requires_grad_(True)
+        oo, _ = om(ox_i)
+        to, _ = tm(pt_i)
+        np.testing.assert_allclose(A(oo), to.detach().numpy(), atol=1e-5)
+        (oo * oo).sum().backward()
+        (to * to).sum().backward()
+        np.testing.assert_allclose(A(ox_i.grad), pt_i.grad.numpy(), atol=1e-5)
+        for pk, tp in tm.named_parameters():
+            base, layer = pk.rsplit("_l", 1)
+            ok = f"cells.{layer}.{base}"
+            np.testing.assert_allclose(A(dict(om.named_parameters())[ok].grad), tp.grad.numpy(), atol=1e-5)

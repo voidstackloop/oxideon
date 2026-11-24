@@ -4002,6 +4002,15 @@ def repeat_interleave(input: _Tensor, repeats: Union[int, _Tensor, Sequence[int]
     return x.index_select(d, _Tensor.from_numpy(idx))
 
 
+def _scaled_mat_add(input: _Tensor, term: _Tensor, beta: float = 1.0, alpha: float = 1.0) -> _Tensor:
+    prod = term * float(alpha) if alpha != 1.0 else term
+    if beta == 0.0:
+        target_shape = list(np.broadcast_shapes(tuple(input.shape), tuple(prod.shape)))
+        return prod.expand(target_shape) if list(prod.shape) != target_shape else prod
+    inp = input * float(beta) if beta != 1.0 else input
+    return inp + prod
+
+
 def addmm(
     input: _Tensor,
     mat1: _Tensor,
@@ -4010,11 +4019,7 @@ def addmm(
     alpha: float = 1.0,
 ) -> _Tensor:
     """Performs a matrix multiplication of matrices mat1 and mat2, adds matrix input: beta*input + alpha*(mat1 @ mat2)."""
-    m1 = _to_np(mat1)
-    m2 = _to_np(mat2)
-    inp = _to_np(input)
-    res = beta * inp + alpha * (m1 @ m2)
-    return _wrap(res, input)
+    return _scaled_mat_add(input, mat1 @ mat2, beta=beta, alpha=alpha)
 
 
 def baddbmm(
@@ -4025,12 +4030,7 @@ def baddbmm(
     alpha: float = 1.0,
 ) -> _Tensor:
     """Performs a batch matrix-matrix product of matrices in batch1 and batch2, adds input: beta*input + alpha*(b1 @ b2)."""
-    b1 = _to_np(batch1)
-    b2 = _to_np(batch2)
-    inp = _to_np(input)
-    prod = np.matmul(b1, b2)
-    res = beta * inp + alpha * prod
-    return _wrap(res, input)
+    return _scaled_mat_add(input, batch1 @ batch2, beta=beta, alpha=alpha)
 
 
 def addbmm(
@@ -4041,12 +4041,7 @@ def addbmm(
     alpha: float = 1.0,
 ) -> _Tensor:
     """Performs a batch matrix-matrix product of matrices in batch1 and batch2 and sums across the batch dimension."""
-    b1 = _to_np(batch1)
-    b2 = _to_np(batch2)
-    inp = _to_np(input)
-    sum_prod = np.sum(np.matmul(b1, b2), axis=0)
-    res = beta * inp + alpha * sum_prod
-    return _wrap(res, input)
+    return _scaled_mat_add(input, (batch1 @ batch2).sum(dim=0), beta=beta, alpha=alpha)
 
 
 def addmv(
@@ -4057,11 +4052,7 @@ def addmv(
     alpha: float = 1.0,
 ) -> _Tensor:
     """Performs a matrix-vector product of matrix mat and vector vec, adds vector input: beta*input + alpha*(mat @ vec)."""
-    m = _to_np(mat)
-    v = _to_np(vec)
-    inp = _to_np(input)
-    res = beta * inp + alpha * (m @ v)
-    return _wrap(res, input)
+    return _scaled_mat_add(input, mat @ vec, beta=beta, alpha=alpha)
 
 
 def addr(
@@ -4072,12 +4063,7 @@ def addr(
     alpha: float = 1.0,
 ) -> _Tensor:
     """Performs the outer-product of vectors vec1 and vec2 and adds it to input: beta*input + alpha*(vec1 (x) vec2)."""
-    v1 = _to_np(vec1)
-    v2 = _to_np(vec2)
-    inp = _to_np(input)
-    outer = np.outer(v1, v2)
-    res = beta * inp + alpha * outer
-    return _wrap(res, input)
+    return _scaled_mat_add(input, vec1.outer(vec2), beta=beta, alpha=alpha)
 
 
 # Monkeypatch methods onto _Tensor (native kron, cov, corrcoef, cross are differentiable in Rust)

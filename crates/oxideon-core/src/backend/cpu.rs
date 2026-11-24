@@ -3746,11 +3746,11 @@ impl CpuStorage {
         let (m, k) = (lhs_l.shape()[ar - 2], lhs_l.shape()[ar - 1]);
         let (k2, n) = (rhs_l.shape()[br - 2], rhs_l.shape()[br - 1]);
         if k != k2 {
-            return Err(Error::ShapeMismatch {
-                op: "matmul",
-                expected: lhs_l.shape().to_vec(),
-                got: rhs_l.shape().to_vec(),
-            });
+            return Err(Error::Msg(format!(
+                "matmul: shape mismatch ({:?} and {:?}, inner dims {k} != {k2})",
+                lhs_l.shape(),
+                rhs_l.shape()
+            )));
         }
 
         let batch_shape =
