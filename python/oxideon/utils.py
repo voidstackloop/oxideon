@@ -16,7 +16,27 @@ sys.modules["oxideon.utils.checkpoint"] = checkpoint
 sys.modules["oxideon.utils.rnn"] = rnn
 sys.modules["oxideon.nn.utils.rnn"] = rnn
 
-from .oxideon import manual_seed as _manual_seed
+from .oxideon import manual_seed as _manual_seed, cat as _native_cat
+from .primitives import no_grad as _no_grad
+
+
+def parameters_to_vector(parameters):
+    """Convert parameters to one flattened 1-D vector (torch.nn.utils.parameters_to_vector)."""
+    vecs = [p.reshape([-1]) for p in parameters]
+    if not vecs:
+        from .oxideon import zeros
+        return zeros([0])
+    return _native_cat(vecs, dim=0)
+
+
+def vector_to_parameters(vec, parameters):
+    """Convert one flattened 1-D vector back to the parameter shapes in-place."""
+    pointer = 0
+    with _no_grad():
+        for p in parameters:
+            num_param = p.numel()
+            p.copy_(vec[pointer:pointer + num_param].reshape(list(p.shape)))
+            pointer += num_param
 
 
 def set_seed(seed: int = 42):

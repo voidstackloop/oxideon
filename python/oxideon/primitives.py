@@ -1489,11 +1489,9 @@ def norm(
     return linalg.norm(input, ord=p, dim=dim, keepdim=keepdim)
 
 
-def clamp(input: _Tensor, min: Optional[float] = None, max: Optional[float] = None) -> _Tensor:
+def clamp(input: _Tensor, min: Any = None, max: Any = None) -> _Tensor:
     """Clamps all elements in input into the range [min, max]."""
-    min_val = -1e30 if min is None else float(min)
-    max_val = 1e30 if max is None else float(max)
-    return input.clamp(min_val, max_val)
+    return as_tensor(input).clamp(min=min, max=max)
 
 
 clip = clamp
@@ -3146,14 +3144,19 @@ def _patch_tensor():
             return orig_squeeze(self)
         # Differentiable path via reshape (stays in the autograd graph).
         s = list(self.shape)
-        if not -len(s) <= dim < len(s):
-            raise IndexError(
-                f"Dimension out of range (expected to be in range of [{-len(s)}, {len(s) - 1}], but got {dim})"
-            )
-        d = dim if dim >= 0 else len(s) + dim
-        if s[d] == 1:
-            return self.reshape([v for i, v in enumerate(s) if i != d])
-        return self
+        dims = list(dim) if isinstance(dim, (tuple, list)) else [dim]
+        norm_dims = set()
+        for d_raw in dims:
+            if not -len(s) <= d_raw < len(s):
+                raise IndexError(
+                    f"Dimension out of range (expected to be in range of [{-len(s)}, {len(s) - 1}], but got {d_raw})"
+                )
+            d = d_raw if d_raw >= 0 else len(s) + d_raw
+            norm_dims.add(d)
+        new_shape = [v for i, v in enumerate(s) if not (i in norm_dims and s[i] == 1)]
+        if new_shape == s:
+            return self
+        return self.reshape(new_shape)
     _Tensor.squeeze = _tensor_squeeze
 
     # In-place mathematical mutations
@@ -3506,6 +3509,13 @@ def _patch_tensor():
     def _tensor_clamp(self, min=None, max=None):
         if min is None and max is None:
             return self.clone()
+        if isinstance(min, _Tensor) or isinstance(max, _Tensor):
+            res = self
+            if min is not None:
+                res = res.maximum(as_tensor(min))
+            if max is not None:
+                res = res.minimum(as_tensor(max))
+            return res
         min_val = -1e30 if min is None else float(min)
         max_val = 1e30 if max is None else float(max)
         if min_val > max_val or math.isnan(min_val) or math.isnan(max_val):

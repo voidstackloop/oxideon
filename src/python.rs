@@ -5087,13 +5087,20 @@ impl_py_layer_params!(PyEmbedding, "Embedding", weight_only);
 pub struct PyLayerNorm {
     inner: LayerNorm,
     normalized_shape: Vec<usize>,
+    elementwise_affine: bool,
+    use_bias: bool,
 }
 
 #[pymethods]
 impl PyLayerNorm {
     #[new]
-    #[pyo3(signature = (normalized_shape, eps=1e-5))]
-    pub fn new(normalized_shape: Bound<'_, PyAny>, eps: f64) -> PyResult<Self> {
+    #[pyo3(signature = (normalized_shape, eps=1e-5, elementwise_affine=true, bias=true))]
+    pub fn new(
+        normalized_shape: Bound<'_, PyAny>,
+        eps: f64,
+        elementwise_affine: bool,
+        bias: bool,
+    ) -> PyResult<Self> {
         let shape = match normalized_shape.extract::<usize>() {
             Ok(n) => vec![n],
             Err(_) => match normalized_shape.extract::<Vec<usize>>()?.as_slice() {
@@ -5109,6 +5116,8 @@ impl PyLayerNorm {
         Ok(Self {
             inner,
             normalized_shape: shape,
+            elementwise_affine,
+            use_bias: bias,
         })
     }
 
@@ -5121,8 +5130,30 @@ impl PyLayerNorm {
     }
 
     pub fn forward(&self, py: Python<'_>, x: &PyTensor) -> PyResult<PyTensor> {
+        let affine = self.elementwise_affine;
+        let use_bias = self.use_bias;
         let out = py
-            .detach(|| self.inner.forward(&x.inner))
+            .detach(|| {
+                if affine && use_bias {
+                    self.inner.forward(&x.inner)
+                } else {
+                    let tmp = LayerNorm {
+                        weight: if affine {
+                            self.inner.weight.clone()
+                        } else {
+                            self.inner.weight.ones_like()?.detach()
+                        },
+                        bias: if affine && use_bias {
+                            self.inner.bias.clone()
+                        } else {
+                            self.inner.bias.zeros_like()?.detach()
+                        },
+                        eps: self.inner.eps,
+                        normalized_shape: self.normalized_shape.clone(),
+                    };
+                    tmp.forward(&x.inner)
+                }
+            })
             .map_err(to_py_err)?;
         Ok(PyTensor { inner: out })
     }
@@ -5132,21 +5163,25 @@ impl PyLayerNorm {
     }
 
     pub fn parameters(&self) -> Vec<PyTensor> {
-        vec![
-            PyTensor {
-                inner: self.inner.weight.clone(),
-            },
-            PyTensor {
+        if !self.elementwise_affine {
+            return Vec::new();
+        }
+        let mut p = vec![PyTensor {
+            inner: self.inner.weight.clone(),
+        }];
+        if self.use_bias {
+            p.push(PyTensor {
                 inner: self.inner.bias.clone(),
-            },
-        ]
+            });
+        }
+        p
     }
 
     #[getter]
-    pub fn weight(&self) -> PyTensor {
-        PyTensor {
+    pub fn weight(&self) -> Option<PyTensor> {
+        self.elementwise_affine.then(|| PyTensor {
             inner: self.inner.weight.clone(),
-        }
+        })
     }
 
     #[setter]
@@ -5155,10 +5190,10 @@ impl PyLayerNorm {
     }
 
     #[getter]
-    pub fn bias(&self) -> PyTensor {
-        PyTensor {
+    pub fn bias(&self) -> Option<PyTensor> {
+        (self.elementwise_affine && self.use_bias).then(|| PyTensor {
             inner: self.inner.bias.clone(),
-        }
+        })
     }
 
     #[setter]
@@ -5167,7 +5202,10 @@ impl PyLayerNorm {
     }
 
     pub fn __repr__(&self) -> String {
-        format!("LayerNorm({:?}, eps={}, elementwise_affine=true)", self.normalized_shape, self.inner.eps)
+        format!(
+            "LayerNorm({:?}, eps={}, elementwise_affine={})",
+            self.normalized_shape, self.inner.eps, self.elementwise_affine
+        )
     }
     #[pyo3(signature = (prefix=""))]
     pub fn named_parameters(&self, prefix: &str) -> Vec<(String, PyTensor)> { layer_named_parameters(self, prefix) }
@@ -5181,7 +5219,29 @@ impl PyLayerNorm {
     pub fn zero_grad(&self) { layer_zero_grad(self); }
 }
 
-impl_py_layer_params!(PyLayerNorm, "LayerNorm", req_bias);
+impl PyLayerParams for PyLayerNorm {
+    const OWNER: &'static str = "LayerNorm";
+    fn param_pairs(&self) -> Vec<(std::borrow::Cow<'static, str>, &Tensor)> {
+        if !self.elementwise_affine {
+            return Vec::new();
+        }
+        let mut p = vec![(std::borrow::Cow::Borrowed("weight"), &self.inner.weight)];
+        if self.use_bias {
+            p.push((std::borrow::Cow::Borrowed("bias"), &self.inner.bias));
+        }
+        p
+    }
+    fn param_pairs_mut(&mut self) -> Vec<(std::borrow::Cow<'static, str>, &mut Tensor)> {
+        if !self.elementwise_affine {
+            return Vec::new();
+        }
+        let mut p = vec![(std::borrow::Cow::Borrowed("weight"), &mut self.inner.weight)];
+        if self.use_bias {
+            p.push((std::borrow::Cow::Borrowed("bias"), &mut self.inner.bias));
+        }
+        p
+    }
+}
 
 /// Zeroes each element with probability `p` (scaling the rest by `1 / (1 - p)`) while in training mode.
 #[pyclass(name = "Dropout", module = "oxideon")]
@@ -10895,9 +10955,57 @@ impl PyZeRO3Parameter {
 // Optimizers & Compiled IR Graph
 // ---------------------------------------------------------------------------
 
+fn opt_state_to_py<O: crate::optim::Optimizer>(
+    opt: &O,
+    py: Python<'_>,
+) -> PyResult<pyo3::Py<pyo3::types::PyDict>> {
+    let st = opt.state_dict();
+    let root = pyo3::types::PyDict::new(py);
+    let tensors = pyo3::types::PyDict::new(py);
+    for (k, t) in st.tensors {
+        tensors.set_item(k, PyTensor { inner: t })?;
+    }
+    let scalars = pyo3::types::PyDict::new(py);
+    for (k, v) in st.scalars {
+        scalars.set_item(k, v)?;
+    }
+    root.set_item("tensors", tensors)?;
+    root.set_item("scalars", scalars)?;
+    Ok(root.into())
+}
+
+fn opt_state_from_py<O: crate::optim::Optimizer>(
+    opt: &mut O,
+    dict: &Bound<'_, pyo3::types::PyDict>,
+) -> PyResult<()> {
+    let mut st = crate::optim::OptimizerState::default();
+    if let Some(td) = dict.get_item("tensors")? {
+        let td = td.cast::<pyo3::types::PyDict>()?;
+        for (k, v) in td.iter() {
+            let key: String = k.extract()?;
+            let val: PyRef<'_, PyTensor> = v.extract()?;
+            st.tensors.insert(key, val.inner.clone());
+        }
+    }
+    if let Some(sd) = dict.get_item("scalars")? {
+        let sd = sd.cast::<pyo3::types::PyDict>()?;
+        for (k, v) in sd.iter() {
+            let key: String = k.extract()?;
+            let val: f64 = v.extract()?;
+            st.scalars.insert(key, val);
+        }
+    }
+    opt.load_state_dict(&st).map_err(to_py_err)
+}
+
 #[pyclass(name = "AdamW", module = "oxideon")]
 pub struct PyAdamW {
     inner: Adam,
+    betas: (f64, f64),
+    eps: f64,
+    weight_decay: f64,
+    amsgrad: bool,
+    maximize: bool,
 }
 
 #[pymethods]
@@ -10930,6 +11038,11 @@ impl PyAdamW {
                 .eps(eps)
                 .amsgrad(amsgrad)
                 .maximize(maximize),
+            betas,
+            eps,
+            weight_decay,
+            amsgrad,
+            maximize,
         })
     }
 
@@ -10950,6 +11063,27 @@ impl PyAdamW {
         non_negative("lr", lr)?;
         self.inner.set_learning_rate(lr);
         Ok(())
+    }
+
+    pub fn state_dict(&self, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::types::PyDict>> {
+        opt_state_to_py(&self.inner, py)
+    }
+
+    pub fn load_state_dict(&mut self, state_dict: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
+        opt_state_from_py(&mut self.inner, state_dict)
+    }
+
+    #[getter]
+    pub fn param_groups(&self, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::types::PyList>> {
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("lr", self.lr())?;
+        dict.set_item("betas", self.betas)?;
+        dict.set_item("eps", self.eps)?;
+        dict.set_item("weight_decay", self.weight_decay)?;
+        dict.set_item("amsgrad", self.amsgrad)?;
+        dict.set_item("maximize", self.maximize)?;
+        let list = pyo3::types::PyList::new(py, &[dict])?;
+        Ok(list.into())
     }
 }
 
@@ -11056,12 +11190,25 @@ impl PySGD {
         let list = pyo3::types::PyList::new(py, &[dict])?;
         Ok(list.into())
     }
+
+    pub fn state_dict(&self, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::types::PyDict>> {
+        opt_state_to_py(&self.inner, py)
+    }
+
+    pub fn load_state_dict(&mut self, state_dict: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
+        opt_state_from_py(&mut self.inner, state_dict)
+    }
 }
 
 /// Adam with optional (coupled, L2) weight decay; use `AdamW` for decoupled decay.
 #[pyclass(name = "Adam", module = "oxideon")]
 pub struct PyAdam {
     inner: Adam,
+    betas: (f64, f64),
+    eps: f64,
+    weight_decay: f64,
+    amsgrad: bool,
+    maximize: bool,
 }
 
 #[pymethods]
@@ -11095,6 +11242,11 @@ impl PyAdam {
                 .weight_decay(weight_decay)
                 .amsgrad(amsgrad)
                 .maximize(maximize),
+            betas,
+            eps,
+            weight_decay,
+            amsgrad,
+            maximize,
         })
     }
 
@@ -11115,6 +11267,27 @@ impl PyAdam {
         non_negative("lr", lr)?;
         self.inner.set_learning_rate(lr);
         Ok(())
+    }
+
+    pub fn state_dict(&self, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::types::PyDict>> {
+        opt_state_to_py(&self.inner, py)
+    }
+
+    pub fn load_state_dict(&mut self, state_dict: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
+        opt_state_from_py(&mut self.inner, state_dict)
+    }
+
+    #[getter]
+    pub fn param_groups(&self, py: Python<'_>) -> PyResult<pyo3::Py<pyo3::types::PyList>> {
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("lr", self.lr())?;
+        dict.set_item("betas", self.betas)?;
+        dict.set_item("eps", self.eps)?;
+        dict.set_item("weight_decay", self.weight_decay)?;
+        dict.set_item("amsgrad", self.amsgrad)?;
+        dict.set_item("maximize", self.maximize)?;
+        let list = pyo3::types::PyList::new(py, &[dict])?;
+        Ok(list.into())
     }
 }
 

@@ -743,3 +743,91 @@ def test_conv_transpose_groups_batchnorm_track_lr_plateau_and_embedding_padding_
     (py_e * py_e).sum().backward()
     np.testing.assert_allclose(A(oe.weight.grad), pe.weight.grad.numpy(), atol=1e-5)
     np.testing.assert_allclose(A(oe.weight.grad)[0], np.zeros(4))
+
+
+def test_squeeze_tuple_clamp_tensor_layernorm_affine_bias_utils_and_opt_state_dict():
+    import os
+    import tempfile
+    import oxideon.nn as nn
+    import torch.nn as tnn
+
+    t = ox.ones(1, 3, 1, 4, requires_grad=True)
+    s = t.squeeze((0, 2))
+    assert tuple(s.shape) == (3, 4)
+    (s * 2.0).sum().backward()
+    np.testing.assert_allclose(A(t.grad), np.full((1, 3, 1, 4), 2.0))
+
+    rng = np.random.RandomState(53)
+    x_np = rng.randn(3, 4)
+    lo_np = rng.uniform(-1.0, 0.0, (1, 4))
+    hi_np = rng.uniform(0.1, 1.0, (3, 4))
+    ox_x = T(x_np.copy()).requires_grad_(True)
+    pt_x = torch.from_numpy(x_np.copy()).requires_grad_(True)
+    oy = ox.clamp(ox_x, min=T(lo_np), max=T(hi_np))
+    py = torch.clamp(pt_x, min=torch.from_numpy(lo_np), max=torch.from_numpy(hi_np))
+    np.testing.assert_allclose(A(oy), py.detach().numpy(), atol=1e-12)
+    (oy * oy).sum().backward()
+    (py * py).sum().backward()
+    np.testing.assert_allclose(A(ox_x.grad), pt_x.grad.numpy(), atol=1e-12)
+
+    x2 = rng.randn(2, 6).astype(np.float32)
+    ln_nb = nn.LayerNorm(6, bias=False)
+    tln_nb = tnn.LayerNorm(6, bias=False)
+    assert ln_nb.bias is None and list(ln_nb.state_dict().keys()) == ["weight"]
+    ox_x2 = T(x2.copy()).requires_grad_(True)
+    pt_x2 = torch.from_numpy(x2.copy()).requires_grad_(True)
+    oy2 = ln_nb(ox_x2)
+    py2 = tln_nb(pt_x2)
+    np.testing.assert_allclose(A(oy2), py2.detach().numpy(), atol=1e-5)
+    (oy2 * oy2).sum().backward()
+    (py2 * py2).sum().backward()
+    np.testing.assert_allclose(A(ox_x2.grad), pt_x2.grad.numpy(), atol=1e-5)
+    np.testing.assert_allclose(A(ln_nb.weight.grad), tln_nb.weight.grad.numpy(), atol=1e-5)
+
+    ln_na = nn.LayerNorm(6, elementwise_affine=False)
+    tln_na = tnn.LayerNorm(6, elementwise_affine=False)
+    assert ln_na.weight is None and ln_na.bias is None and ln_na.state_dict() == {}
+    np.testing.assert_allclose(A(ln_na(T(x2.copy()))), tln_na(torch.from_numpy(x2.copy())).detach().numpy(), atol=1e-5)
+
+    seq = nn.Sequential(nn.Linear(4, 3), nn.ReLU(), nn.Linear(3, 2))
+    vec = nn.utils.parameters_to_vector(seq.parameters())
+    assert tuple(vec.shape) == (4 * 3 + 3 + 3 * 2 + 2,)
+    nn.utils.vector_to_parameters(vec * 0.0 + 0.5, seq.parameters())
+    for p in seq.parameters():
+        np.testing.assert_allclose(A(p), 0.5)
+
+    for ocls in (ox.optim.SGD, ox.optim.Adam, ox.optim.AdamW):
+        kwargs = dict(lr=0.05, momentum=0.9) if ocls is ox.optim.SGD else dict(lr=0.01, amsgrad=True)
+        w_a = T(rng.randn(4, 3).astype(np.float32)).requires_grad_(True)
+        w_b = T(A(w_a).copy()).requires_grad_(True)
+        g1 = T(rng.randn(4, 3).astype(np.float32))
+        g2 = T(rng.randn(4, 3).astype(np.float32))
+        opt_a = ocls([w_a], **kwargs)
+        (w_a * g1).sum().backward()
+        opt_a.step()
+
+        with tempfile.TemporaryDirectory() as td:
+            ckpt = os.path.join(td, "ckpt.ox")
+            ox.save({"w": w_a, "opt": opt_a.state_dict()}, ckpt)
+            loaded = ox.load(ckpt)
+            with ox.no_grad():
+                w_b.copy_(loaded["w"])
+            opt_b = ocls([w_b], **kwargs)
+            opt_b.load_state_dict(loaded["opt"])
+
+        opt_a.zero_grad()
+        opt_b.zero_grad()
+        (w_a * g2).sum().backward()
+        (w_b * g2).sum().backward()
+        opt_a.step()
+        opt_b.step()
+        np.testing.assert_allclose(A(w_a), A(w_b), atol=1e-7)
+        assert len(opt_b.param_groups) == 1
+
+    for cls, inp in [
+        (nn.InstanceNorm1d, rng.randn(2, 4, 6).astype(np.float32)),
+        (nn.InstanceNorm2d, rng.randn(2, 4, 5, 5).astype(np.float32)),
+        (nn.InstanceNorm3d, rng.randn(2, 4, 3, 3, 3).astype(np.float32)),
+    ]:
+        m = cls(4, affine=True, track_running_stats=True)
+        assert m.running_mean is not None and tuple(m(T(inp)).shape) == inp.shape

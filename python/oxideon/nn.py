@@ -1539,6 +1539,8 @@ class MultiheadAttention(Module):
                 scores = scores + kpm_t.to_dtype(scores.dtype).reshape([B, 1, 1, S])
 
         weights = scores.softmax(-1)
+        if self.training and self.dropout_p > 0.0:
+            weights = functional.dropout(weights, p=self.dropout_p, training=True)
 
         attn_out = weights.matmul(v).transpose(1, 2).reshape([B, L, E])
         out = self.out_proj(attn_out)
@@ -2401,17 +2403,25 @@ class LazyBatchNorm3d(BatchNorm3d):
 
 class InstanceNorm1d(Module):
     """Applies 1D Instance Normalization."""
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = False):
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = False, track_running_stats: bool = False):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
+        self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
         if affine:
             self.weight = Parameter(_Tensor.ones([1, num_features, 1]))
             self.bias = Parameter(_Tensor.zeros([1, num_features, 1]))
         else:
             self.weight = None
             self.bias = None
+        if track_running_stats:
+            self.running_mean = _Tensor.zeros([num_features])
+            self.running_var = _Tensor.ones([num_features])
+        else:
+            self.running_mean = None
+            self.running_var = None
 
     def forward(self, x):
         from . import functional as F
@@ -2420,17 +2430,25 @@ class InstanceNorm1d(Module):
 
 class InstanceNorm2d(Module):
     """Applies 2D Instance Normalization."""
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = False):
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = False, track_running_stats: bool = False):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
+        self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
         if affine:
             self.weight = Parameter(_Tensor.ones([1, num_features, 1, 1]))
             self.bias = Parameter(_Tensor.zeros([1, num_features, 1, 1]))
         else:
             self.weight = None
             self.bias = None
+        if track_running_stats:
+            self.running_mean = _Tensor.zeros([num_features])
+            self.running_var = _Tensor.ones([num_features])
+        else:
+            self.running_mean = None
+            self.running_var = None
 
     def forward(self, x):
         from . import functional as F
@@ -2439,17 +2457,25 @@ class InstanceNorm2d(Module):
 
 class InstanceNorm3d(Module):
     """Applies 3D Instance Normalization."""
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = False):
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = False, track_running_stats: bool = False):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
+        self.momentum = momentum
         self.affine = affine
+        self.track_running_stats = track_running_stats
         if affine:
             self.weight = Parameter(_Tensor.ones([1, num_features, 1, 1, 1]))
             self.bias = Parameter(_Tensor.zeros([1, num_features, 1, 1, 1]))
         else:
             self.weight = None
             self.bias = None
+        if track_running_stats:
+            self.running_mean = _Tensor.zeros([num_features])
+            self.running_var = _Tensor.ones([num_features])
+        else:
+            self.running_mean = None
+            self.running_var = None
 
     def forward(self, x):
         from . import functional as F
