@@ -192,16 +192,18 @@ def jvp(
         v_np = _to_np(t_tuple[0]).reshape(-1)
         out_shape = out.shape
         out_numel = int(np.prod(out_shape)) if len(out_shape) > 0 else 1
-        jvp_np = (jac_np.reshape(out_numel, -1) @ v_np).reshape(out_shape).astype(np.float32)
+        out_dt = _to_np(out).dtype
+        jvp_np = (jac_np.reshape(out_numel, -1) @ v_np).reshape(out_shape).astype(out_dt)
         return out, _from_numpy(np.ascontiguousarray(jvp_np))
 
     out_shape = out.shape
     out_numel = int(np.prod(out_shape)) if len(out_shape) > 0 else 1
-    total_jvp = np.zeros(out_numel, dtype=np.float32)
+    out_dt = _to_np(out).dtype
+    total_jvp = np.zeros(out_numel, dtype=out_dt)
     for j_i, v_i in zip(jac, t_tuple):
         j_np = _to_np(j_i).reshape(out_numel, -1)
         v_np = _to_np(v_i).reshape(-1)
-        total_jvp += (j_np @ v_np).astype(np.float32)
+        total_jvp += (j_np @ v_np).astype(out_dt)
     return out, _from_numpy(np.ascontiguousarray(total_jvp.reshape(out_shape)))
 
 

@@ -2705,34 +2705,53 @@ class _FunctionalAutograd:
         create_graph: bool = False,
         strict: bool = False,
     ) -> Tuple[Any, Any]:
-        """Jacobian-vector product via central finite differences (NOT exact forward-mode AD).
-
-        Approximates J(x)v as (f(x+eps*v) - f(x-eps*v)) / (2*eps) with
-        eps=1e-3, giving O(eps^2) truncation error plus float32 rounding
-        (~1e-4 relative on O(1) outputs). Use only for gradient checks and
-        prototyping; unlike torch.func.jvp this is not exact to machine
-        precision.
-        """
+        """Exact forward-mode Jacobian-vector product via reverse-over-reverse (double backward) AD."""
         is_tuple = isinstance(inputs, tuple)
         t_inputs = inputs if is_tuple else (inputs,)
         if v is None:
             v_tuple = tuple(ones_like(inp) for inp in t_inputs)
         else:
             v_tuple = v if isinstance(v, tuple) else (v,)
+        if len(t_inputs) != len(v_tuple):
+            raise ValueError(f"jvp: inputs length ({len(t_inputs)}) must match v length ({len(v_tuple)})")
 
-        eps = 1e-3
-        outputs = func(*t_inputs)
-        fwd_inputs = tuple(inp + eps * vi for inp, vi in zip(t_inputs, v_tuple))
-        bwd_inputs = tuple(inp - eps * vi for inp, vi in zip(t_inputs, v_tuple))
-        fwd_outputs = func(*fwd_inputs)
-        bwd_outputs = func(*bwd_inputs)
+        p_leaves = tuple(inp.detach().requires_grad_(True) for inp in t_inputs)
+        outputs = func(*p_leaves)
+        out_is_tuple = isinstance(outputs, tuple)
+        out_tuple = outputs if out_is_tuple else (outputs,)
 
-        if isinstance(outputs, tuple):
-            jvp_res = tuple((p - m) * (0.5 / eps) for p, m in zip(fwd_outputs, bwd_outputs))
+        u_dummies = tuple(zeros_like(o).detach().requires_grad_(True) for o in out_tuple)
+        vjps = _AutogradModule.grad(
+            out_tuple,
+            p_leaves,
+            grad_outputs=u_dummies,
+            create_graph=True,
+            allow_unused=not strict,
+        )
+        terms = []
+        for g, vi in zip(vjps, v_tuple):
+            if g is not None:
+                terms.append((g * vi).sum())
+        if not terms:
+            jvp_tuple = tuple(zeros_like(o) for o in out_tuple)
         else:
-            jvp_res = (fwd_outputs - bwd_outputs) * (0.5 / eps)
+            scalar = terms[0]
+            for t_item in terms[1:]:
+                scalar = scalar + t_item
+            raw_jvps = _AutogradModule.grad(
+                scalar,
+                u_dummies,
+                create_graph=create_graph,
+                allow_unused=True,
+            )
+            jvp_tuple = tuple(
+                zeros_like(o) if g is None else g
+                for g, o in zip(raw_jvps, out_tuple)
+            )
 
-        return outputs, jvp_res
+        res_out = outputs if out_is_tuple else outputs.detach() if not create_graph else outputs
+        res_jvp = jvp_tuple if out_is_tuple else jvp_tuple[0]
+        return res_out, res_jvp
 
     @staticmethod
     def jacobian(
@@ -2798,53 +2817,31 @@ class _FunctionalAutograd:
         strict: bool = False,
         vectorize: bool = False,
     ) -> Union[_Tensor, Tuple[Any, ...]]:
-        """Hessian via central finite differences of autograd gradients (approximate).
-
-        Inputs that do not affect the output yield zero rows/columns.
-        """
+        """Exact Hessian via reverse-over-reverse automatic differentiation."""
         is_tuple = isinstance(inputs, tuple)
         t_inputs = inputs if is_tuple else (inputs,)
 
-        eps = 1e-3
-        all_hessians = []
+        def _hessian_block(k: int, target_k: int):
+            def grad_fn(x_target):
+                leaves = [
+                    x_target if idx == k else inp.detach().requires_grad_(True)
+                    for idx, inp in enumerate(t_inputs)
+                ]
+                out = func(*leaves)
+                if strict:
+                    g = _AutogradModule.grad(out, leaves[target_k], create_graph=True, allow_unused=False)[0]
+                else:
+                    g = _AutogradModule.grad(out, leaves[target_k], create_graph=True, allow_unused=True)[0]
+                return zeros_like(leaves[target_k]) if g is None else g
 
-        for k, inp_k in enumerate(t_inputs):
-            n = inp_k.numel()
-            arr_k = inp_k.to_numpy().astype(np.float32)
-            flat_k = arr_k.flatten()
-            H_k = np.zeros((n, n), dtype=np.float32)
+            return _FunctionalAutograd.jacobian(grad_fn, t_inputs[k], create_graph=create_graph, strict=strict)
 
-            for j in range(n):
-                e_j = np.zeros(n, dtype=np.float32)
-                e_j[j] = eps
-
-                flat_pos = flat_k + e_j
-                flat_neg = flat_k - e_j
-
-                pos_inputs = list(t_inputs)
-                neg_inputs = list(t_inputs)
-                pos_inputs[k] = tensor(flat_pos.reshape(arr_k.shape), dtype=inp_k.dtype, device=inp_k.device, requires_grad=True)
-                neg_inputs[k] = tensor(flat_neg.reshape(arr_k.shape), dtype=inp_k.dtype, device=inp_k.device, requires_grad=True)
-
-                out_pos = func(*pos_inputs) if is_tuple else func(pos_inputs[0])
-                out_neg = func(*neg_inputs) if is_tuple else func(neg_inputs[0])
-
-                out_pos.backward()
-                out_neg.backward()
-
-                # Unused inputs have no grad (None); their Hessian block is zero.
-                g_pos_t = pos_inputs[k].grad
-                g_neg_t = neg_inputs[k].grad
-                g_pos = g_pos_t.to_numpy().flatten() if g_pos_t is not None else np.zeros(n, dtype=np.float32)
-                g_neg = g_neg_t.to_numpy().flatten() if g_neg_t is not None else np.zeros(n, dtype=np.float32)
-                H_k[:, j] = (g_pos - g_neg) / (2.0 * eps)
-
-            H_k = 0.5 * (H_k + H_k.T)
-            shape = list(inp_k.shape) + list(inp_k.shape)
-            res_t = _from_numpy(_contig(H_k.reshape(shape), dtype=inp_k.to_numpy().dtype))
-            all_hessians.append(res_t)
-
-        return tuple(all_hessians) if is_tuple else all_hessians[0]
+        if not is_tuple:
+            return _hessian_block(0, 0)
+        return tuple(
+            tuple(_hessian_block(j, i) for j in range(len(t_inputs)))
+            for i in range(len(t_inputs))
+        )
 
     @staticmethod
     def hvp(

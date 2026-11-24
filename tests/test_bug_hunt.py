@@ -831,3 +831,53 @@ def test_squeeze_tuple_clamp_tensor_layernorm_affine_bias_utils_and_opt_state_di
     ]:
         m = cls(4, affine=True, track_running_stats=True)
         assert m.running_mean is not None and tuple(m(T(inp)).shape) == inp.shape
+
+
+def test_exact_jvp_hessian_and_persistent_buffers():
+    from collections import OrderedDict
+    import oxideon.nn as nn
+
+    x_np = np.array([1.2, -0.7, 0.4], dtype=np.float64)
+    v_np = np.array([0.5, 1.0, -0.3], dtype=np.float64)
+    f_ox = lambda z: (z.sin() + z * z * 0.5).sum()
+    f_pt = lambda z: (z.sin() + z * z * 0.5).sum()
+
+    o1, j1 = ox.autograd.functional.jvp(f_ox, (T(x_np),), (T(v_np),))
+    p1, pj1 = torch.autograd.functional.jvp(f_pt, (torch.from_numpy(x_np),), (torch.from_numpy(v_np),))
+    np.testing.assert_allclose(A(o1), p1.numpy(), atol=1e-12)
+    np.testing.assert_allclose(A(j1), pj1.numpy(), atol=1e-12)
+
+    oh = ox.autograd.functional.hessian(f_ox, T(x_np))
+    ph = torch.autograd.functional.hessian(f_pt, torch.from_numpy(x_np))
+    assert oh.dtype == "f64"
+    np.testing.assert_allclose(A(oh), ph.numpy(), atol=1e-12)
+    np.testing.assert_allclose(A(ox.func.hessian(f_ox)(T(x_np))), ph.numpy(), atol=1e-12)
+
+    f2_ox = lambda a, b: (a * b).sum() + (a ** 2).sum() * 0.5
+    f2_pt = lambda a, b: (a * b).sum() + (a ** 2).sum() * 0.5
+    oa = T(np.array([1.0, 2.0]))
+    ob = T(np.array([3.0, 4.0]))
+    pa = torch.tensor([1.0, 2.0], dtype=torch.float64)
+    pb = torch.tensor([3.0, 4.0], dtype=torch.float64)
+    h2o = ox.autograd.functional.hessian(f2_ox, (oa, ob))
+    h2p = torch.autograd.functional.hessian(f2_pt, (pa, pb))
+    for r in range(2):
+        for c in range(2):
+            np.testing.assert_allclose(A(h2o[r][c]), h2p[r][c].numpy(), atol=1e-12)
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wn = ox.WeightNormLinear(4, 3)
+            self.register_buffer("perm", ox.ones(3), persistent=True)
+            self.register_buffer("scratch", ox.zeros(3), persistent=False)
+
+    m = Net()
+    sd = m.state_dict()
+    assert set(sd.keys()) == {"wn.weight_g", "wn.weight_v", "wn.bias", "perm"}
+    assert "scratch" in dict(m.named_buffers())
+    m.load_state_dict(sd)
+
+    s = nn.Sequential(OrderedDict([("fc1", nn.Linear(4, 3)), ("act", nn.ReLU()), ("fc2", nn.Linear(3, 2))]))
+    assert tuple(s(ox.ones(2, 4)).shape) == (2, 2)
+    assert s[-1] is s.fc2 and len(s[:2]) == 2

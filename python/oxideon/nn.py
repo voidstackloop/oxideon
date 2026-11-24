@@ -219,6 +219,7 @@ class Module:
         self._buffers = OrderedDict()
         self._forward_pre_hooks = OrderedDict()
         self._forward_hooks = OrderedDict()
+        self._non_persistent_buffers_set = set()
         self.training = True
 
     def add_module(self, name: str, module: Optional[Any]) -> None:
@@ -278,10 +279,16 @@ class Module:
             super().__setattr__(name, None)
 
     def register_buffer(self, name, tensor, persistent=True):
-        """Adds a persistent buffer to the module (e.g. running statistics)."""
+        """Adds a buffer to the module (optionally non-persistent so omitted from state_dict)."""
         if tensor is not None and not isinstance(tensor, _Tensor):
             tensor = _from_numpy(np.asarray(tensor))
         self._buffers[name] = tensor
+        if not hasattr(self, "_non_persistent_buffers_set"):
+            self._non_persistent_buffers_set = set()
+        if persistent:
+            self._non_persistent_buffers_set.discard(name)
+        else:
+            self._non_persistent_buffers_set.add(name)
         super().__setattr__(name, tensor)
 
     def forward(self, *args, **kwargs):
@@ -315,6 +322,8 @@ class Module:
                 full_prefix = f"{prefix}.{mod_name}" if prefix else mod_name
                 if isinstance(child, Module):
                     yield from child.named_parameters(prefix=full_prefix, recurse=True)
+                elif hasattr(child, "named_parameters"):
+                    yield from child.named_parameters(prefix=f"{full_prefix}.")
                 elif hasattr(child, "parameters"):
                     for i, p in enumerate(child.parameters()):
                         p_name = f"{full_prefix}.weight" if i == 0 else f"{full_prefix}.bias" if i == 1 else f"{full_prefix}.param_{i}"
@@ -330,7 +339,7 @@ class Module:
                 if isinstance(child, Module):
                     yield from child.buffers(recurse=True)
 
-    def named_buffers(self, prefix="", recurse=True):
+    def named_buffers(self, prefix="", recurse=True, remove_duplicate=True):
         """Returns an iterator over module buffers, yielding both name and buffer."""
         for name, b in self._buffers.items():
             if b is not None:
@@ -340,7 +349,18 @@ class Module:
             for mod_name, child in self.named_children():
                 full_prefix = f"{prefix}.{mod_name}" if prefix else mod_name
                 if isinstance(child, Module):
-                    yield from child.named_buffers(prefix=full_prefix, recurse=True)
+                    yield from child.named_buffers(prefix=full_prefix, recurse=True, remove_duplicate=remove_duplicate)
+
+    def _named_persistent_buffers(self, prefix=""):
+        non_p = getattr(self, "_non_persistent_buffers_set", ())
+        for name, b in self._buffers.items():
+            if b is not None and name not in non_p:
+                full_name = f"{prefix}.{name}" if prefix else name
+                yield full_name, b
+        for mod_name, child in self.named_children():
+            full_prefix = f"{prefix}.{mod_name}" if prefix else mod_name
+            if isinstance(child, Module):
+                yield from child._named_persistent_buffers(prefix=full_prefix)
 
     def children(self):
         """Returns an iterator over immediate child modules."""
@@ -476,7 +496,7 @@ class Module:
             destination = OrderedDict()
         for name, p in self.named_parameters(prefix=prefix):
             destination[name] = p.clone() if hasattr(p, "clone") else p
-        for name, b in self.named_buffers(prefix=prefix):
+        for name, b in self._named_persistent_buffers(prefix=prefix):
             destination[name] = b.clone() if hasattr(b, "clone") else b
         return destination
 
@@ -521,7 +541,7 @@ class Module:
         missing_keys = []
         unexpected_keys = list(state_dict.keys())
         current_params = dict(self.named_parameters())
-        current_buffers = dict(self.named_buffers())
+        current_buffers = dict(self._named_persistent_buffers())
 
         for key, target_param in current_params.items():
             if key in state_dict:
