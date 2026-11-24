@@ -49,6 +49,51 @@ OxideonTensor* oxideon_tensor_matmul(
 
 OxideonTensor* oxideon_tensor_relu(const OxideonTensor* x);
 
+/* Elementwise activations. */
+OxideonTensor* oxideon_tensor_gelu(const OxideonTensor* x);
+OxideonTensor* oxideon_tensor_silu(const OxideonTensor* x);
+
+/* Softmax along `axis` (negative axes count from the last dimension). */
+OxideonTensor* oxideon_tensor_softmax(const OxideonTensor* x, int64_t axis);
+
+/* Reshape to shape[ndim]; the element count must not change. */
+OxideonTensor* oxideon_tensor_reshape(
+    const OxideonTensor* x,
+    const size_t* shape,
+    size_t ndim
+);
+
+/* Swap two dimensions (negative dims count from the last dimension). */
+OxideonTensor* oxideon_tensor_transpose(
+    const OxideonTensor* x,
+    int64_t dim0,
+    int64_t dim1
+);
+
+/* Layer norm over the trailing `normalized_ndim` dims (sizes in normalized_shape).
+ * `weight` and `bias` may be NULL. */
+OxideonTensor* oxideon_tensor_layer_norm(
+    const OxideonTensor* x,
+    const size_t* normalized_shape,
+    size_t normalized_ndim,
+    const OxideonTensor* weight,
+    const OxideonTensor* bias,
+    double eps
+);
+
+/* 2D convolution: input [N, C_in, H, W], weight [C_out, C_in, kH, kW], optional bias [C_out] (may be NULL). */
+OxideonTensor* oxideon_tensor_conv2d(
+    const OxideonTensor* input,
+    const OxideonTensor* weight,
+    const OxideonTensor* bias,
+    size_t stride_h,
+    size_t stride_w,
+    size_t pad_h,
+    size_t pad_w,
+    size_t dilation_h,
+    size_t dilation_w
+);
+
 #ifdef __cplusplus
 }
 #endif
