@@ -26929,6 +26929,29 @@ pub fn register_python_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_get_rng_state, m)?)?;
     m.add_function(wrap_pyfunction!(py_set_rng_state, m)?)?;
     m.add_function(wrap_pyfunction!(py_grad, m)?)?;
+    m.add_function(wrap_pyfunction!(py_lu_factor_ex, m)?)?;
+    m.add_function(wrap_pyfunction!(py_lu_solve, m)?)?;
+    m.add_function(wrap_pyfunction!(py_inv_ex, m)?)?;
+    m.add_function(wrap_pyfunction!(py_solve_ex, m)?)?;
+    m.add_function(wrap_pyfunction!(py_cholesky_ex, m)?)?;
+    m.add_function(wrap_pyfunction!(py_ldl_factor_ex, m)?)?;
+    m.add_function(wrap_pyfunction!(py_ldl_solve, m)?)?;
+    m.add_function(wrap_pyfunction!(py_max_pool_nd, m)?)?;
+    m.add_function(wrap_pyfunction!(py_adaptive_max_pool_nd, m)?)?;
+    m.add_function(wrap_pyfunction!(py_scatter_reduce, m)?)?;
+    m.add_function(wrap_pyfunction!(py_sparse_adam_step, m)?)?;
+    m.add_function(wrap_pyfunction!(py_optim_step, m)?)?;
+    m.add_function(wrap_pyfunction!(py_gcd_lcm, m)?)?;
+    m.add_function(wrap_pyfunction!(py_frexp, m)?)?;
+    m.add_function(wrap_pyfunction!(py_ldexp, m)?)?;
+    m.add_function(wrap_pyfunction!(py_nextafter, m)?)?;
+    m.add_function(wrap_pyfunction!(py_float_class, m)?)?;
+    m.add_function(wrap_pyfunction!(py_histogramdd, m)?)?;
+    m.add_function(wrap_pyfunction!(py_orthogonal_polynomial, m)?)?;
+    m.add_function(wrap_pyfunction!(py_standard_gamma, m)?)?;
+    m.add_function(wrap_pyfunction!(py_poisson, m)?)?;
+    m.add_function(wrap_pyfunction!(py_von_mises, m)?)?;
+    m.add_function(wrap_pyfunction!(py_qr_householder, m)?)?;
     m.add_function(wrap_pyfunction!(py_flash_attention_2, m)?)?;
     m.add_function(wrap_pyfunction!(py_flash_attention_2_backward, m)?)?;
     m.add_function(wrap_pyfunction!(py_flash_attention_3, m)?)?;
@@ -27051,6 +27074,233 @@ fn versioned_capsule<'py>(py: Python<'py>, t: &oxideon_core::Tensor) -> PyResult
         return Err(pyo3::PyErr::fetch(py));
     }
     Ok(unsafe { Bound::from_owned_ptr(py, raw) })
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Rust kernels behind Python wrappers: LAPACK-style factorizations with error codes (linalg.py), N-d max pooling with
+// indices (functional.py), scatter_reduce (tensor_utils.py) and the SparseAdam step (optim/optimizer.py). The names
+// start with an underscore so `from .oxideon import *` does not put them in the public namespace.
+// ---------------------------------------------------------------------------------------------------------------------
+
+fn py3(t: (Tensor, Tensor, Tensor)) -> (PyTensor, PyTensor, PyTensor) {
+    (PyTensor { inner: t.0 }, PyTensor { inner: t.1 }, PyTensor { inner: t.2 })
+}
+
+fn py2(t: (Tensor, Tensor)) -> (PyTensor, PyTensor) {
+    (PyTensor { inner: t.0 }, PyTensor { inner: t.1 })
+}
+
+#[pyfunction]
+#[pyo3(name = "_lu_factor_ex")]
+pub fn py_lu_factor_ex(py: Python<'_>, a: &PyTensor) -> PyResult<(PyTensor, PyTensor, PyTensor)> {
+    Ok(py3(py.detach(|| a.inner.lu_factor_ex()).map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_lu_solve", signature = (lu, pivots, b, left=true))]
+pub fn py_lu_solve(py: Python<'_>, lu: &PyTensor, pivots: &PyTensor, b: &PyTensor, left: bool) -> PyResult<PyTensor> {
+    let inner = py.detach(|| Tensor::lu_solve_packed(&lu.inner, &pivots.inner, &b.inner, left)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_inv_ex")]
+pub fn py_inv_ex(py: Python<'_>, a: &PyTensor) -> PyResult<(PyTensor, PyTensor)> {
+    Ok(py2(py.detach(|| a.inner.inv_ex()).map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_solve_ex", signature = (a, b, left=true))]
+pub fn py_solve_ex(py: Python<'_>, a: &PyTensor, b: &PyTensor, left: bool) -> PyResult<(PyTensor, PyTensor)> {
+    Ok(py2(py.detach(|| Tensor::solve_ex(&a.inner, &b.inner, left)).map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_cholesky_ex", signature = (a, upper=false))]
+pub fn py_cholesky_ex(py: Python<'_>, a: &PyTensor, upper: bool) -> PyResult<(PyTensor, PyTensor)> {
+    Ok(py2(py.detach(|| a.inner.cholesky_ex(upper)).map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_ldl_factor_ex")]
+pub fn py_ldl_factor_ex(py: Python<'_>, a: &PyTensor) -> PyResult<(PyTensor, PyTensor, PyTensor)> {
+    Ok(py3(py.detach(|| a.inner.ldl_factor_ex()).map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_ldl_solve")]
+pub fn py_ldl_solve(py: Python<'_>, ld: &PyTensor, pivots: &PyTensor, b: &PyTensor) -> PyResult<PyTensor> {
+    let inner = py.detach(|| Tensor::ldl_solve(&ld.inner, &pivots.inner, &b.inner)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_max_pool_nd", signature = (x, kernel, stride, padding, dilation, ceil_mode=false))]
+pub fn py_max_pool_nd(
+    py: Python<'_>,
+    x: &PyTensor,
+    kernel: Vec<usize>,
+    stride: Vec<usize>,
+    padding: Vec<usize>,
+    dilation: Vec<usize>,
+    ceil_mode: bool,
+) -> PyResult<(PyTensor, PyTensor)> {
+    let r = py.detach(|| {
+        crate::nn::conv_ext::max_pool_nd_with_indices(&x.inner, &kernel, &stride, &padding, &dilation, ceil_mode)
+    });
+    Ok(py2(r.map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_adaptive_max_pool_nd")]
+pub fn py_adaptive_max_pool_nd(py: Python<'_>, x: &PyTensor, output_size: Vec<usize>) -> PyResult<(PyTensor, PyTensor)> {
+    let r = py.detach(|| crate::nn::conv_ext::adaptive_max_pool_nd_with_indices(&x.inner, &output_size));
+    Ok(py2(r.map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_scatter_reduce", signature = (x, dim, index, src, reduce, include_self=true))]
+pub fn py_scatter_reduce(
+    py: Python<'_>,
+    x: &PyTensor,
+    dim: isize,
+    index: &PyTensor,
+    src: &PyTensor,
+    reduce: &str,
+    include_self: bool,
+) -> PyResult<PyTensor> {
+    let inner = py
+        .detach(|| x.inner.scatter_reduce(dim, &index.inner, &src.inner, reduce, include_self))
+        .map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_sparse_adam_step", signature = (param, grad, exp_avg, exp_avg_sq, step, lr, beta1, beta2, eps, maximize=false))]
+#[allow(clippy::too_many_arguments)]
+pub fn py_sparse_adam_step(
+    py: Python<'_>,
+    param: &PyTensor,
+    grad: &PyTensor,
+    exp_avg: &PyTensor,
+    exp_avg_sq: &PyTensor,
+    step: u64,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    maximize: bool,
+) -> PyResult<(PyTensor, PyTensor, PyTensor)> {
+    let r = py.detach(|| {
+        crate::optim_extra::sparse_adam_step(
+            &param.inner, &grad.inner, &exp_avg.inner, &exp_avg_sq.inner, step, lr, beta1, beta2, eps, maximize,
+        )
+    });
+    Ok(py3(r.map_err(to_py_err)?))
+}
+
+// Optimizer step kernel (optim/optimizer.py), numeric kernels (tensor_utils.py, special.py), samplers (distributions.py)
+
+#[pyfunction]
+#[pyo3(name = "_optim_step")]
+pub fn py_optim_step(
+    py: Python<'_>,
+    kind: &str,
+    param: &PyTensor,
+    grad: &PyTensor,
+    states: Vec<PyTensor>,
+    hyper: HashMap<String, f64>,
+) -> PyResult<(PyTensor, Vec<PyTensor>)> {
+    let st: Vec<Tensor> = states.into_iter().map(|t| t.inner).collect();
+    let (p, s) = py
+        .detach(|| crate::optim_kernels::optim_step(kind, &param.inner, &grad.inner, &st, &hyper))
+        .map_err(to_py_err)?;
+    Ok((PyTensor { inner: p }, s.into_iter().map(|inner| PyTensor { inner }).collect()))
+}
+
+#[pyfunction]
+#[pyo3(name = "_gcd_lcm")]
+pub fn py_gcd_lcm(py: Python<'_>, a: &PyTensor, b: &PyTensor, lcm: bool) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::numeric_kernels::gcd_lcm(&a.inner, &b.inner, lcm)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_frexp")]
+pub fn py_frexp(py: Python<'_>, x: &PyTensor) -> PyResult<(PyTensor, PyTensor)> {
+    Ok(py2(py.detach(|| crate::numeric_kernels::frexp(&x.inner)).map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[pyo3(name = "_ldexp")]
+pub fn py_ldexp(py: Python<'_>, x: &PyTensor, e: &PyTensor) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::numeric_kernels::ldexp(&x.inner, &e.inner)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_nextafter")]
+pub fn py_nextafter(py: Python<'_>, x: &PyTensor, other: &PyTensor) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::numeric_kernels::nextafter(&x.inner, &other.inner)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_float_class")]
+pub fn py_float_class(py: Python<'_>, x: &PyTensor, what: &str) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::numeric_kernels::float_class(&x.inner, what)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_histogramdd", signature = (sample, bins, ranges=None, weight=None, density=false))]
+pub fn py_histogramdd(
+    py: Python<'_>,
+    sample: &PyTensor,
+    bins: Vec<usize>,
+    ranges: Option<Vec<(f64, f64)>>,
+    weight: Option<PyTensor>,
+    density: bool,
+) -> PyResult<(PyTensor, Vec<PyTensor>)> {
+    let w = weight.map(|t| t.inner);
+    let (h, e) = py
+        .detach(|| crate::numeric_kernels::histogramdd(&sample.inner, &bins, ranges.as_deref(), w.as_ref(), density))
+        .map_err(to_py_err)?;
+    Ok((PyTensor { inner: h }, e.into_iter().map(|inner| PyTensor { inner }).collect()))
+}
+
+#[pyfunction]
+#[pyo3(name = "_orthogonal_polynomial")]
+pub fn py_orthogonal_polynomial(py: Python<'_>, kind: &str, x: &PyTensor, n: &PyTensor) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::numeric_kernels::orthogonal_polynomial(kind, &x.inner, &n.inner)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_standard_gamma")]
+pub fn py_standard_gamma(py: Python<'_>, alpha: &PyTensor) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::distributions_ext::sample_standard_gamma(&alpha.inner)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_poisson")]
+pub fn py_poisson(py: Python<'_>, rate: &PyTensor) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::distributions_ext::sample_poisson(&rate.inner)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_von_mises")]
+pub fn py_von_mises(py: Python<'_>, loc: &PyTensor, concentration: &PyTensor) -> PyResult<PyTensor> {
+    let inner = py.detach(|| crate::distributions_ext::sample_von_mises(&loc.inner, &concentration.inner)).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+#[pyfunction]
+#[pyo3(name = "_qr", signature = (a, complete=false))]
+pub fn py_qr_householder(py: Python<'_>, a: &PyTensor, complete: bool) -> PyResult<(PyTensor, PyTensor)> {
+    Ok(py2(py.detach(|| a.inner.qr_householder(complete)).map_err(to_py_err)?))
 }
 
 #[cfg(test)]

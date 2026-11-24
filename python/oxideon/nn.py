@@ -3649,3 +3649,320 @@ __all__ = [
     "DistributedDataParallel",
     "FullyShardedDataParallel",
 ]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Max pooling modules with dilation / ceil_mode / return_indices, LPPool3d, lazy convolutions, CrossMapLRN2d, Buffer,
+# uninitialized (lazy) parameters, RNNCellBase, NLLLoss2d, Container, LinearCrossEntropyLoss
+# ---------------------------------------------------------------------------------------------------------------------
+
+class _MaxPoolNd(Module):
+    _nd = 2
+
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1, return_indices: bool = False, ceil_mode: bool = False):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+        self.ceil_mode = ceil_mode
+
+    def forward(self, x):
+        f = getattr(functional, f"max_pool{self._nd}d")
+        return f(x, self.kernel_size, self.stride, self.padding, self.dilation, self.ceil_mode, self.return_indices)
+
+    def extra_repr(self) -> str:
+        return (f"kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}, dilation={self.dilation}, "
+                f"ceil_mode={self.ceil_mode}")
+
+
+class MaxPool1d(_MaxPoolNd):
+    """1-D max pooling (kernel_size, stride, padding, dilation, return_indices, ceil_mode as in PyTorch)."""
+    _nd = 1
+
+
+class MaxPool2d(_MaxPoolNd):
+    """2-D max pooling (kernel_size, stride, padding, dilation, return_indices, ceil_mode as in PyTorch)."""
+    _nd = 2
+
+    def __init__(self, kernel_size=2, stride=None, padding=0, dilation=1, return_indices: bool = False, ceil_mode: bool = False):
+        super().__init__(kernel_size, stride, padding, dilation, return_indices, ceil_mode)
+
+
+class MaxPool3d(_MaxPoolNd):
+    """3-D max pooling (kernel_size, stride, padding, dilation, return_indices, ceil_mode as in PyTorch)."""
+    _nd = 3
+
+
+class _AdaptiveMaxPoolNd(Module):
+    _nd = 2
+
+    def __init__(self, output_size, return_indices: bool = False):
+        super().__init__()
+        self.output_size = output_size
+        self.return_indices = return_indices
+
+    def forward(self, x):
+        return getattr(functional, f"adaptive_max_pool{self._nd}d")(x, self.output_size, self.return_indices)
+
+
+class AdaptiveMaxPool1d(_AdaptiveMaxPoolNd):
+    """Adaptive 1-D max pooling to `output_size` (with `return_indices`)."""
+    _nd = 1
+
+
+class AdaptiveMaxPool2d(_AdaptiveMaxPoolNd):
+    """Adaptive 2-D max pooling to `output_size` (with `return_indices`)."""
+    _nd = 2
+
+
+class AdaptiveMaxPool3d(_AdaptiveMaxPoolNd):
+    """Adaptive 3-D max pooling to `output_size` (with `return_indices`)."""
+    _nd = 3
+
+
+class LPPool3d(Module):
+    """3-D power-average pooling: (sum over the window of x ** p) ** (1 / p)."""
+
+    def __init__(self, norm_type: float, kernel_size, stride=None, ceil_mode: bool = False):
+        super().__init__()
+        self.norm_type, self.kernel_size, self.stride, self.ceil_mode = norm_type, kernel_size, stride, ceil_mode
+
+    def forward(self, x):
+        return functional.lp_pool3d(x, self.norm_type, self.kernel_size, self.stride, self.ceil_mode)
+
+
+class _LazyConvNd(Module):
+    """A convolution whose `in_channels` is taken from the first input."""
+
+    _nd = 2
+    _transposed = False
+
+    def __init__(self, out_channels: int, kernel_size, stride=1, padding=0, output_padding=0, groups: int = 1,
+                 bias: bool = True, dilation=1, padding_mode: str = "zeros", device=None, dtype=None):
+        super().__init__()
+        if padding_mode != "zeros":
+            raise NotImplementedError("lazy convolutions support padding_mode='zeros' only")
+        nd = self._nd
+        tup = lambda v: tuple(v) if isinstance(v, (list, tuple)) else (v,) * nd
+        self.in_channels = None
+        self.out_channels = out_channels
+        self.kernel_size, self.stride, self.padding = tup(kernel_size), tup(stride), tup(padding)
+        self.output_padding, self.dilation = tup(output_padding), tup(dilation)
+        self.groups = groups
+        self._has_bias = bias
+        self.padding_mode = padding_mode
+        self.weight = None
+        self.bias = None
+
+    def has_uninitialized_params(self) -> bool:
+        return self.weight is None
+
+    def initialize_parameters(self, input) -> None:
+        c_in = int(input.shape[1]) if len(input.shape) == self._nd + 2 else int(input.shape[0])
+        if c_in % self.groups or self.out_channels % self.groups:
+            raise ValueError("in_channels and out_channels must be divisible by groups")
+        self.in_channels = c_in
+        k = int(np.prod(self.kernel_size))
+        if self._transposed:
+            shape = (c_in, self.out_channels // self.groups) + self.kernel_size
+            fan_in = (self.out_channels // self.groups) * k
+        else:
+            shape = (self.out_channels, c_in // self.groups) + self.kernel_size
+            fan_in = (c_in // self.groups) * k
+        bound = 1.0 / math.sqrt(fan_in) if fan_in > 0 else 0.0
+        self.register_parameter("weight", _from_numpy(np.random.uniform(-bound, bound, size=shape).astype(np.float32)).requires_grad_(True))
+        if self._has_bias:
+            self.register_parameter("bias", _from_numpy(np.random.uniform(-bound, bound, size=(self.out_channels,)).astype(np.float32)).requires_grad_(True))
+
+    def forward(self, x):
+        if self.weight is None:
+            self.initialize_parameters(x)
+        # the functional convolutions take an int where all dimensions agree (some accept nothing else)
+        arg = lambda t: t[0] if len(set(t)) == 1 else t
+        kw = dict(stride=arg(self.stride), padding=arg(self.padding), dilation=arg(self.dilation), groups=self.groups)
+        if self._transposed:
+            return getattr(functional, f"conv_transpose{self._nd}d")(x, self.weight, self.bias, output_padding=arg(self.output_padding), **kw)
+        return getattr(functional, f"conv{self._nd}d")(x, self.weight, self.bias, **kw)
+
+
+class LazyConv1d(_LazyConvNd):
+    """`Conv1d` whose in_channels is inferred from the first input."""
+    _nd = 1
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(out_channels, kernel_size, stride, padding, 0, groups, bias, dilation, padding_mode)
+
+
+class LazyConv3d(_LazyConvNd):
+    """`Conv3d` whose in_channels is inferred from the first input."""
+    _nd = 3
+
+    def __init__(self, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
+        super().__init__(out_channels, kernel_size, stride, padding, 0, groups, bias, dilation, padding_mode)
+
+
+class LazyConvTranspose1d(_LazyConvNd):
+    """`ConvTranspose1d` whose in_channels is inferred from the first input."""
+    _nd, _transposed = 1, True
+
+
+class LazyConvTranspose2d(_LazyConvNd):
+    """`ConvTranspose2d` whose in_channels is inferred from the first input."""
+    _nd, _transposed = 2, True
+
+
+class LazyConvTranspose3d(_LazyConvNd):
+    """`ConvTranspose3d` whose in_channels is inferred from the first input."""
+    _nd, _transposed = 3, True
+
+
+def _cross_map_window(channels: int, size: int) -> np.ndarray:
+    """W[c, j] = 1 when channel j enters channel c's sum in PyTorch's legacy CrossMapLRN2d (whose window is slightly
+    asymmetric), found by running its running-sum recurrence on indicator vectors."""
+    pre_pad = int((size - 1) / 2 + 1)
+    w = np.zeros((channels, channels), dtype=np.float32)
+    w[0, :min(pre_pad, channels)] = 1.0
+    for c in range(1, channels):
+        w[c] = w[c - 1]
+        if c < channels - pre_pad + 1:
+            w[c, c + pre_pad - 1] += 1.0
+        if c > pre_pad:
+            w[c, c - pre_pad] -= 1.0
+    return w
+
+
+class CrossMapLRN2d(Module):
+    """PyTorch's legacy cross-channel local response normalization for 4-D input:
+    y = x * (k + alpha / size * sum of x^2 over neighbouring channels) ** -beta."""
+
+    def __init__(self, size: int, alpha: float = 1e-4, beta: float = 0.75, k: float = 1.0):
+        super().__init__()
+        self.size, self.alpha, self.beta, self.k = size, alpha, beta, k
+
+    def forward(self, x):
+        if len(x.shape) != 4:
+            raise ValueError(f"CrossMapLRN2d: Expected input to be 4D, got {len(x.shape)}D instead.")
+        w = _from_numpy(np.ascontiguousarray(_cross_map_window(int(x.shape[1]), self.size).T))
+        sq = (x * x).permute([0, 2, 3, 1])
+        summed = sq.matmul(w).permute([0, 3, 1, 2])
+        return x * (summed * (self.alpha / self.size) + self.k).pow(-self.beta)
+
+
+class Buffer:
+    """Marks a tensor as a buffer: `self.running = nn.Buffer(t)` inside a Module registers it with `register_buffer`
+    (`persistent=False` keeps it out of the state dict)."""
+
+    def __init__(self, data: Any = None, *, persistent: bool = True):
+        self.data = data if isinstance(data, _Tensor) or data is None else _from_numpy(np.asarray(data))
+        self.persistent = persistent
+
+
+_module_setattr = Module.__setattr__
+
+
+def _setattr_with_buffers(self, name, value):
+    if isinstance(value, Buffer) and hasattr(self, "_modules"):
+        self.register_buffer(name, value.data, persistent=value.persistent)
+        return
+    _module_setattr(self, name, value)
+
+
+Module.__setattr__ = _setattr_with_buffers
+
+
+class UninitializedParameter:
+    """A parameter whose shape is not known yet (for lazy modules). `materialize(shape)` returns the real parameter,
+    zero-filled and requiring grad, which the owner assigns in place of this placeholder."""
+
+    cls_to_become = "Parameter"
+
+    def __init__(self, requires_grad: bool = True, device=None, dtype=None):
+        self.requires_grad = requires_grad
+        self.dtype = dtype
+
+    def materialize(self, shape, device=None, dtype=None) -> _Tensor:
+        t = _from_numpy(np.zeros(tuple(shape), dtype=np.float32))
+        return t.requires_grad_(True) if self.requires_grad else t
+
+
+class UninitializedBuffer(UninitializedParameter):
+    """A buffer whose shape is not known yet; `materialize(shape)` returns the zero-filled tensor."""
+
+    cls_to_become = "Tensor"
+
+    def __init__(self, requires_grad: bool = False, device=None, dtype=None, persistent: bool = True):
+        super().__init__(requires_grad, device, dtype)
+        self.persistent = persistent
+
+
+def is_lazy(param: Any) -> bool:
+    """Whether `param` is an uninitialized (lazy) parameter or buffer."""
+    return isinstance(param, UninitializedParameter)
+
+
+class RNNCellBase(Module):
+    """Base class of RNN cells: `weight_ih` (num_chunks * hidden, input), `weight_hh` (num_chunks * hidden, hidden) and
+    optional biases, all initialized uniformly in +-1/sqrt(hidden_size). Subclasses implement `forward`."""
+
+    def __init__(self, input_size: int, hidden_size: int, bias: bool, num_chunks: int):
+        super().__init__()
+        self.input_size, self.hidden_size, self.bias = input_size, hidden_size, bias
+        bound = 1.0 / math.sqrt(hidden_size) if hidden_size > 0 else 0.0
+        mk = lambda *s: _from_numpy(np.random.uniform(-bound, bound, size=s).astype(np.float32)).requires_grad_(True)
+        self.weight_ih = mk(num_chunks * hidden_size, input_size)
+        self.weight_hh = mk(num_chunks * hidden_size, hidden_size)
+        if bias:
+            self.bias_ih = mk(num_chunks * hidden_size)
+            self.bias_hh = mk(num_chunks * hidden_size)
+        else:
+            self.bias_ih = self.bias_hh = None
+
+    def extra_repr(self) -> str:
+        return f"{self.input_size}, {self.hidden_size}" + ("" if self.bias else ", bias=False")
+
+
+class NLLLoss2d(NLLLoss):
+    """Deprecated alias of `NLLLoss` (kept for old code)."""
+
+
+class Container(Module):
+    """Deprecated: a Module that adds the keyword arguments as child modules."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__()
+        for name, module in kwargs.items():
+            self.add_module(name, module)
+
+
+class LinearCrossEntropyLoss(Module):
+    """A classification head and its loss in one: holds the (num_classes, in_features) weight (and an optional bias)
+    and returns cross_entropy(input @ weight.T + bias, target)."""
+
+    def __init__(self, in_features: int, num_classes: int, *, out_features=(), bias: bool = False, device=None, dtype=None,
+                 reduction: str = "mean", weight: Optional[_Tensor] = None, ignore_index: Optional[int] = None,
+                 label_smoothing: float = 0.0, options: Any = None):
+        super().__init__()
+        if tuple(out_features):
+            raise NotImplementedError("LinearCrossEntropyLoss: out_features is not supported")
+        bound = 1.0 / math.sqrt(in_features)
+        self.linear_weight = _from_numpy(np.random.uniform(-bound, bound, size=(num_classes, in_features)).astype(np.float32)).requires_grad_(True)
+        self.linear_bias = _from_numpy(np.random.uniform(-bound, bound, size=(num_classes,)).astype(np.float32)).requires_grad_(True) if bias else None
+        self.reduction, self.class_weight = reduction, weight
+        self.ignore_index = -100 if ignore_index is None else ignore_index
+        self.label_smoothing = label_smoothing
+
+    def forward(self, input, target):
+        return functional.linear_cross_entropy(input, self.linear_weight, target, linear_bias=self.linear_bias,
+                                               weight=self.class_weight, reduction=self.reduction,
+                                               ignore_index=self.ignore_index, label_smoothing=self.label_smoothing)
+
+
+__all__ += [
+    "MaxPool1d", "MaxPool2d", "MaxPool3d", "AdaptiveMaxPool1d", "AdaptiveMaxPool2d", "AdaptiveMaxPool3d", "LPPool3d",
+    "LazyConv1d", "LazyConv3d", "LazyConvTranspose1d", "LazyConvTranspose2d", "LazyConvTranspose3d", "CrossMapLRN2d",
+    "Buffer", "UninitializedParameter", "UninitializedBuffer", "is_lazy", "RNNCellBase", "NLLLoss2d", "Container",
+    "LinearCrossEntropyLoss",
+]
+__all__ = list(dict.fromkeys(__all__))

@@ -8,6 +8,7 @@ modified Bessel functions, normal distribution CDFs, and information-theoretic o
 import math
 from typing import Any, Optional, Sequence, Union
 import numpy as np
+from ._contig import contig as _contig
 
 from .oxideon import Tensor as _Tensor, from_numpy as _from_numpy
 
@@ -20,7 +21,7 @@ def _to_np(x: Any) -> np.ndarray:
 
 def _wrap(arr: np.ndarray, orig_t: Optional[_Tensor] = None) -> _Tensor:
     dtype = orig_t.to_numpy().dtype if orig_t is not None else np.float32
-    return _from_numpy(np.ascontiguousarray(arr, dtype=dtype))
+    return _from_numpy(_contig(arr, dtype=dtype))
 
 
 def _differentiable_eval(input: _Tensor, forward_fn, deriv_fn) -> _Tensor:
@@ -30,8 +31,8 @@ def _differentiable_eval(input: _Tensor, forward_fn, deriv_fn) -> _Tensor:
         x0 = x0.astype(dtype)
         y0 = forward_fn(x0).astype(dtype)
         deriv = deriv_fn(x0).astype(dtype)
-        c0 = _from_numpy(np.ascontiguousarray(y0 - deriv * x0))
-        c1 = _from_numpy(np.ascontiguousarray(deriv))
+        c0 = _from_numpy(_contig(y0 - deriv * x0))
+        c1 = _from_numpy(_contig(deriv))
         return c0 + c1 * input
     return _wrap(forward_fn(_to_np(input)), input)
 
@@ -554,45 +555,6 @@ def lambert_w(input: _Tensor) -> _Tensor:
     return _wrap(res, input)
 
 
-def hermite_polynomial_h(input: _Tensor, n: int) -> _Tensor:
-    """Evaluates the Physicist's Hermite polynomial H_n(x)."""
-    if n >= 0 and hasattr(input, "hermite_polynomial_h"):
-        return input.hermite_polynomial_h(n)
-    x = _to_np(input).astype(np.float64)
-    if n == 0:
-        return _wrap(np.ones_like(x), input)
-    if n == 1:
-        return _wrap(2.0 * x, input)
-
-    p0 = np.ones_like(x)
-    p1 = 2.0 * x
-    for k in range(1, n):
-        p2 = 2.0 * x * p1 - 2.0 * k * p0
-        p0 = p1
-        p1 = p2
-    return _wrap(p1, input)
-
-
-def legendre_polynomial_p(input: _Tensor, n: int) -> _Tensor:
-    """Evaluates the Legendre polynomial P_n(x)."""
-    if n >= 0 and hasattr(input, "legendre_polynomial_p"):
-        return input.legendre_polynomial_p(n)
-    """Evaluates the Legendre polynomial P_n(x)."""
-    x = _to_np(input).astype(np.float64)
-    if n == 0:
-        return _wrap(np.ones_like(x), input)
-    if n == 1:
-        return _wrap(x, input)
-
-    p0 = np.ones_like(x)
-    p1 = x.copy()
-    for k in range(1, n):
-        p2 = ((2.0 * k + 1.0) * x * p1 - k * p0) / (k + 1.0)
-        p0 = p1
-        p1 = p2
-    return _wrap(p1, input)
-
-
 def xlogy(input: Any, other: Any) -> Any:
     """Computes input * log(other), returning 0 when input == 0."""
     if isinstance(input, _Tensor):
@@ -706,87 +668,6 @@ def gammaincc(input: Any, other: Union[_Tensor, float]) -> _Tensor:
     if hasattr(input, "igammac") and isinstance(other, _Tensor):
         return input.igammac(other)
     return _wrap(1.0 - _to_np(gammainc(input, other)), input if isinstance(input, _Tensor) else (other if isinstance(other, _Tensor) else None))
-
-
-def chebyshev_polynomial_t(input: _Tensor, n: int) -> _Tensor:
-    """Evaluates the Chebyshev polynomial of the first kind T_n(x)."""
-    if n >= 0 and hasattr(input, "chebyshev_polynomial_t"):
-        return input.chebyshev_polynomial_t(n)
-    x = _to_np(input).astype(np.float64)
-    if n == 0:
-        return _wrap(np.ones_like(x), input)
-    if n == 1:
-        return _wrap(x, input)
-    t0 = np.ones_like(x)
-    t1 = x.copy()
-    for _ in range(1, n):
-        t2 = 2.0 * x * t1 - t0
-        t0, t1 = t1, t2
-    return _wrap(t1, input)
-
-
-def chebyshev_polynomial_u(input: _Tensor, n: int) -> _Tensor:
-    """Evaluates the Chebyshev polynomial of the second kind U_n(x)."""
-    if n >= 0 and hasattr(input, "chebyshev_polynomial_u"):
-        return input.chebyshev_polynomial_u(n)
-    x = _to_np(input).astype(np.float64)
-    if n == 0:
-        return _wrap(np.ones_like(x), input)
-    if n == 1:
-        return _wrap(2.0 * x, input)
-    u0 = np.ones_like(x)
-    u1 = 2.0 * x
-    for _ in range(1, n):
-        u2 = 2.0 * x * u1 - u0
-        u0, u1 = u1, u2
-    return _wrap(u1, input)
-
-
-def chebyshev_polynomial_v(input: _Tensor, n: int) -> _Tensor:
-    """Evaluates the Chebyshev polynomial of the third kind V_n(x)."""
-    x = _to_np(input).astype(np.float64)
-    if n == 0:
-        return _wrap(np.ones_like(x), input)
-    if n == 1:
-        return _wrap(2.0 * x - 1.0, input)
-    v0 = np.ones_like(x)
-    v1 = 2.0 * x - 1.0
-    for _ in range(1, n):
-        v2 = 2.0 * x * v1 - v0
-        v0, v1 = v1, v2
-    return _wrap(v1, input)
-
-
-def chebyshev_polynomial_w(input: _Tensor, n: int) -> _Tensor:
-    """Evaluates the Chebyshev polynomial of the fourth kind W_n(x)."""
-    x = _to_np(input).astype(np.float64)
-    if n == 0:
-        return _wrap(np.ones_like(x), input)
-    if n == 1:
-        return _wrap(2.0 * x + 1.0, input)
-    w0 = np.ones_like(x)
-    w1 = 2.0 * x + 1.0
-    for _ in range(1, n):
-        w2 = 2.0 * x * w1 - w0
-        w0, w1 = w1, w2
-    return _wrap(w1, input)
-
-
-def laguerre_polynomial_l(input: _Tensor, n: int) -> _Tensor:
-    """Evaluates the Laguerre polynomial L_n(x)."""
-    if n >= 0 and hasattr(input, "laguerre_polynomial_l"):
-        return input.laguerre_polynomial_l(n)
-    x = _to_np(input).astype(np.float64)
-    if n == 0:
-        return _wrap(np.ones_like(x), input)
-    if n == 1:
-        return _wrap(1.0 - x, input)
-    l0 = np.ones_like(x)
-    l1 = 1.0 - x
-    for k in range(1, n):
-        l2 = ((2.0 * k + 1.0 - x) * l1 - k * l0) / (k + 1.0)
-        l0, l1 = l0, l2
-    return _wrap(l1, input)
 
 
 def bessel_y0(input: _Tensor) -> _Tensor:
@@ -1127,4 +1008,92 @@ __all__ = [
     "entr",
     "rel_entr",
     "round",
+]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Orthogonal polynomials (degree n an int or a tensor, broadcast against x), all evaluated by one Rust kernel
+# (numeric_kernels.rs, three-term recurrences); shifted Chebyshev polynomials; modified Bessel I0 / I1 (PyTorch names)
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _poly(kind: str, input: Any, n: Any) -> _Tensor:
+    from .oxideon import _orthogonal_polynomial
+    x = input if isinstance(input, _Tensor) else _from_numpy(_contig(np.asarray(input, dtype=np.float32)))
+    nt = n if isinstance(n, _Tensor) else _from_numpy(_contig(np.asarray(n, dtype=np.float64)))
+    shape = tuple(int(v) for v in np.broadcast_shapes(tuple(x.shape), tuple(nt.shape)))
+    if tuple(x.shape) != shape:
+        x = x.expand(list(shape)).contiguous()
+    if tuple(nt.shape) != shape:
+        nt = nt.expand(list(shape)).contiguous()
+    return _orthogonal_polynomial(kind, x, nt.double() if nt.dtype != "f64" else nt)
+
+
+def chebyshev_polynomial_t(input: Any, n: Any) -> _Tensor:
+    """The Chebyshev polynomial of the first kind T_n(x)."""
+    return _poly("chebyshev_t", input, n)
+
+
+def chebyshev_polynomial_u(input: Any, n: Any) -> _Tensor:
+    """The Chebyshev polynomial of the second kind U_n(x)."""
+    return _poly("chebyshev_u", input, n)
+
+
+def chebyshev_polynomial_v(input: Any, n: Any) -> _Tensor:
+    """The Chebyshev polynomial of the third kind V_n(x)."""
+    return _poly("chebyshev_v", input, n)
+
+
+def chebyshev_polynomial_w(input: Any, n: Any) -> _Tensor:
+    """The Chebyshev polynomial of the fourth kind W_n(x)."""
+    return _poly("chebyshev_w", input, n)
+
+
+def hermite_polynomial_h(input: Any, n: Any) -> _Tensor:
+    """The physicists' Hermite polynomial H_n(x)."""
+    return _poly("hermite_h", input, n)
+
+
+def hermite_polynomial_he(input: Any, n: Any) -> _Tensor:
+    """The probabilists' Hermite polynomial He_n(x) (He_0 = 1, He_1 = x, He_{k+1} = x He_k - k He_{k-1}); 0 for n < 0."""
+    return _poly("hermite_he", input, n)
+
+
+def laguerre_polynomial_l(input: Any, n: Any) -> _Tensor:
+    """The Laguerre polynomial L_n(x)."""
+    return _poly("laguerre_l", input, n)
+
+
+def legendre_polynomial_p(input: Any, n: Any) -> _Tensor:
+    """The Legendre polynomial P_n(x)."""
+    return _poly("legendre_p", input, n)
+
+
+def _shifted(kind: str):
+    def poly(input: Any, n: Any) -> _Tensor:
+        x = input if isinstance(input, _Tensor) else _from_numpy(_contig(np.asarray(input, dtype=np.float32)))
+        return _poly(kind, x * 2.0 - 1.0, n)
+    poly.__name__ = "shifted_" + kind.replace("chebyshev_", "chebyshev_polynomial_")
+    poly.__doc__ = f"The shifted Chebyshev polynomial on [0, 1]: `{kind}(2 x - 1, n)`."
+    return poly
+
+
+shifted_chebyshev_polynomial_t = _shifted("chebyshev_t")
+shifted_chebyshev_polynomial_u = _shifted("chebyshev_u")
+shifted_chebyshev_polynomial_v = _shifted("chebyshev_v")
+shifted_chebyshev_polynomial_w = _shifted("chebyshev_w")
+
+
+def modified_bessel_i0(input: Any) -> _Tensor:
+    """The modified Bessel function of the first kind of order 0 (the same function as `i0`)."""
+    return i0(input)
+
+
+def modified_bessel_i1(input: Any) -> _Tensor:
+    """The modified Bessel function of the first kind of order 1 (the same function as `i1`)."""
+    return i1(input)
+
+
+__all__ += [
+    "hermite_polynomial_he", "shifted_chebyshev_polynomial_t", "shifted_chebyshev_polynomial_u",
+    "shifted_chebyshev_polynomial_v", "shifted_chebyshev_polynomial_w", "modified_bessel_i0", "modified_bessel_i1",
 ]

@@ -143,6 +143,172 @@ impl Module for Fold {
     }
 }
 
+/// Output length of one pooled dimension (`torch.nn.functional.max_pool*d`), with `ceil_mode`'s rule that the last
+/// window must start inside the input or its left padding.
+fn pooled_len(len: usize, kernel: usize, stride: usize, pad: usize, dil: usize, ceil_mode: bool) -> Result<usize> {
+    let span = (len + 2 * pad) as isize - (dil * (kernel - 1)) as isize - 1;
+    if span < 0 {
+        return Err(Error::Msg(format!(
+            "max_pool: the window ({kernel} x dilation {dil}) does not fit the padded input ({len} + 2 x {pad})"
+        )));
+    }
+    let span = span as usize;
+    let mut out = if ceil_mode { span.div_ceil(stride) } else { span / stride } + 1;
+    if ceil_mode && (out - 1) * stride >= len + pad {
+        out -= 1;
+    }
+    Ok(out)
+}
+
+/// Finds, for every output position of every plane, the flat spatial index of its window's maximum (the first
+/// maximum; a NaN is taken over any number, as the PyTorch CPU kernel does), then gathers the values from `x`, so they
+/// stay differentiable. `windows[o]` lists the in-bounds flat input indices of output position `o`.
+fn pool_by_windows(x: &Tensor, nd: usize, out_shape: &[usize], windows: Vec<Vec<usize>>) -> Result<(Tensor, Tensor)> {
+    let shape = x.shape().to_vec();
+    let lead = &shape[..shape.len() - nd];
+    let planes: usize = lead.iter().product();
+    let plane_len: usize = shape[shape.len() - nd..].iter().product();
+    let n_out: usize = out_shape.iter().product();
+    if windows.iter().any(Vec::is_empty) {
+        return Err(Error::Msg("max_pool: a pooling window lies entirely in the padding".into()));
+    }
+    let data = x.to_vec::<f64>()?;
+    let mut idx = vec![0i64; planes * n_out];
+    let body = |plane: usize, out: &mut [i64]| {
+        let base = plane * plane_len;
+        for (o, slot) in out.iter_mut().enumerate() {
+            let mut best = f64::NEG_INFINITY;
+            let mut at = windows[o][0];
+            for &flat in &windows[o] {
+                let v = data[base + flat];
+                if v > best || v.is_nan() {
+                    best = v;
+                    at = flat;
+                }
+            }
+            *slot = at as i64;
+        }
+    };
+    if n_out > 0 {
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            idx.par_chunks_mut(n_out).enumerate().for_each(|(p, out)| body(p, out));
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            for (p, out) in idx.chunks_mut(n_out).enumerate() {
+                body(p, out);
+            }
+        }
+    }
+    let mut full = lead.to_vec();
+    full.extend_from_slice(out_shape);
+    let indices = Tensor::from_slice_on(&idx, &[planes, n_out], &x.device())?;
+    let values = x.reshape(&[planes, plane_len])?.gather(1, &indices)?.reshape(&full)?;
+    Ok((values, indices.reshape(&full)?))
+}
+
+/// Splits a flat output position into per-dimension coordinates (row-major).
+fn unravel(mut o: usize, dims: &[usize]) -> Vec<usize> {
+    let mut coord = vec![0usize; dims.len()];
+    for d in (0..dims.len()).rev() {
+        coord[d] = o % dims[d];
+        o /= dims[d];
+    }
+    coord
+}
+
+/// Max pooling over the last `kernel.len()` (1 to 3) dimensions with stride, padding, dilation and `ceil_mode`,
+/// returning the values (differentiable) and the indices of the maxima in the flattened spatial input, like
+/// `torch.nn.functional.max_pool{1,2,3}d(..., return_indices=True)`.
+pub fn max_pool_nd_with_indices(
+    x: &Tensor,
+    kernel: &[usize],
+    stride: &[usize],
+    padding: &[usize],
+    dilation: &[usize],
+    ceil_mode: bool,
+) -> Result<(Tensor, Tensor)> {
+    let nd = kernel.len();
+    if !(1..=3).contains(&nd) || stride.len() != nd || padding.len() != nd || dilation.len() != nd {
+        return Err(Error::Msg(
+            "max_pool: kernel, stride, padding and dilation need one entry per spatial dimension (1 to 3)".into(),
+        ));
+    }
+    if x.ndim() < nd + 1 {
+        return Err(Error::Msg(format!("max_pool{nd}d: expected at least {} dimensions, got {:?}", nd + 1, x.shape())));
+    }
+    if kernel.iter().chain(stride).chain(dilation).any(|&v| v == 0) {
+        return Err(Error::Msg("max_pool: kernel_size, stride and dilation must be positive".into()));
+    }
+    if padding.iter().zip(kernel).any(|(&p, &k)| p > k / 2) {
+        return Err(Error::Msg(format!(
+            "max_pool{nd}d: padding should be at most half of the kernel size, got padding {padding:?} and kernel {kernel:?}"
+        )));
+    }
+    let spatial: Vec<usize> = x.shape()[x.ndim() - nd..].to_vec();
+    let out: Vec<usize> = (0..nd)
+        .map(|d| pooled_len(spatial[d], kernel[d], stride[d], padding[d], dilation[d], ceil_mode))
+        .collect::<Result<_>>()?;
+    let slots: usize = kernel.iter().product();
+    let n_out: usize = out.iter().product();
+    let windows = (0..n_out)
+        .map(|o| {
+            let coord = unravel(o, &out);
+            (0..slots)
+                .filter_map(|slot| {
+                    let offs = unravel(slot, kernel);
+                    let mut flat = 0usize;
+                    for d in 0..nd {
+                        let p = (coord[d] * stride[d] + offs[d] * dilation[d]) as isize - padding[d] as isize;
+                        if p < 0 || p >= spatial[d] as isize {
+                            return None;
+                        }
+                        flat = flat * spatial[d] + p as usize;
+                    }
+                    Some(flat)
+                })
+                .collect()
+        })
+        .collect();
+    pool_by_windows(x, nd, &out, windows)
+}
+
+/// Adaptive max pooling over the last `output_size.len()` (1 to 3) dimensions with the indices of the maxima, like
+/// `torch.nn.functional.adaptive_max_pool{1,2,3}d(..., return_indices=True)`: output position `o` of a dimension of
+/// length `L` covers `[floor(o L / out), ceil((o + 1) L / out))`.
+pub fn adaptive_max_pool_nd_with_indices(x: &Tensor, output_size: &[usize]) -> Result<(Tensor, Tensor)> {
+    let nd = output_size.len();
+    if !(1..=3).contains(&nd) || x.ndim() < nd + 1 {
+        return Err(Error::Msg(
+            "adaptive_max_pool: output_size needs 1 to 3 entries and the input one more dimension".into(),
+        ));
+    }
+    if output_size.contains(&0) {
+        return Err(Error::Msg("adaptive_max_pool: output_size must be positive".into()));
+    }
+    let spatial: Vec<usize> = x.shape()[x.ndim() - nd..].to_vec();
+    let n_out: usize = output_size.iter().product();
+    let windows = (0..n_out)
+        .map(|o| {
+            let coord = unravel(o, output_size);
+            let mut list = vec![0usize];
+            for d in 0..nd {
+                let (s, e) = (
+                    (coord[d] * spatial[d]) / output_size[d],
+                    ((coord[d] + 1) * spatial[d]).div_ceil(output_size[d]),
+                );
+                let len = spatial[d];
+                list = list.iter().flat_map(|&base| (s..e).map(move |p| base * len + p)).collect();
+            }
+            list
+        })
+        .collect();
+    pool_by_windows(x, nd, output_size, windows)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +377,33 @@ mod tests {
         assert_eq!(cols.shape(), [1, 4, 4]);
         let fold = Fold { output_size: (4, 4), kernel: (2, 2), stride: (2, 2), padding: (0, 0), dilation: (1, 1) };
         assert_eq!(vals(&fold.forward(&cols).unwrap()), vals(&img));
+    }
+}
+
+#[cfg(test)]
+mod max_pool_nd_tests {
+    use super::*;
+
+    #[test]
+    fn agrees_with_the_2d_kernel() {
+        let data: Vec<f32> = (0..2 * 3 * 7 * 6).map(|i| ((i * 37 % 101) as f32) * 0.1 - 5.0).collect();
+        let x = Tensor::from_slice(&data, &[2, 3, 7, 6]).unwrap();
+        let (v, i) = max_pool_nd_with_indices(&x, &[3, 2], &[2, 2], &[1, 0], &[1, 1], false).unwrap();
+        let (v2, i2) = max_pool2d_with_indices(&x, (3, 2), (2, 2), (1, 0)).unwrap();
+        assert_eq!(i.to_vec::<i64>().unwrap(), i2.to_vec::<i64>().unwrap());
+        assert_eq!(v.to_vec::<f32>().unwrap(), v2.to_vec::<f32>().unwrap());
+    }
+
+    #[test]
+    fn ceil_mode_dilation_and_adaptive() {
+        let x = Tensor::from_slice(&(0..11).map(|v| v as f32).collect::<Vec<_>>(), &[1, 1, 11]).unwrap();
+        // dilation 2, padding 1, stride 2, ceil_mode: windows {-1,1,3} {1,3,5} {3,5,7} {5,7,9} {7,9,11}; 11 is past the end
+        let (v, i) = max_pool_nd_with_indices(&x, &[3], &[2], &[1], &[2], true).unwrap();
+        assert_eq!(i.to_vec::<i64>().unwrap(), vec![3, 5, 7, 9, 9]);
+        assert_eq!(v.to_vec::<f32>().unwrap(), vec![3.0, 5.0, 7.0, 9.0, 9.0]);
+        let (a, ai) = adaptive_max_pool_nd_with_indices(&x, &[4]).unwrap();
+        assert_eq!(ai.to_vec::<i64>().unwrap(), vec![2, 5, 8, 10]);
+        assert_eq!(a.shape(), &[1, 1, 4]);
+        assert!(max_pool_nd_with_indices(&x, &[3], &[1], &[2], &[1], false).is_err()); // padding > kernel / 2
     }
 }

@@ -34,6 +34,7 @@ from .optimizer import (
     Lamb,
     Adafactor,
     Rprop,
+    SparseAdam,
 )
 from . import swa_utils
 from . import lr_scheduler
@@ -63,6 +64,7 @@ Lookahead = LookaheadOptimizer
 
 __all__ = [
     # Base
+    "SparseAdam",
     "Optimizer",
     # First-Order & Adaptive Optimizers
     "SGD",

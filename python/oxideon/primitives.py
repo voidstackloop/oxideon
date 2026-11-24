@@ -15,6 +15,7 @@ import operator
 import sys
 import time
 import numpy as np
+from ._contig import contig as _contig
 
 from .oxideon import (
     Tensor as _Tensor,
@@ -22,6 +23,7 @@ from .oxideon import (
     manual_seed as _manual_seed,
     searchsorted as _native_searchsorted,
     where as _native_where,
+    einsum as _native_einsum,
     tril as _native_tril,
     triu as _native_triu,
     kron as _native_kron,
@@ -33,6 +35,7 @@ from .oxideon import (
     logcumsumexp as _native_logcumsumexp,
     tensordot as _native_tensordot,
     as_strided as _native_as_strided,
+    grad as _native_grad,
 )
 
 # This module defines tensor ops named any/all/sum/abs/round, which shadow the
@@ -907,23 +910,50 @@ class _AutogradModule:
         if grad_outputs is not None:
             gt_list = [grad_outputs] if isinstance(grad_outputs, _Tensor) else list(grad_outputs)
 
-        last = len(out_list) - 1
-        for idx, out in enumerate(out_list):
+        for out in out_list:
             if not out.requires_grad:
                 raise RuntimeError("element 0 of tensors does not require grad and does not have a grad_fn")
-            grad_out = gt_list[idx] if gt_list is not None and idx < len(gt_list) else None
-            # The loop accumulates one output at a time, so the graph must be
-            # retained across iterations; the caller's flag applies to the end.
-            rg = retain_graph if (retain_graph or idx == last) else True
-            out.backward(gradient=grad_out, retain_graph=rg, create_graph=create_graph)
 
-        grads = []
-        for inp in inp_list:
-            g = inp.grad
+        if not any(id(out) in _CUSTOM_BACKWARD_MAP for out in out_list):
+            # Like torch.autograd.grad: the gradients are returned, never accumulated into (or read from) `.grad`,
+            # and `inputs` may be intermediate tensors, not only leaves.
+            targets = []
+            for idx, out in enumerate(out_list):
+                go = gt_list[idx] if gt_list is not None and idx < len(gt_list) else None
+                if go is None:
+                    if out.numel() != 1:
+                        raise RuntimeError("grad can be implicitly created only for scalar outputs")
+                    targets.append(out.sum())
+                else:
+                    if not isinstance(go, _Tensor):
+                        go = tensor(go, dtype=out.dtype, device=out.device)
+                    targets.append((out * (go if create_graph else go.detach())).sum())
+            total = targets[0]
+            for t in targets[1:]:
+                total = total + t
+            grads = list(_native_grad([total], inp_list, create_graph))
+        else:
+            # A custom `Function` output: its backward only runs through `Tensor.backward`. Run it on clean
+            # `.grad` slots and put the callers' gradients back afterwards, so nothing accumulates.
+            saved = [inp.grad for inp in inp_list]
+            for inp in inp_list:
+                inp.set_grad(None)
+            try:
+                last = len(out_list) - 1
+                for idx, out in enumerate(out_list):
+                    grad_out = gt_list[idx] if gt_list is not None and idx < len(gt_list) else None
+                    # The loop accumulates one output at a time, so the graph must be
+                    # retained across iterations; the caller's flag applies to the end.
+                    rg = retain_graph if (retain_graph or idx == last) else True
+                    out.backward(gradient=grad_out, retain_graph=rg, create_graph=create_graph)
+                grads = [inp.grad for inp in inp_list]
+            finally:
+                for inp, g in zip(inp_list, saved):
+                    inp.set_grad(g)
+
+        for g in grads:
             if g is None and not allow_unused:
                 raise RuntimeError("One of the differentiated Tensors appears to not have been used in the graph.")
-            grads.append(g)
-
         return tuple(grads)
 
     @staticmethod
@@ -979,14 +1009,14 @@ class _AutogradModule:
 
                 # f(x + eps)
                 flat[idx] = orig_val + eps
-                inp.assign(_from_numpy(np.ascontiguousarray(flat.reshape(arr.shape), dtype=arr.dtype)))
+                inp.assign(_from_numpy(_contig(flat.reshape(arr.shape), dtype=arr.dtype)))
                 o_pos = func(*input_list)
                 o_pos_t = o_pos[0] if isinstance(o_pos, (tuple, list)) else o_pos
                 v_pos = float(o_pos_t.sum().item()) if o_pos_t.numel() > 1 else float(o_pos_t.item())
 
                 # f(x - eps)
                 flat[idx] = orig_val - eps
-                inp.assign(_from_numpy(np.ascontiguousarray(flat.reshape(arr.shape), dtype=arr.dtype)))
+                inp.assign(_from_numpy(_contig(flat.reshape(arr.shape), dtype=arr.dtype)))
                 o_neg = func(*input_list)
                 o_neg_t = o_neg[0] if isinstance(o_neg, (tuple, list)) else o_neg
                 v_neg = float(o_neg_t.sum().item()) if o_neg_t.numel() > 1 else float(o_neg_t.item())
@@ -1107,7 +1137,7 @@ def tensor(
         if target_dt in dt_map:
             np_arr = np_arr.astype(dt_map[target_dt])
 
-    t = _from_numpy(np.ascontiguousarray(np_arr))
+    t = _from_numpy(_contig(np_arr))
     if device is not None:
         t = t.to_device(_normalize_device(device))
     if requires_grad:
@@ -1164,7 +1194,7 @@ def rand(*size: Any, dtype: Optional[Any] = None, device: Optional[Any] = None, 
     dt = _normalize_dtype(dtype)
     dev = _normalize_device(device)
     arr = np.random.uniform(0.0, 1.0, size=sh).astype(np.float32)
-    t = _from_numpy(np.ascontiguousarray(arr))
+    t = _from_numpy(_contig(arr))
     if dt != "f32":
         t = t.to_dtype(dt)
     if dev != "cpu":
@@ -1352,9 +1382,9 @@ def nonzero(input: _Tensor, as_tuple: bool = False) -> Union[_Tensor, Tuple[_Ten
     arr = _to_np(input)
     indices = np.nonzero(arr)
     if as_tuple:
-        return tuple(_from_numpy(np.ascontiguousarray(idx, dtype=np.int64)).to(input.device) for idx in indices)
+        return tuple(_from_numpy(_contig(idx, dtype=np.int64)).to(input.device) for idx in indices)
     stacked = np.column_stack(indices) if len(indices) > 0 and indices[0].size > 0 else np.zeros((0, input.ndim), dtype=np.int64)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.int64)).to(input.device)
+    return _from_numpy(_contig(stacked, dtype=np.int64)).to(input.device)
 
 
 def argwhere(input: _Tensor) -> _Tensor:
@@ -1662,7 +1692,7 @@ def squeeze(input: _Tensor, dim: Optional[int] = None) -> _Tensor:
     if dim is not None:
         return input.squeeze(dim)
     arr = _to_np(input)
-    return _from_numpy(np.ascontiguousarray(np.squeeze(arr)))
+    return _from_numpy(_contig(np.squeeze(arr)))
 
 
 def unsqueeze(input: _Tensor, dim: int) -> _Tensor:
@@ -1701,7 +1731,7 @@ def cat(tensors: Sequence[_Tensor], dim: int = 0) -> _Tensor:
         return _Tensor.cat(list(tensors), dim)
     arrays = [_to_np(t) for t in tensors]
     res = np.concatenate(arrays, axis=dim)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 concat = cat
@@ -1733,7 +1763,7 @@ def stack(tensors: Sequence[_Tensor], dim: int = 0) -> _Tensor:
         return _Tensor.stack(list(tensors), dim)
     arrays = [_to_np(t) for t in tensors]
     res = np.stack(arrays, axis=dim)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def chunk(input: _Tensor, chunks: int, dim: int = 0) -> Tuple[_Tensor, ...]:
@@ -1769,7 +1799,7 @@ def index_select(input: _Tensor, dim: int, index: _Tensor) -> _Tensor:
     arr = _to_np(input)
     idx = _to_np(index).astype(int).reshape(-1)
     res = np.take(arr, idx, axis=dim)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def nonzero(input: _Tensor, as_tuple: bool = False) -> Union[_Tensor, Tuple[_Tensor, ...]]:
@@ -1777,9 +1807,9 @@ def nonzero(input: _Tensor, as_tuple: bool = False) -> Union[_Tensor, Tuple[_Ten
     arr = _to_np(input)
     indices = np.nonzero(arr)
     if as_tuple:
-        return tuple(_from_numpy(np.ascontiguousarray(idx)) for idx in indices)
+        return tuple(_from_numpy(_contig(idx)) for idx in indices)
     stacked = np.stack(indices, axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.int64))
+    return _from_numpy(_contig(stacked, dtype=np.int64))
 
 
 def where(
@@ -1793,10 +1823,18 @@ def where(
     cond = condition if isinstance(condition, _Tensor) else tensor(condition, dtype=bool)
     if cond.dtype != bool:
         cond = cond != 0
-    tx = x if isinstance(x, _Tensor) else tensor(x)
-    ty = y if isinstance(y, _Tensor) else tensor(y)
-    return _native_where(cond, tx, ty)
+    ref = x if isinstance(x, _Tensor) else y if isinstance(y, _Tensor) else None
 
+    def operand(v):
+        if isinstance(v, _Tensor):
+            return v
+        if ref is None:
+            return tensor(v)
+        # a Python number takes the other operand's dtype (a float on an integer tensor gives float32, like PyTorch)
+        floaty = ref.dtype in ("f16", "bf16", "f32", "f64")
+        dt = ref.dtype if (floaty or not isinstance(v, float)) else "f32"
+        return tensor(v, dtype=dt)
+    return _native_where(cond, operand(x), operand(y))
 
 def roll(input: _Tensor, shifts: Union[int, Sequence[int]], dims: Optional[Union[int, Sequence[int]]] = None) -> _Tensor:
     """Roll the tensor along the given dimension(s)."""
@@ -1874,32 +1912,62 @@ def rot90(input: _Tensor, k: int = 1, dims: Sequence[int] = (0, 1)) -> _Tensor:
         return flip(input.transpose(d0, d1), [d1])
 
 
-def repeat_interleave(input: _Tensor, repeats: Union[int, Sequence[int]], dim: Optional[int] = None) -> _Tensor:
-    """Repeat elements of a tensor."""
-    arr = _to_np(input)
-    res = np.repeat(arr, repeats, axis=dim)
-    return _from_numpy(np.ascontiguousarray(res))
+def repeat_interleave(input: _Tensor, repeats: Union[int, _Tensor, Sequence[int]], dim: Optional[int] = None) -> _Tensor:
+    """Repeats elements of a tensor (differentiable: a gather of the repeated positions)."""
+    x = input if dim is not None else input.reshape([-1])
+    d = 0 if dim is None else (dim if dim >= 0 else dim + x.ndim)
+    n = int(x.shape[d])
+    reps = _to_np(repeats).astype(np.int64) if isinstance(repeats, _Tensor) else np.asarray(repeats, dtype=np.int64)
+    if reps.ndim == 0 or reps.size == 1:
+        reps = np.full(n, int(reps.reshape(-1)[0]), dtype=np.int64)
+    if reps.shape[0] != n:
+        raise RuntimeError(f"repeats must have the same size as input along dim, but got repeats of size {reps.shape[0]} and {n}")
+    idx = np.repeat(np.arange(n, dtype=np.int64), reps)
+    return x.index_select(d, _Tensor.from_numpy(idx))
+
+
+def _repeat_tensor(x: _Tensor, reps: Sequence[int]) -> _Tensor:
+    """`Tensor.repeat` / `tile`: out[j] = x[j % size] along every dim, built from reshape + expand (differentiable)."""
+    reps = [int(r) for r in reps]
+    if len(reps) < x.ndim:
+        raise RuntimeError("Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor")
+    shape = [1] * (len(reps) - x.ndim) + [int(v) for v in x.shape]
+    inter, expanded, final = [], [], []
+    for r, n in zip(reps, shape):
+        inter += [1, n]
+        expanded += [r, n]
+        final.append(r * n)
+    return x.reshape(inter).expand(expanded).reshape(final)
+
+
+def _expand_index(index: _Tensor, dim: int, source: _Tensor) -> _Tensor:
+    """A 1-D index along `dim` broadcast to `source`'s shape (what scatter / scatter_add take)."""
+    idx = _to_np(index).astype(np.int64).reshape(-1)
+    shape = [1] * source.ndim
+    shape[dim] = idx.shape[0]
+    return _Tensor.from_numpy(_contig(np.broadcast_to(idx.reshape(shape), tuple(source.shape))))
 
 
 def tile(input: _Tensor, dims: Sequence[int]) -> _Tensor:
-    """Construct a tensor by repeating the elements of input."""
-    arr = _to_np(input)
-    res = np.tile(arr, dims)
-    return _from_numpy(np.ascontiguousarray(res))
+    """Construct a tensor by repeating the elements of input (differentiable)."""
+    dims = list(dims)
+    if len(dims) < input.ndim:
+        dims = [1] * (input.ndim - len(dims)) + dims
+    return _repeat_tensor(input, dims)
 
 
 def all(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> _Tensor:
     """Tests if all elements in input evaluate to True."""
     arr = _to_np(input) != 0
     res = np.all(arr, axis=dim, keepdims=keepdim)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def any(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> _Tensor:
     """Tests if any element in input evaluates to True."""
     arr = _to_np(input) != 0
     res = np.any(arr, axis=dim, keepdims=keepdim)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def argmax(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> _Tensor:
@@ -1910,7 +1978,7 @@ def argmax(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> 
     res = np.argmax(_to_np(input), axis=dim)
     if keepdim:
         res = np.expand_dims(res, axis=dim)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.int64))
+    return _from_numpy(_contig(res, dtype=np.int64))
 
 
 def argmin(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> _Tensor:
@@ -1921,22 +1989,16 @@ def argmin(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> 
     res = np.argmin(_to_np(input), axis=dim)
     if keepdim:
         res = np.expand_dims(res, axis=dim)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.int64))
+    return _from_numpy(_contig(res, dtype=np.int64))
 
 
 def amax(input: _Tensor, dim: Optional[Union[int, Tuple[int, ...]]] = None, keepdim: bool = False) -> _Tensor:
-    """Returns the maximum value of each slice of the input tensor in the given dimension(s) dim."""
-    arr = _to_np(input)
-    res = np.amax(arr, axis=dim, keepdims=keepdim)
-    return _from_numpy(np.ascontiguousarray(res))
-
+    """Returns the maximum of each slice of the input tensor in the given dimension(s) (differentiable; ties share the gradient)."""
+    return input.amax(dim, keepdim)
 
 def amin(input: _Tensor, dim: Optional[Union[int, Tuple[int, ...]]] = None, keepdim: bool = False) -> _Tensor:
-    """Returns the minimum value of each slice of the input tensor in the given dimension(s) dim."""
-    arr = _to_np(input)
-    res = np.amin(arr, axis=dim, keepdims=keepdim)
-    return _from_numpy(np.ascontiguousarray(res))
-
+    """Returns the minimum of each slice of the input tensor in the given dimension(s) (differentiable; ties share the gradient)."""
+    return input.amin(dim, keepdim)
 
 def maximum(input: _Tensor, other: _Tensor) -> _Tensor:
     """Computes the element-wise maximum of input and other."""
@@ -1953,7 +2015,7 @@ def isclose(input: _Tensor, other: Union[_Tensor, float], rtol: float = 1e-5, at
     x = _to_np(input)
     y = _to_np(other)
     res = np.isclose(x, y, rtol=rtol, atol=atol)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def allclose(input: _Tensor, other: Union[_Tensor, float], rtol: float = 1e-5, atol: float = 1e-8) -> bool:
@@ -1964,14 +2026,14 @@ def allclose(input: _Tensor, other: Union[_Tensor, float], rtol: float = 1e-5, a
 
 
 def einsum(equation: str, *operands: _Tensor) -> _Tensor:
-    """Sums the product of the elements of the input operands along dimensions specified using Einstein summation convention."""
+    """Sums the product of the elements of the input operands along dimensions specified using Einstein summation convention
+    (native, differentiable, keeps the input dtype)."""
+    if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+        operands = tuple(operands[0])
     for op in operands:
         if not isinstance(op, _Tensor):
             raise TypeError(f"einsum(): expected Tensor but got {type(op).__name__}")
-    arrays = [_to_np(op) for op in operands]
-    res = np.einsum(equation, *arrays)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32 if res.dtype == np.float64 else res.dtype))
-
+    return _native_einsum(equation, *operands)
 
 def _check_sort_dim(dim, nd: int) -> int:
     try:
@@ -2036,7 +2098,7 @@ def mean(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> _T
         return input.mean()
     arr = _to_np(input)
     res = np.mean(arr, axis=dim, keepdims=keepdim)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def sum(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> _Tensor:
@@ -2045,7 +2107,7 @@ def sum(input: _Tensor, dim: Optional[int] = None, keepdim: bool = False) -> _Te
         return input.sum()
     arr = _to_np(input)
     res = np.sum(arr, axis=dim, keepdims=keepdim)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def var(input: _Tensor, dim: Optional[int] = None, unbiased: bool = True, keepdim: bool = False) -> _Tensor:
@@ -2068,13 +2130,28 @@ def cartesian_prod(*tensors: Any) -> _Tensor:
         return _native_cartesian_prod(list(tensors))
     grids = np.meshgrid(*[_to_np(t) for t in tensors], indexing="ij")
     stacked = np.stack([g.reshape(-1) for g in grids], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=tensors[0].to_numpy().dtype))
+    return _from_numpy(_contig(stacked, dtype=tensors[0].to_numpy().dtype))
 
 
 def meshgrid(*tensors: _Tensor, indexing: str = "ij") -> Tuple[_Tensor, ...]:
-    """Creates grids of coordinates specified by the 1D inputs in tensors."""
-    grids = np.meshgrid(*[_to_np(t) for t in tensors], indexing=indexing)
-    return tuple(_from_numpy(np.ascontiguousarray(g, dtype=tensors[0].to_numpy().dtype)) for g in grids)
+    """Creates grids of coordinates specified by the 1D inputs in tensors (differentiable expands)."""
+    if len(tensors) == 1 and isinstance(tensors[0], (list, tuple)):
+        tensors = tuple(tensors[0])
+    if indexing not in ("ij", "xy"):
+        raise ValueError(f"meshgrid: indexing must be 'ij' or 'xy', got {indexing!r}")
+    ts = list(tensors)
+    swap = indexing == "xy" and len(ts) >= 2
+    if swap:
+        ts[0], ts[1] = ts[1], ts[0]
+    shape = [int(t.numel()) for t in ts]
+    outs = []
+    for i, t in enumerate(ts):
+        view = [1] * len(ts)
+        view[i] = shape[i]
+        outs.append(t.reshape(view).expand(shape))
+    if swap:
+        outs[0], outs[1] = outs[1], outs[0]
+    return tuple(outs)
 
 
 def atleast_1d(*tensors: Union[_Tensor, Any]) -> Union[_Tensor, Tuple[_Tensor, ...]]:
@@ -2123,35 +2200,30 @@ def column_stack(tensors: Sequence[_Tensor]) -> _Tensor:
     """Stacks 1D or 2D tensors horizontally (column-wise)."""
     arrays = [_to_np(t) for t in tensors]
     res = np.column_stack(arrays)
-    return _from_numpy(np.ascontiguousarray(res, dtype=tensors[0].to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=tensors[0].to_numpy().dtype))
 
 
 def row_stack(tensors: Sequence[_Tensor]) -> _Tensor:
     """Stacks tensors vertically (row-wise)."""
     arrays = [_to_np(t) for t in tensors]
     res = np.row_stack(arrays)
-    return _from_numpy(np.ascontiguousarray(res, dtype=tensors[0].to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=tensors[0].to_numpy().dtype))
 
 
 def vstack(tensors: Sequence[_Tensor]) -> _Tensor:
-    """Stacks tensors vertically along the first dimension."""
-    arrays = [_to_np(t) for t in tensors]
-    res = np.vstack(arrays)
-    return _from_numpy(np.ascontiguousarray(res, dtype=tensors[0].to_numpy().dtype))
+    """Stacks tensors vertically along the first dimension (differentiable)."""
+    return cat([atleast_2d(t) for t in tensors], 0)
 
 
 def hstack(tensors: Sequence[_Tensor]) -> _Tensor:
-    """Stacks tensors horizontally along the second dimension."""
-    arrays = [_to_np(t) for t in tensors]
-    res = np.hstack(arrays)
-    return _from_numpy(np.ascontiguousarray(res, dtype=tensors[0].to_numpy().dtype))
+    """Stacks tensors horizontally (along the second dimension, or the first for 1-D inputs; differentiable)."""
+    ts = [atleast_1d(t) for t in tensors]
+    return cat(ts, 0 if ts[0].ndim == 1 else 1)
 
 
 def dstack(tensors: Sequence[_Tensor]) -> _Tensor:
-    """Stacks tensors depth-wise along the third dimension."""
-    arrays = [_to_np(t) for t in tensors]
-    res = np.dstack(arrays)
-    return _from_numpy(np.ascontiguousarray(res, dtype=tensors[0].to_numpy().dtype))
+    """Stacks tensors depth-wise along the third dimension (differentiable)."""
+    return cat([atleast_3d(t) for t in tensors], 2)
 
 
 def block_diag(*tensors: Any) -> _Tensor:
@@ -2178,14 +2250,14 @@ def block_diag(*tensors: Any) -> _Tensor:
             res[curr_r : curr_r + r, curr_c : curr_c + c] = a.reshape(r, c)
             curr_r += r
             curr_c += c
-    return _from_numpy(np.ascontiguousarray(res, dtype=tensors[0].to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=tensors[0].to_numpy().dtype))
 
 
 def diagflat(input: _Tensor, offset: int = 0) -> _Tensor:
     """Creates a two-dimensional tensor with the flattened input placed along the diagonal."""
     arr = _to_np(input).reshape(-1)
     res = np.diagflat(arr, k=offset)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def tril(input: _Tensor, diagonal: int = 0) -> _Tensor:
@@ -2200,22 +2272,22 @@ def triu(input: _Tensor, diagonal: int = 0) -> _Tensor:
     return _native_triu(t, int(diagonal))
 
 
-def tril_indices(row: int, col: int, offset: int = 0) -> Tuple[_Tensor, _Tensor]:
-    """Returns the indices of the lower triangular part of a row-by-col matrix."""
+def tril_indices(row: int, col: int, offset: int = 0) -> _Tensor:
+    """Returns the indices of the lower triangular part of a row-by-col matrix as a 2 x N tensor."""
     r, c = np.tril_indices(row, k=offset, m=col)
-    return _from_numpy(np.ascontiguousarray(r, dtype=np.int64)), _from_numpy(np.ascontiguousarray(c, dtype=np.int64))
+    return _from_numpy(_contig(np.stack([r, c]), dtype=np.int64))
 
 
-def triu_indices(row: int, col: int, offset: int = 0) -> Tuple[_Tensor, _Tensor]:
-    """Returns the indices of the upper triangular part of a row-by-col matrix."""
+def triu_indices(row: int, col: int, offset: int = 0) -> _Tensor:
+    """Returns the indices of the upper triangular part of a row-by-col matrix as a 2 x N tensor."""
     r, c = np.triu_indices(row, k=offset, m=col)
-    return _from_numpy(np.ascontiguousarray(r, dtype=np.int64)), _from_numpy(np.ascontiguousarray(c, dtype=np.int64))
+    return _from_numpy(_contig(np.stack([r, c]), dtype=np.int64))
 
 
 def diag_indices(n: int, ndim: int = 2) -> Tuple[_Tensor, ...]:
     """Returns the indices of the diagonal elements of an n-by-n array with ndim dimensions."""
     idx = np.diag_indices(n, ndim=ndim)
-    return tuple(_from_numpy(np.ascontiguousarray(i, dtype=np.int64)) for i in idx)
+    return tuple(_from_numpy(_contig(i, dtype=np.int64)) for i in idx)
 
 
 def narrow(input: _Tensor, dim: int, start: int, length: int) -> _Tensor:
@@ -2224,7 +2296,7 @@ def narrow(input: _Tensor, dim: int, start: int, length: int) -> _Tensor:
     sl = [slice(None)] * arr.ndim
     sl[dim] = slice(start, start + length)
     res = arr[tuple(sl)]
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def select(input: _Tensor, dim: int, index: int) -> _Tensor:
@@ -2233,15 +2305,17 @@ def select(input: _Tensor, dim: int, index: int) -> _Tensor:
     sl = [slice(None)] * arr.ndim
     sl[dim] = index
     res = arr[tuple(sl)]
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def take(input: _Tensor, index: _Tensor) -> _Tensor:
-    """Returns a new tensor with the elements of input at the given flat indices."""
-    arr = _to_np(input)
+    """Returns a new tensor with the elements of input at the given flat indices (differentiable gather)."""
+    n = int(input.numel())
     idx = _to_np(index).astype(np.int64)
-    res = np.take(arr, idx)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    if idx.size and (idx.min() < -n or idx.max() >= n):
+        raise IndexError(f"out of range: tried to access index {int(idx.max() if idx.max() >= n else idx.min())} on a tensor of {n} elements")
+    idx = np.where(idx < 0, idx + n, idx)
+    return input.reshape([-1]).index_select(0, _Tensor.from_numpy(_contig(idx.reshape(-1)))).reshape(list(idx.shape))
 
 
 def take_along_dim(input: _Tensor, indices: _Tensor, dim: int) -> _Tensor:
@@ -2317,19 +2391,32 @@ def trapezoid(y: _Tensor, x: Optional[_Tensor] = None, dx: Optional[float] = Non
 
 
 def cumulative_trapezoid(y: _Tensor, x: Optional[_Tensor] = None, dx: float = 1.0, dim: int = -1) -> _Tensor:
-    """Cumulatively integrates y(x) using the composite trapezoidal rule."""
-    y_arr = _to_np(y)
-    d = np.diff(_to_np(x), axis=dim) if x is not None else dx
-    res = np.cumsum(d * (y_arr[..., :-1] + y_arr[..., 1:]) / 2.0, axis=dim)
-    return _from_numpy(np.ascontiguousarray(res, dtype=y.to_numpy().dtype))
-
+    """Cumulatively integrates y(x) using the composite trapezoidal rule (differentiable)."""
+    d = dim if dim >= 0 else y.ndim + dim
+    n = int(y.shape[d])
+    if n < 1:
+        return y.clone()
+    mid = (y.narrow(d, 1, n - 1) + y.narrow(d, 0, n - 1)) * 0.5
+    if x is None:
+        steps = mid * dx
+    else:
+        if x.ndim == 1:
+            shape = [1] * y.ndim
+            shape[d] = n
+            xs = x.reshape(shape)
+            gap = xs.narrow(d, 1, n - 1) - xs.narrow(d, 0, n - 1)
+        else:
+            xd = x.ndim - y.ndim + d if x.ndim != y.ndim else d
+            gap = x.narrow(xd, 1, n - 1) - x.narrow(xd, 0, n - 1)
+        steps = mid * gap
+    return steps.cumsum(d)
 
 def heaviside(input: _Tensor, values: Union[_Tensor, float]) -> _Tensor:
     """Computes the Heaviside step function for each element in input."""
     arr = _to_np(input)
     v = _to_np(values) if isinstance(values, _Tensor) else float(values)
     res = np.heaviside(arr, v)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def atan2(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
@@ -2339,7 +2426,7 @@ def atan2(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
     y = _to_np(input)
     x = _to_np(other) if isinstance(other, _Tensor) else float(other)
     res = np.arctan2(y, x)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 arctan2 = atan2
@@ -2350,7 +2437,7 @@ def logaddexp(input: _Tensor, other: _Tensor) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other)
     res = np.logaddexp(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def logaddexp2(input: _Tensor, other: _Tensor) -> _Tensor:
@@ -2358,7 +2445,7 @@ def logaddexp2(input: _Tensor, other: _Tensor) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other)
     res = np.logaddexp2(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def hypot(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
@@ -2368,7 +2455,7 @@ def hypot(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other) if isinstance(other, _Tensor) else float(other)
     res = np.hypot(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def copysign(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
@@ -2376,7 +2463,7 @@ def copysign(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other) if isinstance(other, _Tensor) else float(other)
     res = np.copysign(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def fmax(input: _Tensor, other: _Tensor) -> _Tensor:
@@ -2384,7 +2471,7 @@ def fmax(input: _Tensor, other: _Tensor) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other)
     res = np.fmax(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def fmin(input: _Tensor, other: _Tensor) -> _Tensor:
@@ -2392,7 +2479,7 @@ def fmin(input: _Tensor, other: _Tensor) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other)
     res = np.fmin(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def fmod(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
@@ -2400,7 +2487,7 @@ def fmod(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other) if isinstance(other, _Tensor) else float(other)
     res = np.fmod(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def remainder(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
@@ -2408,7 +2495,7 @@ def remainder(input: _Tensor, other: Union[_Tensor, float]) -> _Tensor:
     a = _to_np(input)
     b = _to_np(other) if isinstance(other, _Tensor) else float(other)
     res = np.remainder(a, b)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(res, dtype=input.to_numpy().dtype))
 
 
 def bucketize(input: _Tensor, boundaries: _Tensor, out_int32: bool = False, right: bool = False) -> _Tensor:
@@ -2417,7 +2504,7 @@ def bucketize(input: _Tensor, boundaries: _Tensor, out_int32: bool = False, righ
     b = _to_np(boundaries)
     res = np.digitize(arr, b, right=right)
     dtype = np.int32 if out_int32 else np.int64
-    return _from_numpy(np.ascontiguousarray(res, dtype=dtype))
+    return _from_numpy(_contig(res, dtype=dtype))
 
 
 def searchsorted(sorted_sequence: _Tensor, values: _Tensor, out_int32: bool = False, right: bool = False, side: str = "left") -> _Tensor:
@@ -2427,15 +2514,21 @@ def searchsorted(sorted_sequence: _Tensor, values: _Tensor, out_int32: bool = Fa
     # Native engine: N-D broadcast rows, NaN queries read len, i64-exact past 2^53.
     out = _native_searchsorted(sorted_sequence, values, right=(right or side == "right"))
     if out_int32:
-        return _from_numpy(np.ascontiguousarray(out.to_numpy(), dtype=np.int32))
+        return _from_numpy(_contig(out.to_numpy(), dtype=np.int32))
     return out
 
 
 def nan_to_num(input: _Tensor, nan: float = 0.0, posinf: Optional[float] = None, neginf: Optional[float] = None) -> _Tensor:
-    """Replaces NaN, positive infinity, and negative infinity values in input with specified numbers."""
-    arr = _to_np(input)
-    res = np.nan_to_num(arr, nan=nan, posinf=posinf, neginf=neginf)
-    return _from_numpy(np.ascontiguousarray(res, dtype=input.to_numpy().dtype))
+    """Replaces NaN, positive infinity, and negative infinity values in input with specified numbers (differentiable:
+    replaced entries get a zero gradient)."""
+    if input.dtype not in ("f16", "bf16", "f32", "f64"):
+        return input.clone()
+    info = finfo(input.dtype)
+    hi = info.max if posinf is None else float(posinf)
+    lo = info.min if neginf is None else float(neginf)
+    out = input.masked_fill(input.isnan(), float(nan))
+    out = out.masked_fill(input.isposinf(), hi)
+    return out.masked_fill(input.isneginf(), lo)
 
 
 def nanmean(input: _Tensor, dim: Optional[Union[int, Tuple[int, ...]]] = None, keepdim: bool = False) -> _Tensor:
@@ -2514,7 +2607,7 @@ def isin(elements: _Tensor, test_elements: _Tensor, assume_unique: bool = False,
     el = _to_np(elements)
     test_el = _to_np(test_elements)
     res = np.isin(el, test_el, assume_unique=assume_unique, invert=invert)
-    return _from_numpy(np.ascontiguousarray(res))
+    return _from_numpy(_contig(res))
 
 
 def unique(input: _Tensor, sorted: bool = True, return_inverse: bool = False, return_counts: bool = False, dim: Optional[int] = None) -> Union[_Tensor, Tuple[_Tensor, ...]]:
@@ -2522,9 +2615,9 @@ def unique(input: _Tensor, sorted: bool = True, return_inverse: bool = False, re
     arr = _to_np(input)
     out = np.unique(arr, return_index=False, return_inverse=return_inverse, return_counts=return_counts, axis=dim)
     if isinstance(out, tuple):
-        res_list = [_from_numpy(np.ascontiguousarray(o, dtype=np.int64 if i > 0 else input.to_numpy().dtype)) for i, o in enumerate(out)]
+        res_list = [_from_numpy(_contig(o, dtype=np.int64 if i > 0 else input.to_numpy().dtype)) for i, o in enumerate(out)]
         return tuple(res_list)
-    return _from_numpy(np.ascontiguousarray(out, dtype=input.to_numpy().dtype))
+    return _from_numpy(_contig(out, dtype=input.to_numpy().dtype))
 
 
 def unique_consecutive(input: _Tensor, return_inverse: bool = False, return_counts: bool = False, dim: Optional[int] = None) -> Union[_Tensor, Tuple[_Tensor, ...]]:
@@ -2535,17 +2628,17 @@ def unique_consecutive(input: _Tensor, return_inverse: bool = False, return_coun
     flat = arr.reshape(-1)
     mask = np.concatenate(([True], flat[1:] != flat[:-1]))
     unique_vals = flat[mask]
-    res_val = _from_numpy(np.ascontiguousarray(unique_vals, dtype=input.to_numpy().dtype))
+    res_val = _from_numpy(_contig(unique_vals, dtype=input.to_numpy().dtype))
     if not return_inverse and not return_counts:
         return res_val
     results = [res_val]
     if return_inverse:
         inv = np.cumsum(mask) - 1
-        results.append(_from_numpy(np.ascontiguousarray(inv, dtype=np.int64)))
+        results.append(_from_numpy(_contig(inv, dtype=np.int64)))
     if return_counts:
         indices = np.nonzero(mask)[0]
         counts = np.diff(np.append(indices, len(flat)))
-        results.append(_from_numpy(np.ascontiguousarray(counts, dtype=np.int64)))
+        results.append(_from_numpy(_contig(counts, dtype=np.int64)))
     return tuple(results)
 
 
@@ -2570,7 +2663,7 @@ def histogram(input: _Tensor, bins: int = 100, range: Optional[Tuple[float, floa
     arr = _to_np(input).reshape(-1)
     w = _to_np(weight).reshape(-1) if weight is not None else None
     counts, bin_edges = np.histogram(arr, bins=bins, range=range, weights=w, density=density)
-    return _from_numpy(np.ascontiguousarray(counts, dtype=np.float32)), _from_numpy(np.ascontiguousarray(bin_edges, dtype=np.float32))
+    return _from_numpy(_contig(counts, dtype=np.float32)), _from_numpy(_contig(bin_edges, dtype=np.float32))
 
 
 class _FunctionalAutograd:
@@ -2750,7 +2843,7 @@ class _FunctionalAutograd:
 
             H_k = 0.5 * (H_k + H_k.T)
             shape = list(inp_k.shape) + list(inp_k.shape)
-            res_t = _from_numpy(np.ascontiguousarray(H_k.reshape(shape), dtype=inp_k.to_numpy().dtype))
+            res_t = _from_numpy(_contig(H_k.reshape(shape), dtype=inp_k.to_numpy().dtype))
             all_hessians.append(res_t)
 
         return tuple(all_hessians) if is_tuple else all_hessians[0]
@@ -3037,7 +3130,7 @@ def _patch_tensor():
                 # Cast to the target tensor's dtype, not hardcoded float32.
                 dt = _NATIVE_DTYPE_TO_NUMPY.get(str(self.dtype))
                 arr = np.asarray(val, dtype=dt) if dt is not None else np.asarray(val)
-                self.set_grad(_from_numpy(np.ascontiguousarray(arr)))
+                self.set_grad(_from_numpy(_contig(arr)))
     _Tensor.grad = property(_get_tensor_grad, _set_tensor_grad)
 
     orig_reshape = _Tensor.reshape
@@ -3134,7 +3227,13 @@ def _patch_tensor():
     _Tensor.real = property(_orig_real)
     _Tensor.imag = property(_orig_imag)
     _Tensor.conjugate = _Tensor.conj
-    _Tensor.angle = lambda self: atan2(self.imag, self.real)
+    def _angle(self):
+        if self.dtype in ("c64", "c128"):
+            return atan2(self.imag, self.real)
+        # real input: pi for negative values, 0 otherwise (also for -0.0), NaN stays NaN, no gradient
+        x = self if self.dtype in ("f16", "bf16", "f32", "f64") else self.float()
+        return x.masked_fill(x >= 0, 0.0).masked_fill(x < 0, float(np.pi)).detach()
+    _Tensor.angle = _angle
 
     from . import special as _special
     if not hasattr(_Tensor, "xlogy"):
@@ -3159,8 +3258,10 @@ def _patch_tensor():
         target_dt = None
         if len(args) == 1:
             a = args[0]
-            if isinstance(a, dtype):
-                target_dt = _normalize_dtype(a)
+            if isinstance(a, dtype) or (isinstance(a, str) and a in _DTYPE_TO_STR):
+                target_dt = _normalize_dtype(a)  # `x.to(y.dtype)` passes the dtype tag string ("f32")
+            elif isinstance(a, np.dtype) or (isinstance(a, type) and issubclass(a, np.generic)):
+                target_dt = _normalize_dtype(np.dtype(a).name)
             elif isinstance(a, _Tensor):
                 target_dev = _normalize_device(a.device)
                 target_dt = a.dtype
@@ -3191,10 +3292,7 @@ def _patch_tensor():
 
     # Slicing, repeating, and indexing
     def _repeat(self, *repeats):
-        rep = _extract_shape_args(repeats)
-        arr = self.to_numpy()
-        tiled = np.tile(arr, rep)
-        return _from_numpy(np.ascontiguousarray(tiled))
+        return _repeat_tensor(self, _extract_shape_args(repeats))
     _Tensor.repeat = _repeat
 
     # Native engine (differentiable zero-copy views) now serves .chunk and .split directly.
@@ -3227,7 +3325,7 @@ def _patch_tensor():
         k = flat_idx.shape[0]
         onehot = np.zeros((k, n), dtype=np.float32)
         onehot[np.arange(k), flat_idx] = 1.0
-        mask_t = _from_numpy(np.ascontiguousarray(onehot, dtype=base.to_numpy().dtype))
+        mask_t = _from_numpy(_contig(onehot, dtype=base.to_numpy().dtype))
         if hasattr(base, "device"):
             try:
                 mask_t = mask_t.to(base.device)
@@ -3237,66 +3335,95 @@ def _patch_tensor():
         return mask_t.matmul(flat).reshape(out_shape)
 
     orig_getitem = _Tensor.__getitem__
-    def _tensor_getitem(self, key):
-        if self.requires_grad:
-            try:
-                test_arr = np.zeros(self.shape, dtype=np.float32)
-                indexed = test_arr[key]
-                # Scalars only: a size-1 non-scalar result (e.g. shape [1, 1])
-                # must keep its shape via the native path below.
-                if np.isscalar(indexed):
-                    mask = np.zeros(self.shape, dtype=np.float32)
-                    mask[key] = 1.0
-                    mask_t = _from_numpy(np.ascontiguousarray(mask, dtype=np.float32))
-                    return (self * mask_t).sum()
-            except Exception:
-                pass
 
-        if isinstance(key, _Tensor):
-            k = _index_array(key)
-            if self.requires_grad and self.to_numpy().dtype in (np.float32, np.float64):
-                # Differentiable one-hot selection; anything unsupported falls
-                # through to the (detached) numpy path below with identical values.
-                try:
-                    if k.dtype == bool:
-                        if k.ndim == 1 and len(self.shape) and k.shape[0] == self.shape[0]:
-                            pos = np.flatnonzero(k).astype(np.int64)
-                            return _onehot_select(
-                                self, pos, [pos.shape[0]] + list(self.shape[1:])
-                            )
-                        if k.shape == tuple(self.shape):
-                            pos = np.flatnonzero(k.reshape(-1)).astype(np.int64)
-                            flat_self = self.reshape([-1])
-                            return _onehot_select(flat_self, pos, [pos.shape[0]])
-                        raise ValueError("unsupported mask shape for grad path")
-                    idx = k.astype(np.int64)
-                    n = self.shape[0]
-                    idx = np.where(idx < 0, idx + n, idx)
-                    if idx.size and (idx.min() < 0 or idx.max() >= n):
-                        raise IndexError(
-                            f"index out of bounds for dimension 0 of size {n}"
-                        )
-                    return _onehot_select(
-                        self, idx.reshape(-1).astype(np.int64),
-                        list(idx.shape) + list(self.shape[1:]),
-                    )
-                except Exception:
-                    pass
-            arr = self.to_numpy()[k]
-            return _from_numpy(np.ascontiguousarray(arr, dtype=self.to_numpy().dtype))
-        elif isinstance(key, tuple) and _builtin_any(isinstance(item, _Tensor) for item in key):
-            new_k = []
-            for item in key:
-                if isinstance(item, _Tensor):
-                    new_k.append(_index_array(item))
+    def _is_array_index(item) -> bool:
+        return isinstance(item, (_Tensor, list, np.ndarray))
+
+    def _as_index_array(item) -> np.ndarray:
+        if isinstance(item, _Tensor):
+            return _index_array(item)
+        arr = np.asarray(item)
+        if arr.dtype == bool or arr.dtype == np.uint8 and False:
+            return arr
+        if arr.size == 0:
+            return arr.astype(np.int64)
+        if arr.dtype.kind not in "iub":
+            raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
+        return arr
+
+    def _advanced_getitem(x, items):
+        """NumPy/PyTorch advanced indexing built from differentiable native ops: basic parts are applied first,
+        then the index arrays become one flat gather (`index_select` on the indexed dims moved to the front)."""
+        idx_items = []
+        for it in items:
+            if _is_array_index(it):
+                arr = _as_index_array(it)
+                if arr.dtype == bool:
+                    idx_items.extend(np.nonzero(arr))  # a k-d mask consumes k dims
                 else:
-                    new_k.append(item)
-            arr = self.to_numpy()[tuple(new_k)]
-            return _from_numpy(np.ascontiguousarray(arr, dtype=self.to_numpy().dtype))
-        else:
-            if not isinstance(key, (int, slice, tuple, list, type(Ellipsis), type(None))):
-                raise TypeError(f"tensor indices must be integers, slices, None or an ellipsis, not {type(key).__name__}")
-            return orig_getitem(self, key)
+                    idx_items.append(arr)
+            else:
+                idx_items.append(it)
+        consumed = _builtin_sum(1 for it in idx_items if it is not None and it is not Ellipsis)
+        if _builtin_sum(1 for it in idx_items if it is Ellipsis) > 1:
+            raise IndexError("an index can only have a single ellipsis ('...')")
+        if consumed > x.ndim:
+            raise IndexError(f"too many indices for tensor of dimension {x.ndim}")
+        expanded = []
+        for it in idx_items:
+            if it is Ellipsis:
+                expanded.extend([slice(None)] * (x.ndim - consumed))
+            else:
+                expanded.append(it)
+        if not _builtin_any(it is Ellipsis for it in idx_items):
+            expanded.extend([slice(None)] * (x.ndim - consumed))
+        y, cur, adv = x, 0, []
+        for it in expanded:
+            if it is None:
+                y = y.unsqueeze(cur)
+                cur += 1
+            elif isinstance(it, slice):
+                if it != slice(None):
+                    y = orig_getitem(y, (slice(None),) * cur + (it,))
+                cur += 1
+            elif isinstance(it, np.ndarray):
+                adv.append((cur, it))
+                cur += 1
+            else:  # unlike NumPy, PyTorch applies an integer as a plain select, even next to index arrays
+                y = orig_getitem(y, (slice(None),) * cur + (int(it),))
+        if not adv:
+            return y
+        dims = [d for d, _ in adv]
+        sizes = [int(y.shape[d]) for d in dims]
+        arrs = []
+        for (d, arr), n in zip(adv, sizes):
+            arr = arr.astype(np.int64)
+            if arr.size and (arr.min() < -n or arr.max() >= n):
+                raise IndexError(f"index {int(arr.max() if arr.max() >= n else arr.min())} is out of bounds for dimension {d} with size {n}")
+            arrs.append(np.where(arr < 0, arr + n, arr))
+        arrs = np.broadcast_arrays(*arrs)
+        bshape = arrs[0].shape
+        lin = np.ravel_multi_index(tuple(arrs), tuple(sizes)) if arrs[0].size else np.zeros(bshape, dtype=np.int64)
+        others = [i for i in range(y.ndim) if i not in dims]
+        yp = y.permute(dims + others) if dims + others != list(range(y.ndim)) else y
+        rest = [int(y.shape[i]) for i in others]
+        flat = yp.reshape([int(np.prod(sizes))] + rest)
+        out = flat.index_select(0, _Tensor.from_numpy(_contig(lin.reshape(-1).astype(np.int64)))).reshape(list(bshape) + rest)
+        consecutive = dims == list(range(dims[0], dims[0] + len(dims)))
+        nb = len(bshape)
+        if consecutive and dims[0] > 0 and nb > 0:
+            before = list(range(nb, nb + dims[0]))
+            out = out.permute(before + list(range(nb)) + list(range(nb + dims[0], out.ndim)))
+        return out
+
+    def _tensor_getitem(self, key):
+        items = key if isinstance(key, tuple) else (key,)
+        if _builtin_any(_is_array_index(it) for it in items):
+            if not _builtin_any(isinstance(it, _Tensor) and it.dtype in ("f16", "bf16", "f32", "f64") for it in items):
+                return _advanced_getitem(self, items)
+        if not isinstance(key, (int, slice, tuple, list, type(Ellipsis), type(None))):
+            raise TypeError(f"tensor indices must be integers, slices, None or an ellipsis, not {type(key).__name__}")
+        return orig_getitem(self, key)
     _Tensor.__getitem__ = _tensor_getitem
 
     def _tensor_setitem(self, key, value):
@@ -3320,7 +3447,7 @@ def _patch_tensor():
             v = value
 
         arr[k] = v
-        self.assign(_from_numpy(np.ascontiguousarray(arr, dtype=self.to_numpy().dtype)))
+        self.assign(_from_numpy(_contig(arr, dtype=self.to_numpy().dtype)))
     _Tensor.__setitem__ = _tensor_setitem
 
     def _unbind(self, dim: int = 0):
@@ -3402,7 +3529,7 @@ def _patch_tensor():
         arr = self.to_numpy()
         ddof = 1 if unbiased else 0
         res = np.var(arr, axis=dim, ddof=ddof, keepdims=keepdim)
-        return _from_numpy(np.ascontiguousarray(res, dtype=self.to_numpy().dtype))
+        return _from_numpy(_contig(res, dtype=self.to_numpy().dtype))
     _Tensor.var = _tensor_var
 
     orig_std = _Tensor.std
@@ -3413,7 +3540,7 @@ def _patch_tensor():
         arr = self.to_numpy()
         ddof = 1 if unbiased else 0
         res = np.std(arr, axis=dim, ddof=ddof, keepdims=keepdim)
-        return _from_numpy(np.ascontiguousarray(res, dtype=self.to_numpy().dtype))
+        return _from_numpy(_contig(res, dtype=self.to_numpy().dtype))
     _Tensor.std = _tensor_std
     _Tensor.diag = lambda self, diagonal=0: diag(self, diagonal=diagonal)
     _Tensor.diagonal = lambda self, offset=0, dim1=0, dim2=1: diagonal(self, offset=offset, dim1=dim1, dim2=dim2)
@@ -3746,7 +3873,7 @@ def compile(
 
 def _wrap(arr: np.ndarray, orig_t: Optional[_Tensor] = None) -> _Tensor:
     dtype = orig_t.to_numpy().dtype if orig_t is not None else (np.float32 if arr.dtype == np.float64 else arr.dtype)
-    return _from_numpy(np.ascontiguousarray(arr, dtype=dtype))
+    return _from_numpy(_contig(arr, dtype=dtype))
 
 
 def kron(a: _Tensor, b: _Tensor) -> _Tensor:
@@ -3861,16 +3988,18 @@ def flipud(input: _Tensor) -> _Tensor:
     return flip(input, [0])
 
 
-def repeat_interleave(
-    input: _Tensor,
-    repeats: Union[int, _Tensor],
-    dim: Optional[int] = None,
-) -> _Tensor:
-    """Repeats elements of a tensor along a specified dimension."""
-    arr = _to_np(input)
-    rep = _to_np(repeats).astype(np.int64) if isinstance(repeats, _Tensor) else repeats
-    res = np.repeat(arr, rep, axis=dim)
-    return _wrap(res, input)
+def repeat_interleave(input: _Tensor, repeats: Union[int, _Tensor, Sequence[int]], dim: Optional[int] = None) -> _Tensor:
+    """Repeats elements of a tensor (differentiable: a gather of the repeated positions)."""
+    x = input if dim is not None else input.reshape([-1])
+    d = 0 if dim is None else (dim if dim >= 0 else dim + x.ndim)
+    n = int(x.shape[d])
+    reps = _to_np(repeats).astype(np.int64) if isinstance(repeats, _Tensor) else np.asarray(repeats, dtype=np.int64)
+    if reps.ndim == 0 or reps.size == 1:
+        reps = np.full(n, int(reps.reshape(-1)[0]), dtype=np.int64)
+    if reps.shape[0] != n:
+        raise RuntimeError(f"repeats must have the same size as input along dim, but got repeats of size {reps.shape[0]} and {n}")
+    idx = np.repeat(np.arange(n, dtype=np.int64), reps)
+    return x.index_select(d, _Tensor.from_numpy(idx))
 
 
 def addmm(
@@ -3975,15 +4104,9 @@ _Tensor.addr = lambda self, vec1, vec2, beta=1.0, alpha=1.0: addr(self, vec1, ve
 # ---------------------------------------------------------------------------
 
 def index_copy(input: _Tensor, dim: int, index: _Tensor, source: _Tensor) -> _Tensor:
-    """Copies elements of source into input along dimension dim according to the indices in index."""
-    arr = input.to_numpy().copy()
-    idx = index.to_numpy().reshape(-1).astype(np.int64)
-    src = source.to_numpy()
-    d = dim if dim >= 0 else arr.ndim + dim
-    slc = [slice(None)] * arr.ndim
-    slc[d] = idx
-    arr[tuple(slc)] = src
-    return _wrap(arr, input)
+    """Copies elements of source into input along dimension dim according to the indices in index (differentiable)."""
+    d = dim if dim >= 0 else input.ndim + dim
+    return input.scatter(d, _expand_index(index, d, source), source)
 
 
 def index_copy_(input: _Tensor, dim: int, index: _Tensor, source: _Tensor) -> _Tensor:
@@ -3994,20 +4117,12 @@ def index_copy_(input: _Tensor, dim: int, index: _Tensor, source: _Tensor) -> _T
 
 
 def index_add(input: _Tensor, dim: int, index: _Tensor, source: _Tensor, *, alpha: float = 1.0) -> _Tensor:
-    """Accumulates the elements of alpha * source into input along dim according to index."""
+    """Accumulates the elements of alpha * source into input along dim according to index (differentiable scatter_add)."""
     if input.dtype != source.dtype:
-        raise RuntimeError(
-            f"index_add(): self ({input.dtype}) and source ({source.dtype}) "
-            "must have the same dtype"
-        )
-    arr = input.to_numpy().copy()
-    idx = index.to_numpy().reshape(-1).astype(np.int64)
-    src = (source.to_numpy() * alpha).astype(arr.dtype)
-    d = dim if dim >= 0 else arr.ndim + dim
-    slc = [slice(None)] * arr.ndim
-    slc[d] = idx
-    np.add.at(arr, tuple(slc), src)
-    return _wrap(arr, input)
+        raise RuntimeError(f"index_add(): self ({input.dtype}) and source ({source.dtype}) must have the same dtype")
+    d = dim if dim >= 0 else input.ndim + dim
+    src = source if alpha == 1.0 else source * alpha
+    return input.scatter_add(d, _expand_index(index, d, source), src)
 
 
 def index_add_(input: _Tensor, dim: int, index: _Tensor, source: _Tensor, *, alpha: float = 1.0) -> _Tensor:
@@ -4063,23 +4178,24 @@ def masked_select(input: _Tensor, mask: _Tensor) -> _Tensor:
 
 
 def diag_embed(input: _Tensor, offset: int = 0, dim1: int = -2, dim2: int = -1) -> _Tensor:
-    """Creates a tensor whose diagonals of 2D planes are filled by input."""
-    inp = input.to_numpy()
-    d_len = inp.shape[-1]
-    mat_size = d_len + _builtin_abs(offset)
-    res = np.zeros((*inp.shape[:-1], mat_size, mat_size), dtype=inp.dtype)
-    if offset >= 0:
-        row_idx = np.arange(d_len)
-        col_idx = np.arange(d_len) + offset
-    else:
-        row_idx = np.arange(d_len) - offset
-        col_idx = np.arange(d_len)
-    res[..., row_idx, col_idx] = inp
-    d1 = dim1 if dim1 >= 0 else res.ndim + dim1
-    d2 = dim2 if dim2 >= 0 else res.ndim + dim2
-    if (d1, d2) != (res.ndim - 2, res.ndim - 1):
-        res = np.moveaxis(res, (res.ndim - 2, res.ndim - 1), (d1, d2))
-    return _wrap(res, input)
+    """Creates a tensor whose diagonals of 2D planes are filled by input (differentiable scatter)."""
+    batch = [int(v) for v in input.shape[:-1]]
+    d_len = int(input.shape[-1])
+    n = d_len + _builtin_abs(offset)
+    rows = np.arange(d_len) + (0 if offset >= 0 else -offset)
+    cols = np.arange(d_len) + (offset if offset >= 0 else 0)
+    b = int(np.prod(batch)) if batch else 1
+    idx = np.broadcast_to((rows * n + cols)[None, :], (b, d_len))
+    base = zeros([b, n * n], dtype=input.dtype)
+    out = base.scatter(1, _Tensor.from_numpy(_contig(idx)), input.reshape([b, d_len])).reshape(batch + [n, n])
+    nd = out.ndim
+    d1, d2 = (dim1 if dim1 >= 0 else nd + dim1), (dim2 if dim2 >= 0 else nd + dim2)
+    if (d1, d2) != (nd - 2, nd - 1):
+        # place the two matrix dims at d1, d2 and the batch dims, in order, everywhere else
+        batch_dims = iter(range(nd - 2))
+        perm = [nd - 2 if i == d1 else nd - 1 if i == d2 else next(batch_dims) for i in range(nd)]
+        out = out.permute(perm)
+    return out
 
 
 def diagonal_scatter(input: _Tensor, src: _Tensor, offset: int = 0, dim1: int = 0, dim2: int = 1) -> _Tensor:
@@ -4187,7 +4303,7 @@ def _uniform_inplace(self: _Tensor, from_val: float = 0.0, to_val: float = 1.0) 
     """Fills self with values uniformly sampled from [from_val, to_val)."""
     shape = list(self.shape)
     arr = np.random.uniform(from_val, to_val, size=shape).astype(self.to_numpy().dtype)
-    self.assign(_from_numpy(np.ascontiguousarray(arr)))
+    self.assign(_from_numpy(_contig(arr)))
     return self
 
 
@@ -4195,7 +4311,7 @@ def _normal_inplace(self: _Tensor, mean: float = 0.0, std: float = 1.0) -> _Tens
     """Fills self with values sampled from normal distribution N(mean, std^2)."""
     shape = list(self.shape)
     arr = np.random.normal(mean, std, size=shape).astype(self.to_numpy().dtype)
-    self.assign(_from_numpy(np.ascontiguousarray(arr)))
+    self.assign(_from_numpy(_contig(arr)))
     return self
 
 
@@ -4203,7 +4319,7 @@ def _exponential_inplace(self: _Tensor, lambd: float = 1.0) -> _Tensor:
     """Fills self with values sampled from exponential distribution with rate lambd."""
     shape = list(self.shape)
     arr = np.random.exponential(1.0 / lambd, size=shape).astype(self.to_numpy().dtype)
-    self.assign(_from_numpy(np.ascontiguousarray(arr)))
+    self.assign(_from_numpy(_contig(arr)))
     return self
 
 
@@ -4211,7 +4327,7 @@ def _cauchy_inplace(self: _Tensor, median: float = 0.0, sigma: float = 1.0) -> _
     """Fills self with values sampled from standard Cauchy distribution."""
     shape = list(self.shape)
     arr = (median + sigma * np.random.standard_cauchy(size=shape)).astype(self.to_numpy().dtype)
-    self.assign(_from_numpy(np.ascontiguousarray(arr)))
+    self.assign(_from_numpy(_contig(arr)))
     return self
 
 
@@ -4219,7 +4335,7 @@ def _geometric_inplace(self: _Tensor, p: float) -> _Tensor:
     """Fills self with values sampled from geometric distribution with success probability p."""
     shape = list(self.shape)
     arr = np.random.geometric(p, size=shape).astype(self.to_numpy().dtype)
-    self.assign(_from_numpy(np.ascontiguousarray(arr)))
+    self.assign(_from_numpy(_contig(arr)))
     return self
 
 
@@ -4227,7 +4343,7 @@ def _log_normal_inplace(self: _Tensor, mean: float = 1.0, std: float = 2.0) -> _
     """Fills self with values sampled from log-normal distribution."""
     shape = list(self.shape)
     arr = np.random.lognormal(mean, std, size=shape).astype(self.to_numpy().dtype)
-    self.assign(_from_numpy(np.ascontiguousarray(arr)))
+    self.assign(_from_numpy(_contig(arr)))
     return self
 
 
@@ -4236,7 +4352,7 @@ def _bernoulli_inplace(self: _Tensor, p: Union[float, _Tensor] = 0.5) -> _Tensor
     shape = list(self.shape)
     p_arr = p.to_numpy() if isinstance(p, _Tensor) else p
     arr = np.random.binomial(1, p_arr, size=shape).astype(self.to_numpy().dtype)
-    self.assign(_from_numpy(np.ascontiguousarray(arr)))
+    self.assign(_from_numpy(_contig(arr)))
     return self
 
 
@@ -4254,7 +4370,7 @@ def bernoulli(input: _Tensor, *, generator: Any = None, out: Optional[_Tensor] =
     inp = input if isinstance(input, _Tensor) else tensor(input)
     p = inp.to_numpy()
     arr = np.random.binomial(1, p).astype(p.dtype)
-    res = _from_numpy(np.ascontiguousarray(arr))
+    res = _from_numpy(_contig(arr))
     if out is not None:
         out.assign(res)
         return out
@@ -4266,7 +4382,7 @@ def poisson(input: _Tensor, *, generator: Any = None) -> _Tensor:
     inp = input if isinstance(input, _Tensor) else tensor(input)
     lam = inp.to_numpy()
     arr = np.random.poisson(lam).astype(lam.dtype)
-    return _from_numpy(np.ascontiguousarray(arr))
+    return _from_numpy(_contig(arr))
 
 
 def multinomial(input: _Tensor, num_samples: int, replacement: bool = False, *, generator: Any = None, out: Optional[_Tensor] = None) -> _Tensor:

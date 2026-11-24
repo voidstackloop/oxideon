@@ -8,6 +8,7 @@ factorizations, solvers, and generalized matrix/vector norms.
 from collections import namedtuple
 from typing import Any, List, Optional, Sequence, Tuple, Union
 import numpy as np
+from ._contig import contig as _contig
 
 from . import Tensor, from_numpy
 
@@ -26,8 +27,12 @@ def _to_np(x: Any) -> np.ndarray:
     return np.asarray(x)
 
 
+def _as_t(x: Any) -> Tensor:
+    return x if isinstance(x, Tensor) else from_numpy(_contig(np.asarray(x)))
+
+
 def _wrap(arr: np.ndarray, like: Optional[Tensor] = None) -> Tensor:
-    res = from_numpy(np.ascontiguousarray(arr))
+    res = from_numpy(_contig(arr))
     if like is not None and hasattr(like, "device"):
         try:
             res = res.to(like.device)
@@ -78,9 +83,23 @@ def norm(
                 return out
             return res
 
-    arr = _to_np(A)
-    res_np = np.linalg.norm(arr, ord=ord, axis=dim, keepdims=keepdim)
-    res = _wrap(res_np, like=A)
+    A = _as_t(A)
+    nd = len(A.shape)
+    if dim is None and ord is None:
+        res = vector_norm(A, 2, None, keepdim)
+    elif dim is None:
+        if nd == 1:
+            res = vector_norm(A, ord, None, keepdim)
+        elif nd == 2:
+            res = matrix_norm(A, ord, (-2, -1), keepdim)
+        else:
+            raise RuntimeError(f"linalg.norm: with ord={ord!r} and dim=None the input must be 1-D or 2-D, got {nd}-D")
+    elif isinstance(dim, int) or len(dim) == 1:
+        res = vector_norm(A, 2 if ord is None else ord, dim if isinstance(dim, int) else dim[0], keepdim)
+    elif len(dim) == 2:
+        res = matrix_norm(A, "fro" if ord is None else ord, tuple(dim), keepdim)
+    else:
+        raise RuntimeError(f"linalg.norm: dim must be an int or a pair, got {dim}")
     if out is not None:
         out.zero_()
         out.add_(res)
@@ -176,22 +195,27 @@ def pinv(
     *,
     out: Optional[Tensor] = None,
 ) -> Tensor:
-    """Computes the pseudo-inverse (Moore-Penrose inverse) of a matrix or batch of matrices."""
-    if isinstance(A, Tensor) and not hermitian and A.requires_grad and atol is None and not isinstance(rtol, Tensor):
-        rcond = float(rtol) if rtol is not None else 1e-7
-        res = A.pinv(rcond=rcond)
+    """The Moore-Penrose pseudo-inverse, from the SVD (or, with `hermitian`, the eigendecomposition), dropping singular
+    values at or below max(atol, rtol * largest); like PyTorch, rtol defaults to eps * max(m, n) when atol is not given
+    (and to 0 when it is). Computed in Rust."""
+    A = _as_t(A)
+    m, n = int(A.shape[-2]), int(A.shape[-1])
+    eps = float(np.finfo(np.float64 if A.dtype == "f64" else np.float32).eps)
+    if rtol is None:
+        rtol = eps * max(m, n) if atol is None else 0.0
+    atol = 0.0 if atol is None else float(atol)
+    from .primitives import where
+    if hermitian:
+        w, v = A.eigh()
+        mag = w.abs()
+        cut = (mag.max(len(mag.shape) - 1, keepdim=True).values * float(rtol)).clamp_min(atol)
+        inv = where(mag > cut, 1.0 / w, w * 0.0)
+        res = (v * inv.unsqueeze(-2)).matmul(v.transpose(-2, -1))
     else:
-        arr = _to_np(A)
-        rcond = rtol if rtol is not None else (atol if atol is not None else 1e-15)
-        if hermitian:
-            u, s, vh = np.linalg.svd(arr, hermitian=True)
-            cutoff = rcond * np.amax(s, axis=-1, keepdims=True)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                s_inv = np.where(s > cutoff, 1.0 / s, 0.0)
-            res_np = np.matmul(vh.swapaxes(-2, -1).conj() * s_inv[..., None, :], u.swapaxes(-2, -1).conj())
-        else:
-            res_np = np.linalg.pinv(arr, rcond=rcond)
-        res = _wrap(res_np, like=A)
+        u, s, vh = A.svd()
+        cut = (s.max(len(s.shape) - 1, keepdim=True).values * float(rtol)).clamp_min(atol)
+        inv = where(s > cut, 1.0 / s, s * 0.0)
+        res = (vh.transpose(-2, -1) * inv.unsqueeze(-2)).matmul(u.transpose(-2, -1))
     if out is not None:
         out.zero_()
         out.add_(res)
@@ -291,17 +315,17 @@ def cholesky_inverse(L: Tensor, upper: bool = False, *, out: Optional[Tensor] = 
 
 
 def qr(A: Tensor, mode: str = "reduced", *, out: Optional[Tuple[Tensor, Tensor]] = None) -> QRResult:
-    """Computes QR decomposition of a matrix or batch of matrices."""
+    """QR decomposition of a matrix or batch of matrices (`mode` "reduced" or "complete"). Computed in Rust: by the
+    differentiable Householder QR when `A` requires grad (reduced, m >= n), otherwise by LAPACK-convention Householder
+    reflections (any shape; signs agree with NumPy and PyTorch)."""
     if mode not in ("reduced", "complete", "economic"):
         raise ValueError(f"unsupported qr mode {mode!r} (expected 'reduced', 'complete' or 'economic')")
-    if isinstance(A, Tensor) and mode in ("reduced", "economic") and A.requires_grad:
+    A = _as_t(A)
+    if mode in ("reduced", "economic") and A.requires_grad and A.shape[-2] >= A.shape[-1]:
         q, r = A.qr()
     else:
-        arr = _to_np(A)
-        np_mode = "reduced" if mode in ("reduced", "economic") else "complete"
-        q_np, r_np = np.linalg.qr(arr, mode=np_mode)
-        q = _wrap(q_np, like=A)
-        r = _wrap(r_np, like=A)
+        from .oxideon import _qr
+        q, r = _qr(A, mode == "complete")
     if out is not None:
         out[0].zero_()
         out[0].add_(q)
@@ -312,15 +336,21 @@ def qr(A: Tensor, mode: str = "reduced", *, out: Optional[Tuple[Tensor, Tensor]]
 
 
 def svd(A: Tensor, full_matrices: bool = True, *, out: Optional[Tuple[Tensor, Tensor, Tensor]] = None) -> SVDResult:
-    """Computes the Singular Value Decomposition (SVD): A = U @ diag(S) @ Vh."""
-    if isinstance(A, Tensor) and (not full_matrices or (A.ndim >= 2 and A.shape[-2] == A.shape[-1])):
-        u, s, vh = A.svd()
-    else:
-        arr = _to_np(A)
-        u_np, s_np, vh_np = np.linalg.svd(arr, full_matrices=full_matrices)
-        u = _wrap(u_np, like=A)
-        s = _wrap(s_np, like=A)
-        vh = _wrap(vh_np, like=A)
+    """Singular value decomposition A = U @ diag(S) @ Vh (computed in Rust). With `full_matrices` on a non-square
+    matrix, U (or Vh) is completed to a square orthogonal matrix by a complete QR of its columns."""
+    A = _as_t(A)
+    u, s, vh = A.svd()
+    m, n = int(A.shape[-2]), int(A.shape[-1])
+    if full_matrices and m != n:
+        from .oxideon import _qr, cat
+        if m > n:
+            q, _ = _qr(u.detach(), True)
+            u = cat([u, q.narrow(len(q.shape) - 1, n, m - n)], len(u.shape) - 1)
+        else:
+            v = vh.transpose(-2, -1)
+            q, _ = _qr(v.detach(), True)
+            v = cat([v, q.narrow(len(q.shape) - 1, m, n - m)], len(v.shape) - 1)
+            vh = v.transpose(-2, -1).contiguous()
     if out is not None:
         out[0].zero_()
         out[0].add_(u)
@@ -347,12 +377,19 @@ def svdvals(A: Tensor, *, out: Optional[Tensor] = None) -> Tensor:
     return res
 
 
+def _complex_or_real(re: Tensor, im: Tensor) -> Tensor:
+    """re + i im, as a real tensor when every imaginary part is zero (as the previous NumPy-based version did)."""
+    if not bool((im != 0).any().item()):
+        return re
+    return _wrap(re.to_numpy() + 1j * im.to_numpy())
+
+
 def eig(A: Tensor, *, out: Optional[Tuple[Tensor, Tensor]] = None) -> EigResult:
-    """Computes the eigenvalues and right eigenvectors of a square matrix."""
-    arr = _to_np(A)
-    w_np, v_np = np.linalg.eig(arr)
-    w = _wrap(w_np.real if np.isrealobj(arr) and np.all(np.isreal(w_np)) else w_np, like=A)
-    v = _wrap(v_np.real if np.isrealobj(arr) and np.all(np.isreal(v_np)) else v_np, like=A)
+    """Eigenvalues and right (unit-norm) eigenvectors of a general square matrix, computed in Rust; complex results
+    come back complex, real ones real."""
+    wr, wi, vr, vi = _as_t(A).eig()
+    w = _complex_or_real(wr, wi)
+    v = _complex_or_real(vr, vi)
     if out is not None:
         out[0].zero_()
         out[0].add_(w)
@@ -381,10 +418,9 @@ def eigh(A: Tensor, UPLO: str = "L", *, out: Optional[Tuple[Tensor, Tensor]] = N
 
 
 def eigvals(A: Tensor, *, out: Optional[Tensor] = None) -> Tensor:
-    """Computes the eigenvalues of a square matrix."""
-    arr = _to_np(A)
-    w_np = np.linalg.eigvals(arr)
-    res = _wrap(w_np.real if np.isrealobj(arr) and np.all(np.isreal(w_np)) else w_np, like=A)
+    """Eigenvalues of a general square matrix, computed in Rust (complex when any is complex)."""
+    wr, wi = _as_t(A).eigvals()
+    res = _complex_or_real(wr, wi)
     if out is not None:
         out.zero_()
         out.add_(res)
@@ -481,7 +517,7 @@ def matrix_power(A: Tensor, n: int, *, out: Optional[Tensor] = None) -> Tensor:
         if n >= 0 and hasattr(A, "matrix_power"):
             res = A.matrix_power(int(n))
         elif n == 0:
-            eye = from_numpy(np.ascontiguousarray(np.eye(A.shape[-1], dtype=np.float32))).to(dtype=A.dtype, device=A.device).expand(A.shape)
+            eye = from_numpy(_contig(np.eye(A.shape[-1], dtype=np.float32))).to(dtype=A.dtype, device=A.device).expand(A.shape)
             res = eye
         elif n > 0:
             res = A
@@ -607,7 +643,7 @@ def matrix_rank(
         if s.numel() == 0:
             res = from_numpy(np.zeros(A.shape[:-2], dtype=np.int64)).to(device=A.device)
         else:
-            smax = s.max(dim=-1, keepdim=True)
+            smax = s.max(dim=-1, keepdim=True).values
             if isinstance(smax, tuple):
                 smax = smax[0]
             if atol is None and rtol is None:
@@ -676,112 +712,28 @@ def diagonal(A: Tensor, offset: int = 0, dim1: int = -2, dim2: int = -1) -> Tens
 
 
 def lu(A: Tensor, pivot: bool = True) -> Tuple[Tensor, Tensor, Tensor]:
-    """Computes the LU decomposition with partial pivoting: P @ L @ U = A."""
-    arr = _to_np(A)
-    try:
-        import scipy.linalg as sla
-        p, l, u = sla.lu(arr)
-        return _wrap(p, like=A), _wrap(l, like=A), _wrap(u, like=A)
-    except Exception:
-        n = arr.shape[-1]
-        m = arr.shape[-2]
-        k = min(m, n)
-        u = arr.copy().astype(np.float64)
-        l = np.eye(m, k, dtype=np.float64)
-        p = np.eye(m, dtype=np.float64)
-        for i in range(min(m, n)):
-            if pivot:
-                max_row = i + np.argmax(np.abs(u[i:, i]))
-                if max_row != i:
-                    u[[i, max_row]] = u[[max_row, i]]
-                    p[[i, max_row]] = p[[max_row, i]]
-                    if i > 0:
-                        l[[i, max_row], :i] = l[[max_row, i], :i]
-            for j in range(i + 1, m):
-                if abs(u[i, i]) > 1e-15:
-                    factor = u[j, i] / u[i, i]
-                    l[j, i] = factor
-                    u[j, i:] -= factor * u[i, i:]
-        return _wrap(p, like=A), _wrap(l, like=A), _wrap(u[:k, :], like=A)
+    """The LU decomposition with partial pivoting, A = P @ L @ U (computed in Rust)."""
+    if not pivot:
+        raise NotImplementedError("lu: pivot=False is not supported")
+    return _as_t(A).lu()
 
 
 def lu_factor(A: Tensor, pivot: bool = True) -> Tuple[Tensor, Tensor]:
-    """Computes the compact LU factorization and pivot indices of a matrix."""
-    arr = _to_np(A)
-    try:
-        import scipy.linalg as sla
-        lu_mat, piv = sla.lu_factor(arr)
-        return _wrap(lu_mat, like=A), _wrap(piv, like=A)
-    except Exception:
-        # No-scipy convention: pivots are a plain row-permutation array
-        # (row i of P @ A is row piv[i] of A), unlike LAPACK's swap list.
-        p, l, u = lu(A, pivot=pivot)
-        p_arr, l_arr, u_arr = _to_np(p), _to_np(l), _to_np(u)
-        lu_mat = u_arr + l_arr - np.eye(arr.shape[-1])
-        piv = np.argmax(p_arr, axis=1).astype(np.int32)
-        return _wrap(lu_mat, like=A), _wrap(piv, like=A)
+    """The compact LU factorization with partial pivoting, as `torch.linalg.lu_factor`: `LU` holds L (unit diagonal,
+    below) and U (on and above the diagonal), `pivots` the 1-based row interchanges (int32). Batched input is
+    supported. Computed in Rust (LAPACK getrf)."""
+    if not pivot:
+        raise NotImplementedError("lu_factor: pivot=False is not supported")
+    from .oxideon import _lu_factor_ex
+    lu, piv, _ = _lu_factor_ex(_as_t(A))
+    return lu, piv
 
 
 def lu_solve(LU: Tensor, pivots: Tensor, B: Tensor, *, left: bool = True, out: Optional[Tensor] = None) -> Tensor:
-    """Solves the system of linear equations A @ X = B given the LU factorization."""
-    if isinstance(LU, Tensor) and isinstance(B, Tensor) and hasattr(LU, "triangular_solve"):
-        n = LU.shape[-1]
-        piv_np = np.asarray(_to_np(pivots)).astype(np.int64).reshape(-1)
-        try:
-            import scipy.linalg as _sla  # noqa: F401
-            perm = list(range(n))
-            for i, p in enumerate(piv_np):
-                pi = int(p)
-                perm[i], perm[pi] = perm[pi], perm[i]
-        except Exception:
-            perm = [int(v) for v in piv_np]
-        p_mat_np = np.zeros((n, n), dtype=np.float64)
-        for i, j in enumerate(perm):
-            p_mat_np[i, j] = 1.0
-        eye_n = from_numpy(np.eye(n, dtype=np.float64)).to_dtype(LU.dtype).to(device=LU.device)
-        L = LU.tril(-1) + eye_n
-        U = LU.triu(0)
-        b_eff = B.to_dtype(LU.dtype) if B.dtype != LU.dtype else B
-        p_mat = from_numpy(p_mat_np).to_dtype(LU.dtype).to(device=B.device)
-        if left:
-            pb = p_mat.matmul(b_eff) if b_eff.ndim >= 2 else p_mat.matmul(b_eff.unsqueeze(-1)).squeeze(-1)
-            y = solve_triangular(L, pb, upper=False, unitriangular=True)
-            res = solve_triangular(U, y, upper=True)
-        else:
-            bt = b_eff.transpose(-2, -1)
-            y = U.triangular_solve(bt, False, True)
-            z = L.triangular_solve(y, True, True)
-            res = p_mat.transpose(-2, -1).matmul(z).transpose(-2, -1)
-        if res.dtype != B.dtype:
-            res = res.to_dtype(B.dtype)
-        if out is not None:
-            out.zero_()
-            out.add_(res)
-            return out
-        return res
-
-    lu_arr = _to_np(LU)
-    piv_arr = _to_np(pivots)
-    b_arr = _to_np(B)
-    try:
-        import scipy.linalg as sla
-        res_np = sla.lu_solve((lu_arr, piv_arr.astype(np.int32)), b_arr)
-    except Exception:
-        # Pairs with the no-scipy lu_factor above: pivots are a row
-        # permutation with P @ A = L @ U and (P @ B)[i] = B[piv[i]].
-        n = lu_arr.shape[-1]
-        l = np.tril(lu_arr, -1) + np.eye(n)
-        u = np.triu(lu_arr)
-        piv = np.asarray(piv_arr).astype(np.int64).reshape(-1)
-        if left:
-            pb = b_arr[piv] if b_arr.ndim == 1 else b_arr[piv, :]
-            res_np = np.linalg.solve(l @ u, pb)
-        else:
-            inv = np.empty_like(piv)
-            inv[piv] = np.arange(n)
-            a_full = (l @ u)[inv]
-            res_np = np.swapaxes(np.linalg.solve(np.swapaxes(a_full, -2, -1), np.swapaxes(b_arr, -2, -1)), -2, -1)
-    res = _wrap(res_np, like=B)
+    """Solves A X = B (or X A = B with left=False) from `lu_factor`'s result (1-based pivots, as in PyTorch).
+    Computed in Rust (LAPACK getrs); batched factors are supported."""
+    from .oxideon import _lu_solve
+    res = _lu_solve(_as_t(LU), _as_t(pivots), _as_t(B), left)
     if out is not None:
         out.zero_()
         out.add_(res)
@@ -936,4 +888,124 @@ __all__ = [
     "SlogdetResult",
     "EigResult",
     "LstsqResult",
+]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# *_ex variants (error codes instead of exceptions), LDL^T (Bunch-Kaufman), matrix_sqrth, polar, matmul
+# ---------------------------------------------------------------------------------------------------------------------
+
+CholeskyExResult = namedtuple("CholeskyExResult", ["L", "info"])
+InvExResult = namedtuple("InvExResult", ["inverse", "info"])
+SolveExResult = namedtuple("SolveExResult", ["result", "info"])
+LUFactorExResult = namedtuple("LUFactorExResult", ["LU", "pivots", "info"])
+LDLFactorResult = namedtuple("LDLFactorResult", ["LD", "pivots"])
+LDLFactorExResult = namedtuple("LDLFactorExResult", ["LD", "pivots", "info"])
+PolarResult = namedtuple("PolarResult", ["U", "P"])
+
+
+def _raise_if(info: Tensor, check: bool, message: str) -> None:
+    if check and bool((info != 0).any().item()):
+        raise RuntimeError(message)
+
+
+def cholesky_ex(A: Any, *, upper: bool = False, check_errors: bool = False) -> CholeskyExResult:
+    """Cholesky factorization that reports failure in `info` (0, or the order of the first leading minor that is not
+    positive definite) instead of raising, unless `check_errors=True`. Computed in Rust (LAPACK potrf)."""
+    from .oxideon import _cholesky_ex
+    L, info = _cholesky_ex(_as_t(A), upper)
+    _raise_if(info, check_errors, "linalg.cholesky_ex: the input is not positive-definite")
+    return CholeskyExResult(L, info)
+
+
+def inv_ex(A: Any, *, check_errors: bool = False) -> InvExResult:
+    """Matrix inverse that reports a singular matrix in `info` (1 + the index of the zero pivot) instead of raising.
+    Computed in Rust (LU)."""
+    from .oxideon import _inv_ex
+    inv, info = _inv_ex(_as_t(A))
+    _raise_if(info, check_errors, "linalg.inv_ex: the matrix is singular")
+    return InvExResult(inv, info)
+
+
+def solve_ex(A: Any, B: Any, *, left: bool = True, check_errors: bool = False) -> SolveExResult:
+    """Solves A X = B (or X A = B with left=False), reporting a singular A in `info` instead of raising (its solution
+    is then NaN). Computed in Rust (LU)."""
+    from .oxideon import _solve_ex
+    x, info = _solve_ex(_as_t(A), _as_t(B), left)
+    _raise_if(info, check_errors, "linalg.solve_ex: the matrix A is singular")
+    return SolveExResult(x, info)
+
+
+def lu_factor_ex(A: Any, *, pivot: bool = True, check_errors: bool = False) -> LUFactorExResult:
+    """LU factorization with partial pivoting plus LAPACK's `info` (0, or 1 + the index of an exactly-zero pivot).
+    Computed in Rust (LAPACK getrf)."""
+    if not pivot:
+        raise NotImplementedError("lu_factor_ex: pivot=False is not supported")
+    from .oxideon import _lu_factor_ex
+    lu, piv, info = _lu_factor_ex(_as_t(A))
+    _raise_if(info, check_errors, "linalg.lu_factor_ex: U is singular")
+    return LUFactorExResult(lu, piv, info)
+
+
+def ldl_factor_ex(A: Any, *, hermitian: bool = False, check_errors: bool = False) -> LDLFactorExResult:
+    """The Bunch-Kaufman factorization A = L D L^T of a symmetric (possibly indefinite) matrix, in LAPACK's compact
+    form: `LD` holds L below the diagonal and the 1x1 / 2x2 blocks of D, `pivots` the (1-based) interchanges, negative
+    for a 2x2 block. `info` is 0, or k when D[k-1, k-1] is exactly zero (D singular). Only the lower triangle of A is
+    read. Computed in Rust (LAPACK sytrf)."""
+    from .oxideon import _ldl_factor_ex
+    ld, piv, info = _ldl_factor_ex(_as_t(A))
+    _raise_if(info, check_errors, "linalg.ldl_factor_ex: the factor D is singular")
+    return LDLFactorExResult(ld, piv, info)
+
+
+def ldl_factor(A: Any, *, hermitian: bool = False) -> LDLFactorResult:
+    """`ldl_factor_ex` without the error code (the factorization of a matrix with a singular D is still returned)."""
+    LD, piv, _ = ldl_factor_ex(A, hermitian=hermitian)
+    return LDLFactorResult(LD, piv)
+
+
+def ldl_solve(LD: Any, pivots: Any, B: Any, *, hermitian: bool = False) -> Tensor:
+    """Solves A X = B given the factorization of A from `ldl_factor`. Computed in Rust (LAPACK sytrs)."""
+    from .oxideon import _ldl_solve
+    return _ldl_solve(_as_t(LD), _as_t(pivots), _as_t(B))
+
+
+def _per_matrix(A: Tensor, fn):
+    """Applies fn to every matrix of a [..., n, n] tensor (fn runs Rust tensor operations) and restacks the results."""
+    if len(A.shape) == 2:
+        return fn(A)
+    from .oxideon import stack
+    lead = list(A.shape[:-2])
+    flat = A.reshape([-1] + list(A.shape[-2:]))
+    outs = [fn(flat[i]) for i in range(flat.shape[0])]
+    if isinstance(outs[0], tuple):
+        return tuple(stack([o[j] for o in outs], 0).reshape(lead + list(outs[0][j].shape)) for j in range(len(outs[0])))
+    return stack(outs, 0).reshape(lead + list(outs[0].shape))
+
+
+def matrix_sqrth(A: Any) -> Tensor:
+    """The square root of a symmetric positive semi-definite matrix, V sqrt(max(w, 0)) V^T from its eigendecomposition
+    (computed in Rust; negative eigenvalues are treated as zero)."""
+    def one(m):
+        w, v = m.eigh()
+        return (v * w.clamp_min(0.0).sqrt().reshape([1, -1])).matmul(v.transpose(0, 1))
+    return _per_matrix(_as_t(A), one)
+
+
+def polar(A: Any) -> PolarResult:
+    """The polar decomposition A = U P of a square matrix: U orthogonal, P symmetric positive semi-definite
+    (computed in Rust)."""
+    u, p = _per_matrix(_as_t(A), lambda m: m.polar())
+    return PolarResult(u, p)
+
+
+def matmul(input: Tensor, other: Tensor) -> Tensor:
+    """Matrix product (an alias of `Tensor.matmul`, as `torch.linalg.matmul`)."""
+    return input.matmul(other)
+
+
+__all__ += [
+    "cholesky_ex", "inv_ex", "solve_ex", "lu_factor_ex", "ldl_factor", "ldl_factor_ex", "ldl_solve", "matrix_sqrth",
+    "polar", "matmul", "CholeskyExResult", "InvExResult", "SolveExResult", "LUFactorExResult", "LDLFactorResult",
+    "LDLFactorExResult", "PolarResult",
 ]

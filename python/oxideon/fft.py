@@ -5,9 +5,10 @@ specification, including forward, inverse, real-to-complex, complex-to-real, Her
 frequency calculations, and spectral shift operations.
 """
 
-from typing import Any, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 import math
 import numpy as np
+from ._contig import contig as _contig
 
 from .oxideon import Tensor as _Tensor, from_numpy as _from_numpy
 
@@ -49,9 +50,9 @@ def view_as_real(input: Any) -> Any:
         return input
     if np.iscomplexobj(arr):
         real_arr = np.stack([arr.real, arr.imag], axis=-1)
-        return _from_numpy(np.ascontiguousarray(real_arr, dtype=np.float32))
+        return _from_numpy(_contig(real_arr, dtype=np.float32))
     stacked = np.stack([arr, np.zeros_like(arr)], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def view_as_complex(input: Any) -> Any:
@@ -130,15 +131,15 @@ def fft(
     res = np.fft.fft(arr, n=n, axis=dim, norm=norm)
     if hasattr(input, "is_complex") and input.is_complex():
         from .primitives import complex as _make_complex
-        r = _from_numpy(np.ascontiguousarray(res.real, dtype=np.float32))
-        i = _from_numpy(np.ascontiguousarray(res.imag, dtype=np.float32))
+        r = _from_numpy(_contig(res.real, dtype=np.float32))
+        i = _from_numpy(_contig(res.imag, dtype=np.float32))
         dev = getattr(input, "device", None)
         if dev is not None:
             r = r.to(dev)
             i = i.to(dev)
         return _make_complex(r, i)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def ifft(
@@ -154,15 +155,15 @@ def ifft(
     res = np.fft.ifft(arr, n=n, axis=dim, norm=norm)
     if hasattr(input, "is_complex") and input.is_complex():
         from .primitives import complex as _make_complex
-        r = _from_numpy(np.ascontiguousarray(res.real, dtype=np.float32))
-        i = _from_numpy(np.ascontiguousarray(res.imag, dtype=np.float32))
+        r = _from_numpy(_contig(res.real, dtype=np.float32))
+        i = _from_numpy(_contig(res.imag, dtype=np.float32))
         dev = getattr(input, "device", None)
         if dev is not None:
             r = r.to(dev)
             i = i.to(dev)
         return _make_complex(r, i)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def rfft(
@@ -186,7 +187,7 @@ def rfft(
     arr = _to_np(input)
     res = np.fft.rfft(arr, n=n, axis=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def irfft(
@@ -208,8 +209,8 @@ def irfft(
         t_idx = np.arange(n_fft, dtype=np.float32)[None, :]
         angles = 2.0 * math.pi * (k_idx @ t_idx) / float(n_fft)
         scale = _norm_scale(n_fft, norm, inverse=True)
-        cos_mat = _from_numpy(np.ascontiguousarray(mult * np.cos(angles) * scale, dtype=np.float32))
-        sin_mat = _from_numpy(np.ascontiguousarray(-mult * np.sin(angles) * scale, dtype=np.float32))
+        cos_mat = _from_numpy(_contig(mult * np.cos(angles) * scale, dtype=np.float32))
+        sin_mat = _from_numpy(_contig(-mult * np.sin(angles) * scale, dtype=np.float32))
 
         orig_prefix = list(input.shape[:-2])
         flat = input.reshape([-1, k_freqs, 2])
@@ -220,7 +221,7 @@ def irfft(
 
     arr = _to_complex_np(input)
     res = np.fft.irfft(arr, n=n, axis=dim, norm=norm)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32))
+    return _from_numpy(_contig(res, dtype=np.float32))
 
 
 def fft2(
@@ -243,7 +244,7 @@ def fft2(
     arr = _to_complex_np(input)
     res = np.fft.fft2(arr, s=s, axes=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def ifft2(
@@ -266,7 +267,7 @@ def ifft2(
     arr = _to_complex_np(input)
     res = np.fft.ifft2(arr, s=s, axes=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def rfft2(
@@ -283,7 +284,7 @@ def rfft2(
     arr = _to_np(input)
     res = np.fft.rfft2(arr, s=s, axes=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def irfft2(
@@ -295,7 +296,7 @@ def irfft2(
     """Computes the inverse of rfft2, returning a purely real-valued tensor."""
     arr = _to_complex_np(input)
     res = np.fft.irfft2(arr, s=s, axes=dim, norm=norm)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32))
+    return _from_numpy(_contig(res, dtype=np.float32))
 
 
 def fftn(
@@ -308,7 +309,7 @@ def fftn(
     arr = _to_complex_np(input)
     res = np.fft.fftn(arr, s=s, axes=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def ifftn(
@@ -321,7 +322,7 @@ def ifftn(
     arr = _to_complex_np(input)
     res = np.fft.ifftn(arr, s=s, axes=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def rfftn(
@@ -334,7 +335,7 @@ def rfftn(
     arr = _to_np(input)
     res = np.fft.rfftn(arr, s=s, axes=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def irfftn(
@@ -346,7 +347,7 @@ def irfftn(
     """Computes the inverse of rfftn, returning a purely real-valued tensor."""
     arr = _to_complex_np(input)
     res = np.fft.irfftn(arr, s=s, axes=dim, norm=norm)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32))
+    return _from_numpy(_contig(res, dtype=np.float32))
 
 
 def hfft(
@@ -358,7 +359,7 @@ def hfft(
     """Computes the 1D discrete Fourier transform of an Hermitian symmetric input."""
     arr = _to_complex_np(input)
     res = np.fft.hfft(arr, n=n, axis=dim, norm=norm)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32))
+    return _from_numpy(_contig(res, dtype=np.float32))
 
 
 def ihfft(
@@ -371,33 +372,33 @@ def ihfft(
     arr = _to_np(input)
     res = np.fft.ihfft(arr, n=n, axis=dim, norm=norm)
     stacked = np.stack([res.real, res.imag], axis=-1)
-    return _from_numpy(np.ascontiguousarray(stacked, dtype=np.float32))
+    return _from_numpy(_contig(stacked, dtype=np.float32))
 
 
 def fftfreq(n: int, d: float = 1.0, dtype: Optional[Any] = None, device: Optional[Any] = None) -> _Tensor:
     """Computes the discrete Fourier transform sample frequencies."""
     arr = np.fft.fftfreq(n, d=d)
-    return _from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+    return _from_numpy(_contig(arr, dtype=np.float32))
 
 
 def rfftfreq(n: int, d: float = 1.0, dtype: Optional[Any] = None, device: Optional[Any] = None) -> _Tensor:
     """Computes the sample frequencies for rfft."""
     arr = np.fft.rfftfreq(n, d=d)
-    return _from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+    return _from_numpy(_contig(arr, dtype=np.float32))
 
 
 def fftshift(input: _Tensor, dim: Optional[Union[int, Sequence[int]]] = None) -> _Tensor:
     """Shifts the zero-frequency component to the center of the spectrum."""
     arr = _to_np(input)
     res = np.fft.fftshift(arr, axes=dim)
-    return _from_numpy(np.ascontiguousarray(res, dtype=arr.dtype))
+    return _from_numpy(_contig(res, dtype=arr.dtype))
 
 
 def ifftshift(input: _Tensor, dim: Optional[Union[int, Sequence[int]]] = None) -> _Tensor:
     """Inverse of fftshift."""
     arr = _to_np(input)
     res = np.fft.ifftshift(arr, axes=dim)
-    return _from_numpy(np.ascontiguousarray(res, dtype=arr.dtype))
+    return _from_numpy(_contig(res, dtype=arr.dtype))
 
 
 __all__ = [
@@ -422,3 +423,130 @@ __all__ = [
     "view_as_real",
     "view_as_complex",
 ]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Multi-dimensional Hermitian FFTs (complex values are stored as a trailing (real, imag) dimension, as elsewhere here)
+# ---------------------------------------------------------------------------------------------------------------------
+
+_SWAP_NORM = {None: "forward", "backward": "forward", "forward": "backward", "ortho": "ortho"}
+
+
+def _check_norm(norm: Optional[str]) -> None:
+    if norm not in _SWAP_NORM:
+        raise ValueError(f"Invalid normalization mode: {norm!r}")
+
+
+def _cplx(x: _Tensor) -> _Tensor:
+    """A real tensor as complex (real, imag) pairs."""
+    from .oxideon import stack
+    return stack([x, x * 0.0], -1)
+
+
+def _conj(c: _Tensor) -> _Tensor:
+    return c * _from_numpy(np.array([1.0, -1.0], dtype=np.float32)).to_dtype(c.dtype)
+
+
+def _fft_axis(c: _Tensor, axis: int, inverse: bool) -> _Tensor:
+    """The (Rust) 1-D complex FFT of `c` ((real, imag) pairs in the last dimension) along complex axis `axis`,
+    unnormalized in both directions."""
+    nd = len(c.shape) - 1
+    perm = [i for i in range(nd) if i != axis] + [axis, nd]
+    inv = [0] * (nd + 1)
+    for i, p in enumerate(perm):
+        inv[p] = i
+    moved = c.permute(perm).contiguous()
+    out = moved.ifft() * float(c.shape[axis]) if inverse else moved.fft()
+    return out.permute(inv).contiguous()
+
+
+def _fit(c: _Tensor, axis: int, size: int) -> _Tensor:
+    """Crops or zero-pads complex axis `axis` of `c` to `size`."""
+    from .oxideon import cat
+    n = int(c.shape[axis])
+    if n == size:
+        return c
+    if n > size:
+        return c.narrow(axis, 0, size).contiguous()
+    shape = list(c.shape)
+    shape[axis] = size - n
+    return cat([c, _from_numpy(np.zeros(tuple(shape), dtype=np.float32)).to_dtype(c.dtype)], axis)
+
+
+def _dims(nd: int, s: Optional[Sequence[int]], dim: Optional[Sequence[int]]) -> List[int]:
+    if dim is not None:
+        return [d % nd for d in (dim if isinstance(dim, (list, tuple)) else [dim])]
+    if s is not None:
+        return list(range(nd - len(s), nd))
+    return list(range(nd))
+
+
+def _scale(norm: Optional[str], n: int, forward_direction: bool) -> float:
+    """The normalization factor: "backward" (the default) leaves forward transforms unscaled and divides inverse ones
+    by n, "forward" does the opposite, "ortho" divides both by sqrt(n)."""
+    if norm == "ortho":
+        return 1.0 / math.sqrt(n)
+    backward = norm in (None, "backward")
+    return 1.0 if backward == forward_direction else 1.0 / n
+
+
+def hfftn(input: _Tensor, s: Optional[Sequence[int]] = None, dim: Optional[Sequence[int]] = None, norm: Optional[str] = None) -> _Tensor:
+    """The N-dimensional FFT of a Hermitian-symmetric signal given by its one-sided half (the last dimension in `dim`
+    holds n // 2 + 1 values); the result is real. The inverse of `ihfftn`. Computed with the Rust FFT."""
+    _check_norm(norm)
+    from .oxideon import cat
+    x = input if isinstance(input, _Tensor) else _from_numpy(_contig(_to_np(input)))
+    if not (len(x.shape) >= 1 and x.shape[-1] == 2):
+        x = _cplx(x)
+    x = x.double()
+    nd = len(x.shape) - 1
+    dims = _dims(nd, s, dim)
+    last = dims[-1]
+    sizes = [int(v) for v in s] if s is not None else [int(x.shape[d]) for d in dims[:-1]] + [2 * (int(x.shape[last]) - 1)]
+    if sizes[-1] < 1:
+        raise ValueError(f"Invalid number of data points ({sizes[-1]}) specified")
+    c = _conj(x)
+    for d, n in zip(dims[:-1], sizes[:-1]):
+        c = _fft_axis(_fit(c, d, n), d, inverse=True)
+    n_last = sizes[-1]
+    m = n_last // 2 + 1
+    c = _fit(c, last, m)
+    if n_last - m > 0:
+        idx = _from_numpy(np.arange(n_last - m, 0, -1, dtype=np.int64))
+        c = cat([c, _conj(c.index_select(last, idx))], last)
+    y = _fft_axis(c, last, inverse=True)
+    real = y.narrow(len(y.shape) - 1, 0, 1).reshape(list(y.shape[:-1]))
+    total = int(np.prod(sizes))
+    out = real * _scale(norm, total, forward_direction=True)  # hfftn is a forward transform
+    return out.float() if input.dtype != "f64" else out
+
+
+def hfft2(input: _Tensor, s: Optional[Sequence[int]] = None, dim: Sequence[int] = (-2, -1), norm: Optional[str] = None) -> _Tensor:
+    """`hfftn` over two dimensions (the last two by default)."""
+    return hfftn(input, s=s, dim=dim, norm=norm)
+
+
+def ihfftn(input: _Tensor, s: Optional[Sequence[int]] = None, dim: Optional[Sequence[int]] = None, norm: Optional[str] = None) -> _Tensor:
+    """The N-dimensional inverse FFT of a real signal, returning only the non-redundant half of the last dimension in
+    `dim` (as (real, imag) pairs). The inverse of `hfftn`. Computed with the Rust FFT."""
+    _check_norm(norm)
+    x = input if isinstance(input, _Tensor) else _from_numpy(_contig(_to_np(input)))
+    c = _cplx(x.double())
+    nd = len(c.shape) - 1
+    dims = _dims(nd, s, dim)
+    sizes = [int(v) for v in s] if s is not None else [int(c.shape[d]) for d in dims]
+    for d, n in zip(dims, sizes):
+        c = _fft_axis(_fit(c, d, n), d, inverse=False)
+    last = dims[-1]
+    c = c.narrow(last, 0, sizes[-1] // 2 + 1).contiguous()
+    total = int(np.prod(sizes))
+    out = _conj(c) * _scale(norm, total, forward_direction=False)  # ihfftn is an inverse transform
+    return out.float() if x.dtype != "f64" else out
+
+
+def ihfft2(input: _Tensor, s: Optional[Sequence[int]] = None, dim: Sequence[int] = (-2, -1), norm: Optional[str] = None) -> _Tensor:
+    """`ihfftn` over two dimensions (the last two by default)."""
+    return ihfftn(input, s=s, dim=dim, norm=norm)
+
+
+__all__ += ["hfftn", "hfft2", "ihfftn", "ihfft2"]

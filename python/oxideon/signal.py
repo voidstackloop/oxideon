@@ -8,6 +8,7 @@ cross-correlation, convolution, and polyphase resampling.
 import math
 from typing import Any, Optional, Sequence, Tuple, Union, List, Dict
 import numpy as np
+from ._contig import contig as _contig
 
 from .oxideon import Tensor as _Tensor, from_numpy as _from_numpy
 from .primitives import tensor, float32, zeros
@@ -135,7 +136,7 @@ class windows:
         w = np.fft.ifft(W).real
         w = np.roll(w, (M - 1) // 2)
         w = w / np.max(np.abs(w))
-        return _from_numpy(np.ascontiguousarray(w, dtype=np.float32))
+        return _from_numpy(_contig(w, dtype=np.float32))
 
 
 # Top-level window helpers matching standard PyTorch conventions
@@ -308,7 +309,7 @@ def istft(
     if is_1d:
         out_sig = out_sig[0]
 
-    return _from_numpy(np.ascontiguousarray(out_sig, dtype=np.float32))
+    return _from_numpy(_contig(out_sig, dtype=np.float32))
 
 
 def hilbert(input: _Tensor, n: Optional[int] = None, axis: int = -1) -> _Tensor:
@@ -333,7 +334,7 @@ def hilbert(input: _Tensor, n: Optional[int] = None, axis: int = -1) -> _Tensor:
 
     analytic = np.fft.ifft(X * h, axis=axis)
     real_imag = np.stack([np.real(analytic), np.imag(analytic)], axis=-1)
-    return _from_numpy(np.ascontiguousarray(real_imag, dtype=np.float32))
+    return _from_numpy(_contig(real_imag, dtype=np.float32))
 
 
 def correlate(input: _Tensor, other: _Tensor, mode: str = "valid") -> _Tensor:
@@ -371,7 +372,7 @@ def correlate(input: _Tensor, other: _Tensor, mode: str = "valid") -> _Tensor:
             raise ValueError(f"Batch dimension mismatch: {a.shape} vs {other.to_numpy().shape}")
         res_list = [np.correlate(a_flat[i], b_flat[i], mode=mode) for i in range(len(a_flat))]
         res = np.array(res_list).reshape(*a.shape[:-1], -1)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32))
+    return _from_numpy(_contig(res, dtype=np.float32))
 
 
 def _pad_1d(t: _Tensor, pad_left: int, pad_right: int) -> _Tensor:
@@ -429,7 +430,7 @@ def convolve(input: _Tensor, other: _Tensor, mode: str = "full") -> _Tensor:
             raise ValueError(f"Batch dimension mismatch: {a.shape} vs {other.to_numpy().shape}")
         res_list = [np.convolve(a_flat[i], b_flat[i], mode=mode) for i in range(len(a_flat))]
         res = np.array(res_list).reshape(*a.shape[:-1], -1)
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32))
+    return _from_numpy(_contig(res, dtype=np.float32))
 
 
 def find_peaks(
@@ -492,7 +493,7 @@ def resample_poly(input: _Tensor, up: int, down: int, axis: int = -1) -> _Tensor
 
     # Scaled irfft with target length
     resampled = np.fft.irfft(X, n=target_len, axis=axis) * (float(target_len) / float(orig_len))
-    return _from_numpy(np.ascontiguousarray(resampled, dtype=np.float32))
+    return _from_numpy(_contig(resampled, dtype=np.float32))
 
 
 import sys as _sys

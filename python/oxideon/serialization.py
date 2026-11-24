@@ -224,6 +224,16 @@ def save(
         save_file(obj, path_str, metadata=metadata)
         return
 
+    if path.suffix.lower() not in PICKLE_EXTENSIONS:
+        # `load` only unpickles files with a checkpoint extension, so a pickle written under any other name could never
+        # be read back: store tensor collections as safetensors, refuse the rest.
+        if isinstance(obj, dict) and obj and all(isinstance(v, Tensor) for v in obj.values()):
+            save_file(obj, path_str, metadata=metadata)
+            return
+        raise ValueError(
+            f"save: '{path.name}' would be written with pickle, which load() only reads from "
+            f"{', '.join(sorted(PICKLE_EXTENSIONS))} files; use one of those extensions (or .safetensors for tensors)")
+
     with open(path_str, "wb") as f:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
 

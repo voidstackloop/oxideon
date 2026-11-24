@@ -87,7 +87,7 @@ def test_reductions_with_dim():
     t = sq()
     assert vals(t.sum()) == [10] and vals(t.sum(0)) == [4, 6] and t.sum(1, keepdim=True).shape == [2, 1]
     assert vals(t.sum(dim=1)) == [3, 7] and vals(t.mean(0)) == [2, 3] and vals(t.mean()) == [2.5]
-    assert vals(t.max()) == [4] and vals(t.max(0)) == [3, 4] and vals(t.min(1)) == [1, 3] and vals(t.min()) == [1]
+    assert vals(t.max()) == [4] and vals(t.max(0).values) == [3, 4] and vals(t.min(1).values) == [1, 3] and vals(t.min()) == [1]
     assert t.argmax().item() == 3 and vals(t.argmax(1)) == [1, 1] and vals(t.argmin(0)) == [0, 0]
     assert abs(t.var().item() - 5 / 3) < 1e-4 and abs(t.var(unbiased=False).item() - 1.25) < 1e-4
     assert vals(t.std(0)) == [round(math.sqrt(2), 4)] * 2
@@ -190,7 +190,7 @@ def test_absurd_sizes_raise_instead_of_killing_the_process():
     raises(RuntimeError, lambda: ox.Tensor.zeros([2**40, 2**40]))
     raises(RuntimeError, lambda: ox.Tensor.randn([10**12]))
     raises(RuntimeError, lambda: ox.Tensor.arange(0.0, 1e15, 1.0))
-    raises(RuntimeError, lambda: ox.Tensor.from_i64([1], [1]) / ox.Tensor.from_i64([0], [1]))
+    raises(RuntimeError, lambda: ox.Tensor.from_i64([1], [1]) // ox.Tensor.from_i64([0], [1]))
 
 
 def test_engines_with_absurd_arguments_return_promptly():

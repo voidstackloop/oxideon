@@ -2,6 +2,43 @@
 
 ## 0.1.0 - 2026-11-23
 
+### Added
+- `oxideon.tensor_utils`: 71 PyTorch-named tensor utilities, all exported at the top level and covered by `tests/test_tensor_utils.py`
+  (compared against NumPy and PyTorch): `ravel`, `movedim` / `moveaxis`, `swapaxes` / `swapdims`, `tensor_split`, `hsplit` / `vsplit` /
+  `dsplit`, `broadcast_shapes` / `broadcast_to` / `broadcast_tensors`, `combinations`, `msort`, `lerp`, `float_power`, `addcmul`, `addcdiv`,
+  `signbit`, `gcd`, `lcm`, `ldexp`, `frexp`, `nextafter`, `sgn`, `positive`, `negative`, `trunc` / `fix`, `frac`, `square`, `lgamma`,
+  `mvlgamma`, `logspace`, `vander`, `isnan` / `isinf` / `isfinite` / `isposinf` / `isneginf` / `isreal`, `is_tensor`, `numel`, `result_type`,
+  `logsumexp`, `cumulative_logsumexp`, `var_mean`, `std_mean`, `aminmax`, `count_nonzero`, `renorm`, `scatter_reduce`, `histogramdd`,
+  `chain_matmul`, `matrix_power`, `matrix_exp`, `pinverse`, `cholesky_solve`, `lu`, `det`, `inverse`, `slogdet`, `ger`, the logical
+  (`and` / `or` / `xor` / `not`) and bitwise operators. See [docs/PYTHON_API.md](docs/PYTHON_API.md) section 21.
+- `oxideon.tensor_methods`: 149 PyTorch-style `Tensor` methods, every one checked against PyTorch: method forms (`x.logsumexp(1)`,
+  `x.amax(0)`, `x.movedim(0, -1)`, `x.unique()`, `x.trace()`, ...), comparison and division aliases (`x.gt(y)`, `x.true_divide(y)`,
+  `x.divide(y, rounding_mode="floor")`, `x.dist(y, p)`, ...), and 75 in-place forms (`x.exp_()`, `x.clamp_min_(0)`, `x.lerp_(y, w)`,
+  `x.addcdiv_(a, b, value=)`, ...) that refuse shape changes, float results in integer tensors, tensors that require grad outside
+  `no_grad`, and views (`tests/test_tensor_methods.py`).
+- `oxideon.distributions`: 19 distributions (`Chi2`, `InverseGamma`, `Pareto`, `Kumaraswamy`, `FisherSnedecor`, `GeneralizedPareto`,
+  `NegativeBinomial`, `OneHotCategorical`, `OneHotCategoricalStraightThrough`, `LogitRelaxedBernoulli`, `RelaxedBernoulli`,
+  `ExpRelaxedCategorical`, `RelaxedOneHotCategorical`, `LogisticNormal`, `MixtureSameFamily`, `VonMises`, `Wishart`, `LKJCholesky`,
+  `ExponentialFamily`) and 18 transforms (`Exp`, `Affine`, `Sigmoid`, `Tanh`, `Softplus`, `Abs`, `Power`, `Softmax`, `StickBreaking`,
+  `Compose`, `Independent`, `Reshape`, `Cat`, `Stack`, `CumulativeDistribution`, `CorrCholesky`, `LowerCholesky`, `PositiveDefinite`);
+  `TransformedDistribution` gains `log_prob` and `cdf`; `mean` / `variance` / `stddev` on every distribution with a closed form. All
+  checked against `torch.distributions` (`tests/test_distributions_ext.py`).
+- `oxideon.diagnostics`: `detect_anomaly(model)` (the layer that first produces NaN / Inf, forward or backward), `precision_audit`
+  (float32 error added by each layer, against a float64 run), `estimate_memory`, `lr_find` (learning-rate range test),
+  `check_determinism`, `diff_checkpoints`, `TrainingMonitor` (gradient norms, update ratios, activation statistics, warnings),
+  `hessian_top_eigenvalue` and `hessian_trace` (sharpness). `tests/test_diagnostics.py`.
+- More PyTorch parity, each checked against PyTorch (`tests/test_torch_parity_extra.py`): max pooling with `dilation`, `ceil_mode`
+  and `return_indices` (functional and `nn`, 1-3 D, plus the `*_with_indices` forms; one gather-based implementation replaces the
+  Python window loops: a Rust kernel, parallel over planes, finds the maxima and the values are gathered, so they stay
+  differentiable), `lp_pool3d` / `LPPool3d`, `multi_margin_loss`,
+  `multilabel_margin_loss`, `multilabel_soft_margin_loss`, `triplet_margin_with_distance_loss`, `linear_cross_entropy` /
+  `LinearCrossEntropyLoss`, in-place functional activations, `upsample*`; `linalg.cholesky_ex`, `inv_ex`, `solve_ex`,
+  `lu_factor_ex`, `ldl_factor(_ex)`, `ldl_solve` (new Rust module `oxideon-core/src/lapack.rs`: getrf / getrs / potrf /
+  Bunch-Kaufman sytrf / sytrs with LAPACK's info codes), `matrix_sqrth`, `polar`, `matmul`; `special.hermite_polynomial_he`,
+  `shifted_chebyshev_polynomial_t/u/v/w`, `modified_bessel_i0/i1`; `fft.hfft2/hfftn/ihfft2/ihfftn`; `nn.LazyConv1d/3d`,
+  `LazyConvTranspose1d/2d/3d`, `CrossMapLRN2d`, `Buffer`, `UninitializedParameter`, `UninitializedBuffer`, `RNNCellBase`,
+  `NLLLoss2d`, `Container`; `optim.SparseAdam` (its step runs in Rust); `data.DistributedSampler`, `data.StackDataset`.
+
 ### Speed (accuracy unchanged unless noted)
 - Balanced `gelu` 150 -> 135 us per 1M elements (PyTorch 111 us): the tail exponent `poly - z^2` is never positive, so it uses an `exp` without the
   upper clamp and the NaN restore (a NaN input still gives NaN through `x * cdf`), the 0.5 of the cdf folds into the quotient factor, and
@@ -11,7 +48,35 @@
   (PyTorch 1529 us); 8x16x64x64 665 -> 640-660 us (PyTorch 512 us). Accuracy vs PyTorch (worst / mean): 16 channels 3.05x / 1.55x -> 2.69x /
   1.54x, 64 channels 4.64x / 2.99x -> 4.58x / 2.67x.
 
+### Changed
+- Compute moved from NumPy to Rust: the Python optimizers (`RMSprop`, `Adagrad`, `Adadelta`, `Adamax`, `NAdam`, `RAdam`, `ASGD`,
+  `Lion`, `Lamb`, `Adafactor`, `Rprop`, `SparseAdam`) run their updates in `oxideon-core/src/optim_kernels.rs` and keep their
+  state as tensors (NumPy state from older checkpoints is converted on load), `LBFGS` does its two-loop recursion with tensor
+  operations; `linalg.qr` (any shape, both modes), `svd(full_matrices=True)`, `lu`, `norm`, `pinv`, `eig`, `eigvals` no longer call
+  NumPy; `tensor_utils.gcd` / `lcm` / `frexp` / `ldexp` / `nextafter` / `signbit` / `isposinf` / `isneginf` / `histogramdd` /
+  `logspace`, all orthogonal polynomials (`special.*_polynomial_*`, now also with a tensor degree), the Hermitian FFTs, and the
+  sampling and densities of the new distributions use Rust kernels (`numeric_kernels.rs`, `lapack.rs`, samplers in
+  `distributions_ext.rs`); distribution samples now come from the oxideon generator, so `oxideon.manual_seed` makes them
+  reproducible.
+
 ### Fixes
+- Optimizers that disagreed with PyTorch: `RMSprop` added `eps` inside the square root (`sqrt(v + eps)` instead of
+  `sqrt(v) + eps`), `RAdam` switched to the rectified update at rho > 4 instead of 5 and scaled `eps` differently, `ASGD` never
+  applied its decay `lambd` to the parameters, `Adamax` added `eps` after the max instead of inside it; `Rprop` keyed its state by
+  the tensor instead of its id, so `state_dict` / `load_state_dict` lost it. All now match `torch.optim` step for step
+  (`tests/test_rust_kernels.py`).
+- `linalg.lu_factor` returned LAPACK's 0-based swaps when SciPy was installed and a plain row permutation when it was not, and
+  `lu_solve` guessed which one it got from whether SciPy imports; neither matched PyTorch. Both now use PyTorch's 1-based pivots
+  in every environment (no SciPy needed), work on batches, and accept factors computed by `torch.linalg.lu_factor`.
+- `ox.autograd.grad` ran a backward pass and returned the inputs' `.grad`, so it added to (and returned) gradients left by
+  earlier calls, left `.grad` changed, and made every second derivative wrong (`grad` of `w * w` with `create_graph=True`, then
+  `grad` again, gave 2 + 2w instead of 2). It now uses the native graph traversal: the gradients are returned and `.grad` is not
+  touched, like `torch.autograd.grad` (custom `autograd.Function` outputs keep the old path, now with `.grad` saved and restored).
+- `ox.save(state_dict, "model.weights")`: a file name without a checkpoint extension was written with pickle, which `ox.load`
+  refuses to read from such a name, so the file could never be loaded. Tensor dicts are now written as safetensors; other objects
+  raise an error that names the extensions to use.
+- `oxideon.distributions`: a distribution with scalar parameters (`Normal(0.0, 1.0)`, `HalfNormal(1.0)`, ...) failed in `sample()`
+  (`np.random.randn()` returns a Python float), and scalar results came back with shape `[1]` instead of `[]`.
 - CUDA: `where_cond` with a broadcast mask (kernel declined) returned a host-backed tensor labelled `cuda:0`, so the next matmul failed with
   `device mismatch (cuda:0 vs cuda:0)` (attention with a causal mask on the composed path); it now returns CUDA storage.
 - NVRTC is loaded with the wide-character Windows loader, so it is found under a user directory with non-ASCII characters

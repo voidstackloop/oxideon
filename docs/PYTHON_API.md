@@ -28,6 +28,9 @@
 18. [Canonical Deep Architectures & State Space Models (`ox.models`, `ox.state_space`)](#18-canonical-deep-architectures--state-space-models)
 19. [Signal Processing, 3D Geometry & Video Analytics (`ox.signal`, `ox.geometry`, `ox.video`)](#19-signal-processing-3d-geometry--video-analytics)
 20. [Frontier Optimizers, Loss Functions & Synthetic Data (`ox.optim_ext`, `ox.losses_ext`, `ox.synthetic_data`, `ox.uncertainty_quant`, `ox.interpret`, `ox.func`)](#20-frontier-optimizers-loss-functions--synthetic-data)
+21. [Tensor Utilities (`ox.tensor_utils`)](#21-tensor-utilities-oxtensor_utils)
+22. [Model & Training Diagnostics (`ox.diagnostics`)](#22-model--training-diagnostics-oxdiagnostics)
+23. [More PyTorch Parity (functional, linalg, special, fft, nn, optim, data)](#23-more-pytorch-parity)
 
 ---
 
@@ -671,3 +674,103 @@ Oxideon natively integrates 52 high-level features across 10 flagship systems an
 - `grad(func, argnums=0)`: Computes function gradients w.r.t specified arguments.
 - `jacrev(func, argnums=0)`, `jacfwd`: Reverse-mode and forward-mode Jacobian matrices.
 - `hessian(func, argnums=0)`: Second-order Hessian matrix of scalar functions.
+
+---
+
+## 21. Tensor Utilities (`ox.tensor_utils`)
+
+PyTorch-named helpers, all also available at the top level (`ox.lerp`, `ox.logsumexp`, ...). Those built from tensor
+operations stay differentiable; the ones that go through NumPy (marked *no graph*) return fresh tensors.
+
+- **Shape and layout:** `ravel`, `movedim` / `moveaxis`, `swapaxes` / `swapdims`, `tensor_split`, `hsplit`, `vsplit`, `dsplit`,
+  `broadcast_shapes`, `broadcast_to`, `broadcast_tensors`, `combinations(x, r, with_replacement)`, `msort`.
+- **Elementwise math:** `lerp`, `float_power` (float64), `addcmul`, `addcdiv`, `sgn`, `positive`, `negative`, `trunc` / `fix`,
+  `frac`, `square`, `lgamma`, `mvlgamma`, `signbit`\*, `gcd`\*, `lcm`\*, `ldexp`\*, `frexp`\*, `nextafter`\*, `logspace`, `vander`.
+- **Predicates and metadata:** `isnan`, `isinf`, `isfinite`, `isposinf`, `isneginf`, `isreal`, `is_tensor`, `numel`, `result_type`.
+- **Reductions:** `logsumexp` (several dims, no overflow, differentiable), `cumulative_logsumexp`, `var_mean`, `std_mean`,
+  `aminmax`, `count_nonzero`, `renorm`, `scatter_reduce` (in Rust; `sum` and `mean` differentiable; `prod`, `amax`, `amin`;
+  `include_self`), `histogramdd`\*.
+- **Linear algebra, top-level:** `chain_matmul`, `matrix_power`, `matrix_exp`, `pinverse`, `cholesky_solve`, `lu`, `det`, `inverse`,
+  `slogdet`, `ger`.
+- **Logical and bitwise:** `logical_and` / `or` / `xor` / `not`, `bitwise_and` / `or` / `xor` / `not`.
+
+\* no graph.
+
+### Tensor methods (`ox.tensor_methods`)
+
+Importing oxideon also attaches 149 PyTorch-style methods to `Tensor` (`ox.tensor_methods.ADDED` lists them):
+
+- **Method forms** of the functions above and of `amax`, `amin`, `outer`, `inner`, `dot`, `vdot`, `mv`, `allclose`, `isclose`, `unique`,
+  `unique_consecutive`, `diagflat`, `deg2rad`, `rad2deg`, `histogram`, plus `x.where(cond, y)` and `x.trace()`.
+- **Comparisons and arithmetic:** `eq`, `ne`, `lt`, `le`, `gt`, `ge` and their long names (`greater_equal`, ...), `equal`, `true_divide`,
+  `divide(rounding_mode=None | "trunc" | "floor")`, `floor_divide`, `reciprocal`, `multiply`, `subtract(alpha=)`, `absolute`, `dist(p)`,
+  `new_full`, `reshape_as`, `sum_to_size`, `split_with_sizes`, `is_same_size`, `is_nonzero`, `element_size`.
+- **In-place forms** (`x.exp_()`, `x.clamp_min_(0)`, `x.lerp_(y, 0.1)`, `x.addcmul_(a, b, value=)`, the comparison, logical and bitwise
+  ones, ...). Like PyTorch they keep the shape, refuse a float result in an integer tensor, refuse a tensor that requires grad
+  outside `ox.no_grad()`, and refuse non-contiguous views.
+
+`true_divide` / `divide` follow PyTorch and return a float tensor for integer inputs; note that the `/` operator on two integer
+tensors still truncates (`7 / 2 == 3`).
+
+```python
+import oxideon as ox
+x = ox.randn([4, 8])
+ox.logsumexp(x, (0, 1))                      # a stable log(sum(exp(x)))
+ox.var_mean(x, dim=1, correction=0)          # (biased variance, mean)
+ox.tensor_split(x, [2, 5], dim=1)            # pieces of width 2, 3, 3
+ox.scatter_reduce(ox.zeros([3]), 0, idx, src, "amax", include_self=False)
+```
+
+---
+
+## 22. Model & Training Diagnostics (`ox.diagnostics`)
+
+Layers are observed by temporarily wrapping each child module (native layers included) during the call, so results are
+reported per module; the model is left unchanged.
+
+| Tool | What it answers |
+|---|---|
+| `with detect_anomaly(model): ...` | Which layer first produced NaN / Inf, in the forward or the backward pass (or the loss). Raises `AnomalyError` with `.module` and `.phase`. |
+| `precision_audit(model, *inputs)` | How much float32 error each layer adds, against a float64 run: per module the error in its input, the error it adds on its own, and the total. |
+| `estimate_memory(model, *inputs, optimizer="adam")` | Bytes for parameters, gradients, optimizer state and activations at this batch size. |
+| `lr_find(model, loss_fn, data)` | The learning-rate range test: `suggestion` (one tenth of the lowest-loss rate), a cautious `valley` pick, and the curve. Weights are restored. |
+| `check_determinism(fn, runs=3)` | Whether `fn` (e.g. "build, train 3 steps, return the model") gives bit-identical results under the same seeds, and the first value that differs. |
+| `diff_checkpoints(a, b)` | Tensor-by-tensor diff of two state dicts, models or saved files: changed (with relative change), missing, extra, shape and dtype mismatches. |
+| `TrainingMonitor(model)` | Per step: gradient norms, update-to-weight ratios, activation mean / std, dead ReLU share; `report()` and `warnings()` (vanishing / exploding gradients, too large or tiny updates, dead units, rising loss). |
+| `hessian_top_eigenvalue(model, loss_fn, x, y)`, `hessian_trace(...)` | The sharpness of the loss at the current weights (power iteration and Hutchinson's estimator on Hessian-vector products). |
+
+```python
+from oxideon import diagnostics as dg
+
+with dg.detect_anomaly(model):
+    loss = loss_fn(model(x), y)
+    loss.backward()                    # AnomalyError: backward: SqrtLayer 'block.2' turned a finite gradient ...
+
+print(dg.precision_audit(model, x))    # which layer loses accuracy
+print(dg.estimate_memory(model, x, optimizer="adamw"))
+print(dg.lr_find(model, loss_fn, loader).suggestion)
+```
+
+---
+
+## 23. More PyTorch Parity
+
+Each item behaves like its PyTorch namesake and is checked against it in `tests/test_torch_parity_extra.py`.
+
+- **`ox.functional`:** `max_pool1d/2d/3d` and `adaptive_max_pool1d/2d/3d` now take `dilation`, `ceil_mode` and `return_indices`
+  (indices into the flattened spatial input, as `MaxUnpool` expects), plus the `*_with_indices` forms; `lp_pool3d`;
+  `multi_margin_loss`, `multilabel_margin_loss`, `multilabel_soft_margin_loss`, `triplet_margin_with_distance_loss`,
+  `linear_cross_entropy`; in-place `relu_`, `elu_`, `celu_`, `selu_`, `leaky_relu_`, `hardtanh_`, `threshold_`, `rrelu_`;
+  the deprecated `upsample`, `upsample_nearest`, `upsample_bilinear`.
+- **`ox.linalg`:** `cholesky_ex`, `inv_ex`, `solve_ex`, `lu_factor_ex` (error codes instead of exceptions); `ldl_factor`,
+  `ldl_factor_ex`, `ldl_solve` (Bunch-Kaufman, LAPACK's compact format); `matrix_sqrth`, `polar`, `matmul`. The
+  factorizations and solves run in Rust (`oxideon-core/src/lapack.rs`). `lu_factor` returns
+  PyTorch's 1-based pivots and `lu_solve` expects them, so factors move freely between the two libraries.
+- **`ox.special`:** `hermite_polynomial_he`, `shifted_chebyshev_polynomial_t/u/v/w`, `modified_bessel_i0`, `modified_bessel_i1`.
+- **`ox.fft`:** `hfft2`, `hfftn`, `ihfft2`, `ihfftn` (complex values as a trailing (real, imag) dimension, like the rest of `ox.fft`).
+- **`ox.nn`:** `MaxPool1d/2d/3d` and `AdaptiveMaxPool1d/2d/3d` with the new options, `LPPool3d`, `LazyConv1d`, `LazyConv3d`,
+  `LazyConvTranspose1d/2d/3d`, `CrossMapLRN2d`, `Buffer` (`self.stats = nn.Buffer(t)` registers a buffer),
+  `UninitializedParameter` / `UninitializedBuffer` / `is_lazy`, `RNNCellBase`, `LinearCrossEntropyLoss`, and the deprecated
+  `NLLLoss2d` and `Container`.
+- **`ox.optim.SparseAdam`:** lazy Adam for embedding tables (only rows with a non-zero gradient are updated).
+- **`ox.data`:** `DistributedSampler` (with `set_epoch`) and `StackDataset`.

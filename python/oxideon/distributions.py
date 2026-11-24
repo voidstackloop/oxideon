@@ -7,7 +7,15 @@ variational inference, policy gradients, generative modeling, and closed-form KL
 - `Laplace`, `Cauchy`, `Beta`, `Gamma`, `Dirichlet`, `Poisson`
 - `Geometric`, `Gumbel`, `LogNormal`, `StudentT`
 - `MultivariateNormal`, `LowRankMultivariateNormal`
-- `Independent`, `TransformedDistribution`
+- `Independent`, `TransformedDistribution` (with `log_prob` and `cdf` through the transforms)
+- `Chi2`, `InverseGamma`, `Pareto`, `Kumaraswamy`, `FisherSnedecor`, `GeneralizedPareto`, `NegativeBinomial`
+- `OneHotCategorical`, `OneHotCategoricalStraightThrough`, `RelaxedBernoulli`, `RelaxedOneHotCategorical`, `LogisticNormal`
+- `MixtureSameFamily`, `VonMises`, `Wishart`, `LKJCholesky`, `ExponentialFamily` (base)
+- transforms: `ExpTransform`, `AffineTransform`, `SigmoidTransform`, `TanhTransform`, `SoftplusTransform`, `AbsTransform`,
+  `PowerTransform`, `SoftmaxTransform`, `StickBreakingTransform`, `ComposeTransform`, `IndependentTransform`,
+  `ReshapeTransform`, `CatTransform`, `StackTransform`, `CumulativeDistributionTransform`, `CorrCholeskyTransform`,
+  `LowerCholeskyTransform`, `PositiveDefiniteTransform`
+- `mean`, `variance`, `stddev` on every distribution with a closed form
 - `kl_divergence` & `@register_kl`
 """
 
@@ -25,7 +33,9 @@ def _to_np(x: Any) -> np.ndarray:
 
 
 def _wrap(arr: np.ndarray) -> _Tensor:
-    return _from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+    # np.ascontiguousarray would turn a 0-d result into shape (1,); keep scalars scalar, like PyTorch
+    a = np.asarray(arr, dtype=np.float32)
+    return _from_numpy(a if a.flags.c_contiguous else np.ascontiguousarray(a))
 
 
 _KL_REGISTRY: Dict[Tuple[Type, Type], Callable[[Any, Any], _Tensor]] = {}
@@ -109,7 +119,7 @@ class Normal(Distribution):
 
     def rsample(self, sample_shape: Sequence[int] = ()) -> _Tensor:
         shape = tuple(sample_shape) + self.batch_shape
-        eps = np.random.randn(*shape).astype(np.float32)
+        eps = np.random.standard_normal(shape).astype(np.float32)
         if (isinstance(self.loc, _Tensor) and self.loc.requires_grad) or (isinstance(self.scale, _Tensor) and self.scale.requires_grad):
             eps_t = _wrap(eps)
             return self.loc + eps_t * self.scale
@@ -118,7 +128,7 @@ class Normal(Distribution):
 
     def sample(self, sample_shape: Sequence[int] = ()) -> _Tensor:
         shape = tuple(sample_shape) + self.batch_shape
-        eps = np.random.randn(*shape).astype(np.float32)
+        eps = np.random.standard_normal(shape).astype(np.float32)
         res = self.loc_np + eps * self.scale_np
         return _wrap(res)
 
@@ -746,7 +756,7 @@ class MultivariateNormal(Distribution):
 
     def rsample(self, sample_shape: Sequence[int] = ()) -> _Tensor:
         shape = tuple(sample_shape) + self.batch_shape + self.event_shape
-        eps = np.random.randn(*shape).astype(np.float32)
+        eps = np.random.standard_normal(shape).astype(np.float32)
         if self._has_grad():
             eps_t = _wrap(eps)
             return eps_t.unsqueeze(-2).matmul(self.scale_tril.transpose(-2, -1)).squeeze(-2) + self.loc
@@ -827,7 +837,7 @@ class StudentT(Distribution):
 
     def rsample(self, sample_shape: Sequence[int] = ()) -> _Tensor:
         shape = tuple(sample_shape) + self.batch_shape
-        z = np.random.randn(*shape).astype(np.float32)
+        z = np.random.standard_normal(shape).astype(np.float32)
         v = np.random.gamma(self.df_np / 2.0, 2.0 / self.df_np, size=shape).astype(np.float32)
         res = self.loc_np + self.scale_np * (z / np.sqrt(np.maximum(v, 1e-12)))
         return _wrap(res)
@@ -1089,7 +1099,7 @@ class HalfNormal(Distribution):
 
     def rsample(self, sample_shape: Sequence[int] = ()) -> _Tensor:
         shape = tuple(sample_shape) + self._batch_shape
-        eps = np.abs(np.random.randn(*shape)).astype(np.float32)
+        eps = np.abs(np.random.standard_normal(shape)).astype(np.float32)
         if isinstance(self.scale, _Tensor) and self.scale.requires_grad:
             return _wrap(eps) * self.scale
         return _wrap(eps * self.scale_np)
@@ -1225,4 +1235,1492 @@ __all__ = [
     "ContinuousBernoulli",
     "kl_divergence",
     "register_kl",
+]
+
+
+# ---------------------------------------------------------------------------
+# mean / variance / stddev of the distributions above
+# ---------------------------------------------------------------------------
+
+def _stddev(self) -> _Tensor:
+    return _wrap(np.sqrt(_to_np(self.variance)))
+
+
+def _no_moment(name):
+    def get(self):
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form {name}")
+    return property(get)
+
+
+Distribution.stddev = property(_stddev)
+Distribution.mean = _no_moment("mean")
+Distribution.variance = _no_moment("variance")
+
+
+def _moments(cls, mean, variance):
+    cls.mean = property(lambda self: _wrap(np.asarray(mean(self), dtype=np.float64)))
+    cls.variance = property(lambda self: _wrap(np.asarray(variance(self), dtype=np.float64)))
+
+
+def _lg(x):
+    from math import lgamma
+    return np.vectorize(lgamma, otypes=[np.float64])(np.asarray(x, dtype=np.float64))
+
+
+def _dg(x):
+    from .special import digamma
+    return np.asarray(_to_np(digamma(_wrap(np.asarray(x, dtype=np.float64)))), dtype=np.float64)
+
+
+_EULER = 0.5772156649015329
+_moments(Normal, lambda d: d.loc_np, lambda d: d.scale_np ** 2)
+_moments(Bernoulli, lambda d: d.probs_np, lambda d: d.probs_np * (1 - d.probs_np))
+_moments(Uniform, lambda d: (d.low_np + d.high_np) / 2, lambda d: (d.high_np - d.low_np) ** 2 / 12)
+_moments(Exponential, lambda d: 1 / d.rate_np, lambda d: d.rate_np ** -2.0)
+_moments(Laplace, lambda d: d.loc_np, lambda d: 2 * d.scale_np ** 2)
+_moments(Cauchy, lambda d: np.full(d.batch_shape, np.nan), lambda d: np.full(d.batch_shape, np.inf))
+_moments(Beta, lambda d: d.alpha_np / (d.alpha_np + d.beta_np),
+         lambda d: d.alpha_np * d.beta_np / ((d.alpha_np + d.beta_np) ** 2 * (d.alpha_np + d.beta_np + 1)))
+_moments(Gamma, lambda d: d.c_np / d.r_np, lambda d: d.c_np / d.r_np ** 2)
+_moments(Dirichlet, lambda d: d.conc_np / d.conc_np.sum(-1, keepdims=True),
+         lambda d: (lambda a, a0: a * (a0 - a) / (a0 ** 2 * (a0 + 1)))(d.conc_np, d.conc_np.sum(-1, keepdims=True)))
+_moments(Poisson, lambda d: d.rate_np, lambda d: d.rate_np)
+_moments(Geometric, lambda d: 1 / d.probs_np - 1, lambda d: (1 / d.probs_np - 1) / d.probs_np)
+_moments(Gumbel, lambda d: d.loc_np + d.scale_np * _EULER, lambda d: (math.pi * d.scale_np) ** 2 / 6)
+_moments(LogNormal, lambda d: np.exp(d.base.loc_np + d.base.scale_np ** 2 / 2),
+         lambda d: (np.exp(d.base.scale_np ** 2) - 1) * np.exp(2 * d.base.loc_np + d.base.scale_np ** 2))
+_moments(MultivariateNormal, lambda d: np.broadcast_to(d.loc_np, d.batch_shape + d.event_shape),
+         lambda d: np.broadcast_to(np.diagonal(d.cov_np, axis1=-2, axis2=-1), d.batch_shape + d.event_shape))
+_moments(StudentT, lambda d: np.where(d.df_np > 1, d.loc_np, np.nan),
+         lambda d: np.where(d.df_np > 2, d.scale_np ** 2 * d.df_np / np.where(d.df_np > 2, d.df_np - 2, 1),
+                            np.where(d.df_np > 1, np.inf, np.nan)))
+_moments(Binomial, lambda d: d.count_np * d.probs_np, lambda d: d.count_np * d.probs_np * (1 - d.probs_np))
+_moments(Multinomial, lambda d: d.total_count * d.probs_np, lambda d: d.total_count * d.probs_np * (1 - d.probs_np))
+_moments(HalfNormal, lambda d: d.scale_np * math.sqrt(2 / math.pi), lambda d: d.scale_np ** 2 * (1 - 2 / math.pi))
+_moments(HalfCauchy, lambda d: np.full(np.shape(d.scale_np), np.inf), lambda d: np.full(np.shape(d.scale_np), np.inf))
+_moments(Weibull, lambda d: d.scale_np * np.exp(_lg(1 + 1 / d.conc_np)),
+         lambda d: d.scale_np ** 2 * (np.exp(_lg(1 + 2 / d.conc_np)) - np.exp(2 * _lg(1 + 1 / d.conc_np))))
+
+
+def _lowrank_variance(d):
+    return (d.w_np ** 2).sum(-1) + d.d_np
+
+
+_moments(LowRankMultivariateNormal, lambda d: d.loc_np, _lowrank_variance)
+
+
+# ---------------------------------------------------------------------------
+# Transforms
+# ---------------------------------------------------------------------------
+
+def _as_t(x: Any) -> _Tensor:
+    return x if isinstance(x, _Tensor) else _wrap(np.asarray(x, dtype=np.float32))
+
+
+def _sum_rightmost(x: _Tensor, n: int) -> _Tensor:
+    for _ in range(n):
+        x = x.sum(-1)
+    return x
+
+
+def _softplus(x: _Tensor) -> _Tensor:
+    # log(1 + exp(x)) without overflow
+    return x.clamp_min(0.0) + (-(x.abs())).exp().log1p()
+
+
+class Transform:
+    """A differentiable map `y = t(x)` with `t.inv(y)` and, for bijections, `log_abs_det_jacobian(x, y)`.
+
+    `event_dim` is how many rightmost dimensions form one event (0 for elementwise maps)."""
+
+    bijective = True
+    event_dim = 0
+    sign = 1
+
+    def __call__(self, x: Any) -> _Tensor:
+        return self._call(_as_t(x))
+
+    def _call(self, x: _Tensor) -> _Tensor:
+        raise NotImplementedError
+
+    def _inverse(self, y: _Tensor) -> _Tensor:
+        raise NotImplementedError
+
+    @property
+    def inv(self) -> "Transform":
+        return _InverseTransform(self)
+
+    def log_abs_det_jacobian(self, x: Any, y: Any) -> _Tensor:
+        raise NotImplementedError(f"{type(self).__name__} has no log_abs_det_jacobian")
+
+    def forward_shape(self, shape: Sequence[int]) -> Tuple[int, ...]:
+        return tuple(shape)
+
+    def inverse_shape(self, shape: Sequence[int]) -> Tuple[int, ...]:
+        return tuple(shape)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}()"
+
+
+class _InverseTransform(Transform):
+    def __init__(self, base: Transform):
+        self._base = base
+        self.bijective = base.bijective
+        self.event_dim = base.event_dim
+        self.sign = base.sign
+
+    def _call(self, x):
+        return self._base._inverse(x)
+
+    def _inverse(self, y):
+        return self._base._call(y)
+
+    @property
+    def inv(self):
+        return self._base
+
+    def log_abs_det_jacobian(self, x, y):
+        return -self._base.log_abs_det_jacobian(_as_t(y), _as_t(x))
+
+    def forward_shape(self, shape):
+        return self._base.inverse_shape(shape)
+
+    def inverse_shape(self, shape):
+        return self._base.forward_shape(shape)
+
+
+class ExpTransform(Transform):
+    """y = exp(x)."""
+
+    def _call(self, x):
+        return x.exp()
+
+    def _inverse(self, y):
+        return y.log()
+
+    def log_abs_det_jacobian(self, x, y):
+        return _as_t(x)
+
+
+class AffineTransform(Transform):
+    """y = loc + scale * x (`event_dim` rightmost dimensions are summed in the log-determinant)."""
+
+    def __init__(self, loc: Any, scale: Any, event_dim: int = 0):
+        self.loc, self.scale, self.event_dim = loc, scale, event_dim
+        self.sign = 1 if np.all(_to_np(scale) > 0) else (-1 if np.all(_to_np(scale) < 0) else 0)
+
+    def _call(self, x):
+        return x * self.scale + self.loc
+
+    def _inverse(self, y):
+        return (y - self.loc) / self.scale
+
+    def log_abs_det_jacobian(self, x, y):
+        x = _as_t(x)
+        s = self.scale.abs().log() if isinstance(self.scale, _Tensor) else math.log(abs(float(self.scale)))
+        out = x * 0 + s
+        return _sum_rightmost(out, self.event_dim)
+
+
+class SigmoidTransform(Transform):
+    """y = sigmoid(x)."""
+
+    def _call(self, x):
+        return x.sigmoid()
+
+    def _inverse(self, y):
+        eps = float(np.finfo(np.float32).eps)
+        y = y.clamp(eps, 1 - eps)
+        return y.log() - (-y).log1p()
+
+    def log_abs_det_jacobian(self, x, y):
+        x = _as_t(x)
+        return -_softplus(-x) - _softplus(x)
+
+
+class TanhTransform(Transform):
+    """y = tanh(x)."""
+
+    def _call(self, x):
+        return x.tanh()
+
+    def _inverse(self, y):
+        return ((y.log1p()) - ((-y).log1p())) * 0.5
+
+    def log_abs_det_jacobian(self, x, y):
+        x = _as_t(x)
+        return (math.log(2.0) - x - _softplus(x * -2.0)) * 2.0
+
+
+class SoftplusTransform(Transform):
+    """y = log(1 + exp(x))."""
+
+    def _call(self, x):
+        return _softplus(x)
+
+    def _inverse(self, y):
+        return y + (-((-y).expm1())).log()
+
+    def log_abs_det_jacobian(self, x, y):
+        return -_softplus(-_as_t(x))
+
+
+class AbsTransform(Transform):
+    """y = |x| (not a bijection: `inv` returns the non-negative preimage)."""
+
+    bijective = False
+
+    def _call(self, x):
+        return x.abs()
+
+    def _inverse(self, y):
+        return y
+
+
+class PowerTransform(Transform):
+    """y = x ** exponent, for positive x."""
+
+    def __init__(self, exponent: Any):
+        self.exponent = exponent
+
+    def _call(self, x):
+        return x.pow(self.exponent)
+
+    def _inverse(self, y):
+        return y.pow(1.0 / self.exponent if not isinstance(self.exponent, _Tensor) else self.exponent.reciprocal())
+
+    def log_abs_det_jacobian(self, x, y):
+        x, y = _as_t(x), _as_t(y)
+        return (y * self.exponent / x).abs().log()
+
+
+class SoftmaxTransform(Transform):
+    """y = softmax(x) over the last dimension (not a bijection; `inv` returns log(y))."""
+
+    bijective = False
+    event_dim = 1
+
+    def _call(self, x):
+        return x.softmax(-1)
+
+    def _inverse(self, y):
+        return y.log()
+
+
+def _pad_last(x: _Tensor, value: float, before: bool) -> _Tensor:
+    from .oxideon import cat
+    shape = list(x.shape)
+    shape[-1] = 1
+    pad = _wrap(np.full(shape, value, dtype=np.float32))
+    return cat([pad, x] if before else [x, pad], -1)
+
+
+class StickBreakingTransform(Transform):
+    """Maps a vector in R^(K-1) onto the K-simplex (positive entries summing to 1) by stick breaking."""
+
+    event_dim = 1
+
+    def _offset_log(self, k: int) -> _Tensor:
+        return _wrap(np.log(np.arange(k, 0, -1, dtype=np.float64)))
+
+    def _call(self, x):
+        k = x.shape[-1]
+        z = (x - self._offset_log(k)).sigmoid()
+        z_cumprod = (1.0 - z).cumprod(-1)
+        return _pad_last(z, 1.0, before=False) * _pad_last(z_cumprod, 1.0, before=True)
+
+    def _inverse(self, y):
+        k = y.shape[-1] - 1
+        y_crop = y.narrow(len(y.shape) - 1, 0, k)
+        sf = (1.0 - y_crop.cumsum(-1)).clamp_min(float(np.finfo(np.float32).tiny))
+        return y_crop.log() - sf.log() + self._offset_log(k)
+
+    def log_abs_det_jacobian(self, x, y):
+        x, y = _as_t(x), _as_t(y)
+        k = x.shape[-1]
+        xs = x - self._offset_log(k)
+        y_crop = y.narrow(len(y.shape) - 1, 0, k)
+        return (-xs - _softplus(-xs) + y_crop.log()).sum(-1)
+
+    def forward_shape(self, shape):
+        return tuple(shape[:-1]) + (shape[-1] + 1,)
+
+    def inverse_shape(self, shape):
+        return tuple(shape[:-1]) + (shape[-1] - 1,)
+
+
+class ComposeTransform(Transform):
+    """Applies `parts` one after the other."""
+
+    def __init__(self, parts: Sequence[Transform]):
+        self.parts = list(parts)
+        self.event_dim = max([p.event_dim for p in self.parts], default=0)
+        self.bijective = all(p.bijective for p in self.parts)
+        sign = 1
+        for p in self.parts:
+            sign *= p.sign
+        self.sign = sign
+
+    def _call(self, x):
+        for p in self.parts:
+            x = p(x)
+        return x
+
+    def _inverse(self, y):
+        for p in reversed(self.parts):
+            y = p.inv(y)
+        return y
+
+    def log_abs_det_jacobian(self, x, y):
+        x = _as_t(x)
+        total = None
+        for p in self.parts:
+            y_p = p(x)
+            term = _sum_rightmost(p.log_abs_det_jacobian(x, y_p), self.event_dim - p.event_dim)
+            total = term if total is None else total + term
+            x = y_p
+        return total if total is not None else _wrap(np.zeros(tuple(x.shape[:len(x.shape) - self.event_dim])))
+
+    def forward_shape(self, shape):
+        for p in self.parts:
+            shape = p.forward_shape(shape)
+        return tuple(shape)
+
+    def inverse_shape(self, shape):
+        for p in reversed(self.parts):
+            shape = p.inverse_shape(shape)
+        return tuple(shape)
+
+
+class IndependentTransform(Transform):
+    """Treats `reinterpreted_batch_ndims` extra rightmost dimensions of `base_transform` as part of the event."""
+
+    def __init__(self, base_transform: Transform, reinterpreted_batch_ndims: int):
+        self.base_transform = base_transform
+        self.reinterpreted_batch_ndims = reinterpreted_batch_ndims
+        self.event_dim = base_transform.event_dim + reinterpreted_batch_ndims
+        self.bijective, self.sign = base_transform.bijective, base_transform.sign
+
+    def _call(self, x):
+        return self.base_transform(x)
+
+    def _inverse(self, y):
+        return self.base_transform.inv(y)
+
+    def log_abs_det_jacobian(self, x, y):
+        return _sum_rightmost(self.base_transform.log_abs_det_jacobian(x, y), self.reinterpreted_batch_ndims)
+
+
+class ReshapeTransform(Transform):
+    """Reshapes the rightmost `in_shape` dimensions to `out_shape` (same number of elements)."""
+
+    def __init__(self, in_shape: Sequence[int], out_shape: Sequence[int]):
+        self.in_shape, self.out_shape = tuple(in_shape), tuple(out_shape)
+        if int(np.prod(self.in_shape)) != int(np.prod(self.out_shape)):
+            raise ValueError("in_shape and out_shape have different numbers of elements")
+        self.event_dim = len(self.in_shape)
+
+    def _call(self, x):
+        batch = list(x.shape[:len(x.shape) - len(self.in_shape)])
+        return x.reshape(batch + list(self.out_shape))
+
+    def _inverse(self, y):
+        batch = list(y.shape[:len(y.shape) - len(self.out_shape)])
+        return y.reshape(batch + list(self.in_shape))
+
+    def log_abs_det_jacobian(self, x, y):
+        x = _as_t(x)
+        return _wrap(np.zeros(tuple(x.shape[:len(x.shape) - len(self.in_shape)])))
+
+    def forward_shape(self, shape):
+        return tuple(shape[:len(shape) - len(self.in_shape)]) + self.out_shape
+
+    def inverse_shape(self, shape):
+        return tuple(shape[:len(shape) - len(self.out_shape)]) + self.in_shape
+
+
+class CatTransform(Transform):
+    """Applies `tseq[i]` to the i-th block of `lengths[i]` entries along `dim` and concatenates the results."""
+
+    def __init__(self, tseq: Sequence[Transform], dim: int = 0, lengths: Optional[Sequence[int]] = None):
+        self.transforms = list(tseq)
+        self.dim = dim
+        self.lengths = list(lengths) if lengths is not None else [1] * len(self.transforms)
+        self.event_dim = max([t.event_dim for t in self.transforms], default=0)
+
+    def _apply(self, x, fn):
+        from .oxideon import cat
+        parts, start = [], 0
+        d = self.dim % len(x.shape)
+        for t, n in zip(self.transforms, self.lengths):
+            parts.append(fn(t, x.narrow(d, start, n)))
+            start += n
+        return cat(parts, d)
+
+    def _call(self, x):
+        return self._apply(x, lambda t, v: t(v))
+
+    def _inverse(self, y):
+        return self._apply(y, lambda t, v: t.inv(v))
+
+    def log_abs_det_jacobian(self, x, y):
+        from .oxideon import cat
+        x, y = _as_t(x), _as_t(y)
+        d = self.dim % len(x.shape)
+        parts, start = [], 0
+        for t, n in zip(self.transforms, self.lengths):
+            parts.append(t.log_abs_det_jacobian(x.narrow(d, start, n), y.narrow(d, start, n)))
+            start += n
+        return cat(parts, d)
+
+
+class StackTransform(Transform):
+    """Applies `tseq[i]` to `x.select(dim, i)` and stacks the results along `dim`."""
+
+    def __init__(self, tseq: Sequence[Transform], dim: int = 0):
+        self.transforms = list(tseq)
+        self.dim = dim
+
+    def _apply(self, x, fn):
+        from .oxideon import stack
+        d = self.dim % len(x.shape)
+        return stack([fn(t, x.narrow(d, i, 1).squeeze(d)) for i, t in enumerate(self.transforms)], d)
+
+    def _call(self, x):
+        return self._apply(x, lambda t, v: t(v))
+
+    def _inverse(self, y):
+        return self._apply(y, lambda t, v: t.inv(v))
+
+    def log_abs_det_jacobian(self, x, y):
+        from .oxideon import stack
+        x, y = _as_t(x), _as_t(y)
+        d = self.dim % len(x.shape)
+        return stack([t.log_abs_det_jacobian(x.narrow(d, i, 1).squeeze(d), y.narrow(d, i, 1).squeeze(d))
+                      for i, t in enumerate(self.transforms)], d)
+
+
+class CumulativeDistributionTransform(Transform):
+    """y = distribution.cdf(x), a map onto (0, 1); its log-determinant is the log-density."""
+
+    def __init__(self, distribution: Distribution):
+        self.distribution = distribution
+
+    def _call(self, x):
+        return self.distribution.cdf(x)
+
+    def _inverse(self, y):
+        return self.distribution.icdf(y)
+
+    def log_abs_det_jacobian(self, x, y):
+        return self.distribution.log_prob(x)
+
+
+def _tril_vec_to_matrix(vec: np.ndarray, diag: int) -> np.ndarray:
+    n_vec = vec.shape[-1]
+    n = int(round((math.sqrt(1 + 8 * n_vec) - 1) / 2 - diag))  # matrix size so that tril(-diag) has n_vec entries
+    while (n * (n + 1) // 2 + n * diag) != n_vec and n < 1000:
+        n += 1
+    rows, cols = np.tril_indices(n, diag)
+    out = np.zeros(vec.shape[:-1] + (n, n), dtype=vec.dtype)
+    out[..., rows, cols] = vec
+    return out
+
+
+def _tril_matrix_to_vec(mat: np.ndarray, diag: int) -> np.ndarray:
+    n = mat.shape[-1]
+    rows, cols = np.tril_indices(n, diag)
+    return mat[..., rows, cols]
+
+
+class CorrCholeskyTransform(Transform):
+    """Maps a vector of D(D-1)/2 unconstrained numbers onto the Cholesky factor of a D x D correlation matrix
+    (lower triangular, positive diagonal, unit-norm rows). No graph."""
+
+    event_dim = 1
+
+    def _call(self, x):
+        v = np.tanh(_to_np(x).astype(np.float64))
+        eps = np.finfo(np.float32).eps
+        v = np.clip(v, -1 + eps, 1 - eps)
+        r = _tril_vec_to_matrix(v, -1)
+        z = r ** 2
+        z1m_cumprod_sqrt = np.cumprod(np.sqrt(1 - z), axis=-1)
+        r = r + np.eye(r.shape[-1])
+        pad = np.concatenate([np.ones(z1m_cumprod_sqrt.shape[:-1] + (1,)), z1m_cumprod_sqrt[..., :-1]], -1)
+        return _wrap(r * pad)
+
+    def _inverse(self, y):
+        y = _to_np(y).astype(np.float64)
+        y_cumsum = 1 - np.cumsum(y * y, axis=-1)
+        shifted = np.concatenate([np.ones(y_cumsum.shape[:-1] + (1,)), y_cumsum[..., :-1]], -1)
+        t = _tril_matrix_to_vec(y, -1) / np.sqrt(_tril_matrix_to_vec(shifted, -1))
+        return _wrap((np.log1p(t) - np.log1p(-t)) / 2)
+
+    def log_abs_det_jacobian(self, x, y):
+        x = _to_np(x).astype(np.float64)
+        y = _to_np(y).astype(np.float64)
+        y1m_cumsum = 1 - np.cumsum(y * y, axis=-1)
+        stick = 0.5 * np.log(_tril_matrix_to_vec(y1m_cumsum, -2)).sum(-1)
+        tanh_ld = -2 * (x + np.logaddexp(0, -2 * x) - math.log(2.0)).sum(-1)
+        return _wrap(stick + tanh_ld)
+
+    def forward_shape(self, shape):
+        n = int(round((1 + math.sqrt(1 + 8 * shape[-1])) / 2))
+        return tuple(shape[:-1]) + (n, n)
+
+    def inverse_shape(self, shape):
+        return tuple(shape[:-2]) + (shape[-1] * (shape[-1] - 1) // 2,)
+
+
+class LowerCholeskyTransform(Transform):
+    """Maps a square matrix onto a lower-triangular one with a positive diagonal (exp of the diagonal). No graph."""
+
+    event_dim = 2
+
+    def _call(self, x):
+        a = _to_np(x).astype(np.float64)
+        d = np.exp(np.diagonal(a, axis1=-2, axis2=-1))
+        return _wrap(np.tril(a, -1) + d[..., None] * np.eye(a.shape[-1]))
+
+    def _inverse(self, y):
+        a = _to_np(y).astype(np.float64)
+        d = np.log(np.diagonal(a, axis1=-2, axis2=-1))
+        return _wrap(np.tril(a, -1) + d[..., None] * np.eye(a.shape[-1]))
+
+
+class PositiveDefiniteTransform(Transform):
+    """Maps a square matrix onto a symmetric positive-definite one: L L^T with L = LowerCholeskyTransform(x). No graph."""
+
+    event_dim = 2
+
+    def _call(self, x):
+        low = _to_np(LowerCholeskyTransform()(x)).astype(np.float64)
+        return _wrap(low @ np.swapaxes(low, -1, -2))
+
+    def _inverse(self, y):
+        low = np.linalg.cholesky(_to_np(y).astype(np.float64))
+        return LowerCholeskyTransform().inv(_wrap(low))
+
+
+# TransformedDistribution: log_prob through the transforms (and mean-free shapes)
+
+def _td_init(self, base_distribution: Distribution, transforms: Any):
+    self.base_dist = base_distribution
+    self.transforms = [transforms] if isinstance(transforms, Transform) else list(transforms)
+    shape = tuple(base_distribution.batch_shape) + tuple(base_distribution.event_shape)
+    event_dim = len(base_distribution.event_shape)
+    for t in self.transforms:
+        if hasattr(t, "forward_shape"):
+            shape = t.forward_shape(shape)
+        event_dim = max(event_dim, getattr(t, "event_dim", 0))
+    cut = len(shape) - event_dim
+    Distribution.__init__(self, batch_shape=shape[:cut], event_shape=shape[cut:])
+    self.has_rsample = getattr(base_distribution, "has_rsample", False)
+
+
+def _td_log_prob(self, value: Any) -> _Tensor:
+    y = _as_t(value)
+    event_dim = len(self.event_shape)
+    lp = None
+    for t in reversed(self.transforms):
+        x = t.inv(y)
+        term = _sum_rightmost(t.log_abs_det_jacobian(x, y), event_dim - getattr(t, "event_dim", 0))
+        lp = -term if lp is None else lp - term
+        event_dim += len(x.shape) - len(y.shape) if hasattr(x, "shape") else 0
+        y = x
+    base = self.base_dist.log_prob(y)
+    base = _sum_rightmost(base, event_dim - len(self.base_dist.event_shape))
+    return base if lp is None else base + lp
+
+
+TransformedDistribution.__init__ = _td_init
+TransformedDistribution.log_prob = _td_log_prob
+
+
+def _td_cdf(self, value):
+    y = _as_t(value)
+    for t in reversed(self.transforms):
+        y = t.inv(y)
+    out = self.base_dist.cdf(y)
+    sign = 1
+    for t in self.transforms:
+        sign *= t.sign
+    return out if sign == 1 else 1.0 - out
+
+
+TransformedDistribution.cdf = _td_cdf
+
+
+# ---------------------------------------------------------------------------
+# More distributions
+# ---------------------------------------------------------------------------
+
+def _f64(x: Any) -> np.ndarray:
+    return np.asarray(_to_np(x), dtype=np.float64)
+
+
+def _bcast(*xs):
+    arrs = [_f64(x) for x in xs]
+    shape = np.broadcast_shapes(*[a.shape for a in arrs])
+    return [np.broadcast_to(a, shape).copy() for a in arrs] + [shape]
+
+
+class ExponentialFamily(Distribution):
+    """Base class for exponential-family distributions p(x) = h(x) exp(<eta, T(x)> - A(eta)). Subclasses define
+    `_natural_params`, `_log_normalizer(*eta)` and `_mean_carrier_measure`; the entropy then follows from A by
+    numerical differentiation."""
+
+    @property
+    def _natural_params(self) -> Tuple[np.ndarray, ...]:
+        raise NotImplementedError
+
+    def _log_normalizer(self, *natural_params: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    @property
+    def _mean_carrier_measure(self) -> float:
+        raise NotImplementedError
+
+    def entropy(self) -> _Tensor:
+        eta = [np.asarray(e, dtype=np.float64) for e in self._natural_params]
+        a = self._log_normalizer(*eta)
+        result = -self._mean_carrier_measure + a
+        for i, e in enumerate(eta):
+            h = 1e-6 * np.maximum(1.0, np.abs(e))
+            up = list(eta)
+            dn = list(eta)
+            up[i], dn[i] = e + h, e - h
+            grad = (self._log_normalizer(*up) - self._log_normalizer(*dn)) / (2 * h)
+            result = result - e * grad
+        return _wrap(result)
+
+
+class Chi2(Gamma):
+    """The chi-squared distribution with `df` degrees of freedom (Gamma(df / 2, 1 / 2))."""
+
+    def __init__(self, df: Union[_Tensor, float]):
+        self.df_np = _f64(df)
+        super().__init__(df * 0.5 if isinstance(df, _Tensor) else self.df_np * 0.5, 0.5)
+        self.df = df if isinstance(df, _Tensor) else _wrap(self.df_np)
+
+
+class InverseGamma(Distribution):
+    """The inverse-gamma distribution: 1 / X for X ~ Gamma(concentration, rate)."""
+
+    has_rsample = True
+
+    def __init__(self, concentration: Any, rate: Any):
+        self.c_np, self.r_np, shape = _bcast(concentration, rate)
+        self.concentration, self.rate = _wrap(self.c_np), _wrap(self.r_np)
+        super().__init__(batch_shape=shape)
+
+
+    @property
+    def mean(self):
+        c, r = self.c_np, self.r_np
+        return _wrap(np.where(c > 1, r / np.where(c > 1, c - 1, 1), np.inf))
+
+    @property
+    def variance(self):
+        c, r = self.c_np, self.r_np
+        return _wrap(np.where(c > 2, r ** 2 / (np.where(c > 2, c - 1, 1) ** 2 * np.where(c > 2, c - 2, 1)), np.inf))
+
+    def entropy(self):
+        c, r = self.c_np, self.r_np
+        return _wrap(c + np.log(r) + _lg(c) - (1 + c) * _dg(c))
+
+
+class Pareto(Distribution):
+    """The Pareto type I distribution: density alpha * scale^alpha / x^(alpha + 1) for x >= scale."""
+
+    has_rsample = True
+
+    def __init__(self, scale: Any, alpha: Any):
+        self.scale_np, self.alpha_np, shape = _bcast(scale, alpha)
+        self.scale, self.alpha = _wrap(self.scale_np), _wrap(self.alpha_np)
+        super().__init__(batch_shape=shape)
+
+
+    @property
+    def mean(self):
+        a = self.alpha_np
+        return _wrap(np.where(a > 1, a * self.scale_np / np.where(a > 1, a - 1, 1), np.inf))
+
+    @property
+    def variance(self):
+        a = self.alpha_np
+        return _wrap(np.where(a > 2, self.scale_np ** 2 * a / (np.where(a > 2, a - 1, 1) ** 2 * np.where(a > 2, a - 2, 1)), np.inf))
+
+    def entropy(self):
+        return _wrap(np.log(self.scale_np / self.alpha_np) + 1 / self.alpha_np + 1)
+
+
+class Kumaraswamy(Distribution):
+    """The Kumaraswamy distribution on (0, 1): density a b x^(a-1) (1 - x^a)^(b-1), a Beta look-alike with a closed-form cdf."""
+
+    has_rsample = True
+
+    def __init__(self, concentration1: Any, concentration0: Any):
+        self.a_np, self.b_np, shape = _bcast(concentration1, concentration0)
+        self.concentration1, self.concentration0 = _wrap(self.a_np), _wrap(self.b_np)
+        super().__init__(batch_shape=shape)
+
+
+    def _moment(self, n):
+        a, b = self.a_np, self.b_np
+        return b * np.exp(_lg(1 + n / a) + _lg(b) - _lg(1 + n / a + b))
+
+    @property
+    def mean(self):
+        return _wrap(self._moment(1))
+
+    @property
+    def variance(self):
+        return _wrap(self._moment(2) - self._moment(1) ** 2)
+
+    def entropy(self):
+        a, b = self.a_np, self.b_np
+        h0 = _dg(b + 1) + _EULER
+        return _wrap((1 - 1 / b) + (1 - 1 / a) * h0 - np.log(b) - np.log(a))
+
+
+class FisherSnedecor(Distribution):
+    """The F distribution with `df1` and `df2` degrees of freedom: (chi2(df1) / df1) / (chi2(df2) / df2)."""
+
+    has_rsample = True
+
+    def __init__(self, df1: Any, df2: Any):
+        self.d1, self.d2, shape = _bcast(df1, df2)
+        self.df1, self.df2 = _wrap(self.d1), _wrap(self.d2)
+        super().__init__(batch_shape=shape)
+
+
+    @property
+    def mean(self):
+        d2 = self.d2
+        return _wrap(np.where(d2 > 2, d2 / np.where(d2 > 2, d2 - 2, 1), np.nan))
+
+    @property
+    def variance(self):
+        d1, d2 = self.d1, self.d2
+        ok = d2 > 4
+        s = np.where(ok, d2, 5)
+        return _wrap(np.where(ok, 2 * s ** 2 * (d1 + s - 2) / (d1 * (s - 2) ** 2 * (s - 4)), np.nan))
+
+
+class GeneralizedPareto(Distribution):
+    """The generalized Pareto distribution with location, scale and shape (`concentration`) parameters."""
+
+    has_rsample = True
+
+    def __init__(self, loc: Any, scale: Any, concentration: Any):
+        self.loc_np, self.scale_np, self.c_np, shape = _bcast(loc, scale, concentration)
+        self.loc, self.scale, self.concentration = _wrap(self.loc_np), _wrap(self.scale_np), _wrap(self.c_np)
+        super().__init__(batch_shape=shape)
+
+
+    @property
+    def mean(self):
+        c = self.c_np
+        return _wrap(np.where(c < 1, self.loc_np + self.scale_np / (1 - np.where(c < 1, c, 0)), np.inf))
+
+    @property
+    def variance(self):
+        c = self.c_np
+        ok = c < 0.5
+        s = np.where(ok, c, 0)
+        return _wrap(np.where(ok, self.scale_np ** 2 / ((1 - s) ** 2 * (1 - 2 * s)), np.inf))
+
+    def entropy(self):
+        return _wrap(np.log(self.scale_np) + self.c_np + 1)
+
+
+def _probs_logits(probs, logits, categorical: bool):
+    if (probs is None) == (logits is None):
+        raise ValueError("pass exactly one of probs or logits")
+    if probs is not None:
+        p = _f64(probs)
+        if categorical:
+            p = p / p.sum(-1, keepdims=True)
+            return p, np.log(np.clip(p, 1e-300, None))
+        return p, np.log(np.clip(p, 1e-300, None)) - np.log1p(-np.clip(p, None, 1 - 1e-16))
+    lg = _f64(logits)
+    if categorical:
+        lg = lg - np.log(np.exp(lg - lg.max(-1, keepdims=True)).sum(-1, keepdims=True)) - lg.max(-1, keepdims=True)
+        return np.exp(lg), lg
+    return 1 / (1 + np.exp(-lg)), lg
+
+
+class NegativeBinomial(Distribution):
+    """The number of successes (probability `probs`) before `total_count` failures."""
+
+    def __init__(self, total_count: Any, probs: Any = None, logits: Any = None):
+        p, lg = _probs_logits(probs, logits, categorical=False)
+        self.count_np, self.probs_np, self.logits_np, shape = _bcast(total_count, p, lg)
+        self.total_count, self.probs, self.logits = _wrap(self.count_np), _wrap(self.probs_np), _wrap(self.logits_np)
+        super().__init__(batch_shape=shape)
+
+    @property
+    def mean(self):
+        return _wrap(self.count_np * np.exp(self.logits_np))
+
+    @property
+    def variance(self):
+        return _wrap(self.count_np * np.exp(self.logits_np) / (1 - self.probs_np))
+
+
+class OneHotCategorical(Distribution):
+    """A categorical distribution whose samples are one-hot vectors of length K."""
+
+    has_enumerate_support = True
+
+    def __init__(self, probs: Any = None, logits: Any = None):
+        self.probs_np, self.logits_np = _probs_logits(probs, logits, categorical=True)
+        self.probs, self.logits = _wrap(self.probs_np), _wrap(self.logits_np)
+        super().__init__(batch_shape=self.probs_np.shape[:-1], event_shape=self.probs_np.shape[-1:])
+
+    def entropy(self):
+        p = self.probs_np
+        return _wrap(-(np.where(p > 0, p * self.logits_np, 0.0)).sum(-1))
+
+    @property
+    def mean(self):
+        return _wrap(self.probs_np)
+
+    @property
+    def variance(self):
+        return _wrap(self.probs_np * (1 - self.probs_np))
+
+    def enumerate_support(self, expand: bool = True):
+        k = self.probs_np.shape[-1]
+        vals = np.eye(k).reshape((k,) + (1,) * len(self.batch_shape) + (k,))
+        if expand:
+            vals = np.broadcast_to(vals, (k,) + self.batch_shape + (k,))
+        return _wrap(vals)
+
+
+class OneHotCategoricalStraightThrough(OneHotCategorical):
+    """`OneHotCategorical` whose `rsample` passes gradients to `probs` with the straight-through estimator:
+    the forward value is the one-hot sample, the backward pass treats it as `probs`."""
+
+    has_rsample = True
+
+    def __init__(self, probs: Any = None, logits: Any = None):
+        self._probs_t = probs if isinstance(probs, _Tensor) else None
+        super().__init__(probs=probs, logits=logits)
+
+    def rsample(self, sample_shape=()):
+        s = self.sample(sample_shape)
+        p = self._probs_t if self._probs_t is not None else self.probs
+        return s + p - p.detach()
+
+
+class LogitRelaxedBernoulli(Distribution):
+    """The logit of a relaxed (Concrete / Gumbel-sigmoid) Bernoulli sample at a given temperature."""
+
+    has_rsample = True
+
+    def __init__(self, temperature: Any, probs: Any = None, logits: Any = None):
+        p, lg = _probs_logits(probs, logits, categorical=False)
+        self.probs_np, self.logits_np, shape = _bcast(p, lg)
+        self.temperature_np = _f64(temperature)
+        self.temperature, self.probs, self.logits = _wrap(self.temperature_np), _wrap(self.probs_np), _wrap(self.logits_np)
+        super().__init__(batch_shape=shape)
+
+
+class RelaxedBernoulli(TransformedDistribution):
+    """A Bernoulli relaxed to (0, 1) at a temperature (sigmoid of `LogitRelaxedBernoulli`); low temperatures approach
+    hard 0/1 samples while staying differentiable in the parameters."""
+
+    has_rsample = True
+
+    def __init__(self, temperature: Any, probs: Any = None, logits: Any = None):
+        base = LogitRelaxedBernoulli(temperature, probs, logits)
+        super().__init__(base, SigmoidTransform())
+        self.temperature, self.probs, self.logits = base.temperature, base.probs, base.logits
+
+
+class ExpRelaxedCategorical(Distribution):
+    """The log of a relaxed one-hot categorical (Concrete / Gumbel-softmax) sample."""
+
+    has_rsample = True
+
+    def __init__(self, temperature: Any, probs: Any = None, logits: Any = None):
+        self.probs_np, self.logits_np = _probs_logits(probs, logits, categorical=True)
+        self.temperature_np = _f64(temperature)
+        self.temperature, self.probs, self.logits = _wrap(self.temperature_np), _wrap(self.probs_np), _wrap(self.logits_np)
+        super().__init__(batch_shape=self.probs_np.shape[:-1], event_shape=self.probs_np.shape[-1:])
+
+
+class RelaxedOneHotCategorical(TransformedDistribution):
+    """A one-hot categorical relaxed onto the simplex at a temperature (Gumbel-softmax), for differentiable discrete choices."""
+
+    has_rsample = True
+
+    def __init__(self, temperature: Any, probs: Any = None, logits: Any = None):
+        base = ExpRelaxedCategorical(temperature, probs, logits)
+        super().__init__(base, ExpTransform())
+        self.temperature, self.probs, self.logits = base.temperature, base.probs, base.logits
+
+
+class LogisticNormal(TransformedDistribution):
+    """A distribution on the simplex: stick-breaking of a normal vector (`loc`, `scale` of length K - 1 give K outputs)."""
+
+    has_rsample = True
+
+    def __init__(self, loc: Any, scale: Any):
+        base = Independent(Normal(loc, scale), 1)
+        super().__init__(base, StickBreakingTransform())
+        self.loc, self.scale = base.base_dist.loc, base.base_dist.scale
+
+
+class MixtureSameFamily(Distribution):
+    """A mixture of components of one family: `mixture_distribution` (Categorical over K) picks one of the K
+    components batched in the rightmost batch dimension of `component_distribution`."""
+
+    def __init__(self, mixture_distribution: Categorical, component_distribution: Distribution):
+        self.mixture_distribution = mixture_distribution
+        self.component_distribution = component_distribution
+        k = component_distribution.batch_shape[-1]
+        if mixture_distribution.probs_np.shape[-1] != k:
+            raise ValueError("the mixture has a different number of components than component_distribution's last batch dimension")
+        super().__init__(batch_shape=component_distribution.batch_shape[:-1], event_shape=component_distribution.event_shape)
+
+    def _mix_probs(self) -> np.ndarray:
+        # batch + (K,) -> batch + (K,) + (1,) * event_ndims, to weight the component moments
+        p = self.mixture_distribution.probs_np
+        return p.reshape(p.shape + (1,) * len(self.event_shape))
+
+    @property
+    def mean(self):
+        p = self._mix_probs()
+        return _wrap((p * _f64(self.component_distribution.mean)).sum(-1 - len(self.event_shape)))
+
+    @property
+    def variance(self):
+        ax = -1 - len(self.event_shape)
+        p = self._mix_probs()
+        m = _f64(self.component_distribution.mean)
+        v = _f64(self.component_distribution.variance)
+        mean = (p * m).sum(ax, keepdims=True)
+        return _wrap((p * v).sum(ax) + (p * (m - mean) ** 2).sum(ax))
+
+
+def _log_i0(k: np.ndarray) -> np.ndarray:
+    k = np.asarray(k, dtype=np.float64)
+    from .special import i0e
+    return np.log(_f64(i0e(_wrap(k)))) + np.abs(k)
+
+
+def _log_i1(k: np.ndarray) -> np.ndarray:
+    k = np.asarray(k, dtype=np.float64)
+    from .special import i1e
+    return np.log(np.abs(_f64(i1e(_wrap(k))))) + np.abs(k)
+
+
+class VonMises(Distribution):
+    """The von Mises (circular normal) distribution on angles, with mean `loc` and concentration `concentration`."""
+
+    def __init__(self, loc: Any, concentration: Any):
+        self.loc_np, self.k_np, shape = _bcast(loc, concentration)
+        self.loc, self.concentration = _wrap(self.loc_np), _wrap(self.k_np)
+        super().__init__(batch_shape=shape)
+
+    @property
+    def mean(self):
+        return _wrap(self.loc_np)
+
+    @property
+    def variance(self):
+        """The circular variance 1 - I1(k) / I0(k)."""
+        return _wrap(1 - np.exp(_log_i1(self.k_np) - _log_i0(self.k_np)))
+
+
+def _mvlgamma_np(a: np.ndarray, p: int) -> np.ndarray:
+    return p * (p - 1) / 4 * math.log(math.pi) + sum(_lg(a - i / 2) for i in range(p))
+
+
+def _mvdigamma_np(a: np.ndarray, p: int) -> np.ndarray:
+    return sum(_dg(a - i / 2) for i in range(p))
+
+
+class Wishart(Distribution):
+    """The Wishart distribution over p x p positive-definite matrices with `df` degrees of freedom and a scale matrix
+    (pass one of `covariance_matrix`, `precision_matrix`, `scale_tril`)."""
+
+    has_rsample = True
+
+    def __init__(self, df: Any, covariance_matrix: Any = None, precision_matrix: Any = None, scale_tril: Any = None):
+        if sum(x is not None for x in (covariance_matrix, precision_matrix, scale_tril)) != 1:
+            raise ValueError("pass exactly one of covariance_matrix, precision_matrix, scale_tril")
+        if scale_tril is not None:
+            tril = _f64(scale_tril)
+        elif covariance_matrix is not None:
+            tril = np.linalg.cholesky(_f64(covariance_matrix))
+        else:
+            tril = np.linalg.cholesky(np.linalg.inv(_f64(precision_matrix)))
+        self.tril_np = tril
+        self.cov_np = tril @ np.swapaxes(tril, -1, -2)
+        p = tril.shape[-1]
+        self.df_np = _f64(df)
+        if np.any(self.df_np <= p - 1):
+            raise ValueError(f"df must be greater than p - 1 = {p - 1}")
+        self.df, self.covariance_matrix, self.scale_tril = _wrap(self.df_np), _wrap(self.cov_np), _wrap(tril)
+        batch = np.broadcast_shapes(self.df_np.shape, tril.shape[:-2])
+        super().__init__(batch_shape=batch, event_shape=(p, p))
+
+
+    @property
+    def mean(self):
+        return _wrap(self.df_np[..., None, None] * self.cov_np)
+
+    @property
+    def variance(self):
+        d = np.diagonal(self.cov_np, axis1=-2, axis2=-1)
+        return _wrap(self.df_np[..., None, None] * (self.cov_np ** 2 + d[..., :, None] * d[..., None, :]))
+
+    def entropy(self):
+        p = self.event_shape[-1]
+        nu = self.df_np
+        logdiag = np.log(np.diagonal(self.tril_np, axis1=-2, axis2=-1)).sum(-1)
+        return _wrap((p + 1) * logdiag + 0.5 * p * (p + 1) * math.log(2) + _mvlgamma_np(0.5 * nu, p)
+                     - 0.5 * (nu - p - 1) * _mvdigamma_np(0.5 * nu, p) + 0.5 * nu * p)
+
+
+class LKJCholesky(Distribution):
+    """The LKJ distribution over Cholesky factors of `dim` x `dim` correlation matrices; `concentration` > 1 favours
+    matrices near the identity, < 1 strong correlations (Lewandowski, Kurowicka and Joe, 2009; onion sampler)."""
+
+    def __init__(self, dim: int, concentration: Any = 1.0):
+        if dim < 2:
+            raise ValueError("dim must be at least 2")
+        self.dim = dim
+        self.conc_np = _f64(concentration)
+        self.concentration = _wrap(self.conc_np)
+        super().__init__(batch_shape=self.conc_np.shape, event_shape=(dim, dim))
+
+
+
+# ---------------------------------------------------------------------------
+# Sampling and log-densities of the distributions above, in Rust: draws come from the global oxideon generator
+# (`oxideon.manual_seed`) through the Rust samplers (`_standard_gamma`, `_poisson`, `_von_mises`, `rand`, `randn`), and
+# every density is a chain of Rust tensor operations. Parameters are evaluated in float64; results are float32.
+# ---------------------------------------------------------------------------
+
+def _P(a: Any) -> _Tensor:
+    """A parameter or value as a float64 tensor."""
+    if isinstance(a, _Tensor):
+        return a.detach().double()
+    arr = np.asarray(a, dtype=np.float64)  # keep 0-d values 0-d (np.ascontiguousarray would make them 1-d)
+    return _from_numpy(arr if arr.flags.c_contiguous else np.ascontiguousarray(arr))
+
+
+def _expand(t: _Tensor, shape: Tuple[int, ...]) -> _Tensor:
+    return t if tuple(t.shape) == tuple(shape) else t.expand(list(shape)).contiguous()
+
+
+def _shape(d: Distribution, sample_shape: Sequence[int]) -> Tuple[int, ...]:
+    return tuple(int(s) for s in sample_shape) + tuple(d.batch_shape) + tuple(d.event_shape)
+
+
+def _uniform(shape: Tuple[int, ...]) -> _Tensor:
+    from .primitives import rand
+    u = rand(list(shape)).double() if shape else rand([1]).double().reshape([])
+    return u.clamp(1e-12, 1.0 - 1e-12)
+
+
+def _normal(shape: Tuple[int, ...]) -> _Tensor:
+    from .primitives import randn
+    return randn(list(shape)).double() if shape else randn([1]).double().reshape([])
+
+
+def _gamma(conc: _Tensor, shape: Tuple[int, ...]) -> _Tensor:
+    from .oxideon import _standard_gamma
+    return _standard_gamma(_expand(conc, shape))
+
+
+def _f32(t: _Tensor) -> _Tensor:
+    return t.float()
+
+
+def _where(cond: _Tensor, a: Any, b: Any) -> _Tensor:
+    from .primitives import where
+    return where(cond, a, b)
+
+
+def _neg_inf_like(t: _Tensor) -> _Tensor:
+    return t * 0.0 - float("inf")
+
+
+def _softplus_t(t: _Tensor) -> _Tensor:
+    return t.clamp_min(0.0) + (-(t.abs())).exp().log1p()
+
+
+def _logsumexp_last(t: _Tensor, keepdim: bool = False) -> _Tensor:
+    from .tensor_utils import logsumexp
+    return logsumexp(t, len(t.shape) - 1, keepdim)
+
+
+# InverseGamma
+def _ig_rsample(self, sample_shape=()):
+    shape = _shape(self, sample_shape)
+    return _f32(_expand(_P(self.r_np), shape) / _gamma(_P(self.c_np), shape))
+
+
+def _ig_log_prob(self, value):
+    v, c, r = _P(value), _P(self.c_np), _P(self.r_np)
+    vs = _where(v > 0, v, v * 0.0 + 1.0)
+    out = c * r.log() - c.lgamma() - (c + 1.0) * vs.log() - r / vs
+    return _f32(_where(v > 0, out, _neg_inf_like(out)))
+
+
+InverseGamma.rsample = InverseGamma.sample = _ig_rsample
+InverseGamma.log_prob = _ig_log_prob
+
+
+# Pareto
+def _pareto_rsample(self, sample_shape=()):
+    shape = _shape(self, sample_shape)
+    u = _uniform(shape)
+    return _f32(_expand(_P(self.scale_np), shape) * (1.0 - u).pow(_expand(-1.0 / _P(self.alpha_np), shape)))
+
+
+def _pareto_log_prob(self, value):
+    v, s, a = _P(value), _P(self.scale_np), _P(self.alpha_np)
+    vs = _where(v >= s, v, s + v * 0.0)
+    out = a.log() + a * s.log() - (a + 1.0) * vs.log()
+    return _f32(_where(v >= s, out, _neg_inf_like(out)))
+
+
+def _pareto_cdf(self, value):
+    v, s, a = _P(value), _P(self.scale_np), _P(self.alpha_np)
+    vs = _where(v >= s, v, s + v * 0.0)
+    return _f32(_where(v >= s, 1.0 - (s / vs).pow(a), vs * 0.0))
+
+
+def _pareto_icdf(self, value):
+    return _f32(_P(self.scale_np) * (1.0 - _P(value)).pow(-1.0 / _P(self.alpha_np)))
+
+
+Pareto.rsample = Pareto.sample = _pareto_rsample
+Pareto.log_prob, Pareto.cdf, Pareto.icdf = _pareto_log_prob, _pareto_cdf, _pareto_icdf
+
+
+# Kumaraswamy
+def _kuma_rsample(self, sample_shape=()):
+    shape = _shape(self, sample_shape)
+    a, b = _expand(_P(self.a_np), shape), _expand(_P(self.b_np), shape)
+    u = _uniform(shape)
+    return _f32((1.0 - (1.0 - u).pow(1.0 / b)).pow(1.0 / a))
+
+
+def _kuma_log_prob(self, value):
+    v, a, b = _P(value), _P(self.a_np), _P(self.b_np)
+    inside = (v > 0) & (v < 1)
+    vs = _where(inside, v, v * 0.0 + 0.5)
+    out = a.log() + b.log() + (a - 1.0) * vs.log() + (b - 1.0) * (-(vs.pow(a))).log1p()
+    return _f32(_where(inside, out, _neg_inf_like(out)))
+
+
+def _kuma_cdf(self, value):
+    v = _P(value).clamp(0.0, 1.0)
+    return _f32(1.0 - (1.0 - v.pow(_P(self.a_np))).pow(_P(self.b_np)))
+
+
+Kumaraswamy.rsample = Kumaraswamy.sample = _kuma_rsample
+Kumaraswamy.log_prob, Kumaraswamy.cdf = _kuma_log_prob, _kuma_cdf
+
+
+# FisherSnedecor
+def _f_rsample(self, sample_shape=()):
+    shape = _shape(self, sample_shape)
+    d1, d2 = _expand(_P(self.d1), shape), _expand(_P(self.d2), shape)
+    x1 = _gamma(d1 * 0.5, shape) * 2.0 / d1
+    x2 = _gamma(d2 * 0.5, shape) * 2.0 / d2
+    return _f32(x1 / x2)
+
+
+def _f_log_prob(self, value):
+    v, d1, d2 = _P(value), _P(self.d1), _P(self.d2)
+    c1, c2 = d1 * 0.5, d2 * 0.5
+    ratio = d1 / d2
+    vs = _where(v > 0, v, v * 0.0 + 1.0)
+    out = (c1 + c2).lgamma() - c1.lgamma() - c2.lgamma() + c1 * ratio.log() + (c1 - 1.0) * vs.log() - (c1 + c2) * (ratio * vs).log1p()
+    return _f32(_where(v > 0, out, _neg_inf_like(out)))
+
+
+FisherSnedecor.rsample = FisherSnedecor.sample = _f_rsample
+FisherSnedecor.log_prob = _f_log_prob
+
+
+# GeneralizedPareto
+def _gpd_icdf(self, value):
+    u, c = _P(value), _P(self.c_np)
+    zero = c == 0
+    safe = _where(zero, c * 0.0 + 1.0, c)
+    log1mu = (-u).log1p()
+    out = _where(zero, -log1mu, (-(safe * log1mu)).expm1() / safe)
+    return _f32(_P(self.loc_np) + _P(self.scale_np) * out)
+
+
+def _gpd_rsample(self, sample_shape=()):
+    shape = _shape(self, sample_shape)
+    return self.icdf(_uniform(shape))
+
+
+def _gpd_z(self, value):
+    return (_P(value) - _P(self.loc_np)) / _P(self.scale_np)
+
+
+def _gpd_support(self, z):
+    c = _P(self.c_np)
+    neg = c < 0
+    upper = _where(neg, -1.0 / _where(neg, c, c * 0.0 - 1.0), c * 0.0 + float("inf"))
+    return (z >= 0) & (z <= upper)
+
+
+def _gpd_log_prob(self, value):
+    z, c = _gpd_z(self, value), _P(self.c_np)
+    ok = _gpd_support(self, z)
+    zs = _where(ok, z, z * 0.0)
+    zero = c == 0
+    safe = _where(zero, c * 0.0 + 1.0, c)
+    out = -(_P(self.scale_np).log()) - _where(zero, zs, (1.0 / safe + 1.0) * (c * zs).log1p())
+    return _f32(_where(ok, out, _neg_inf_like(out)))
+
+
+def _gpd_cdf(self, value):
+    z, c = _gpd_z(self, value), _P(self.c_np)
+    zs = z.clamp_min(0.0)
+    zero = c == 0
+    safe = _where(zero, c * 0.0 + 1.0, c)
+    inside = (c * zs + 1.0).clamp_min(0.0)
+    out = _where(zero, -((-zs).expm1()), -((-(inside.log() / safe)).expm1()))
+    return _f32(_where(z < 0, z * 0.0, out).clamp(0.0, 1.0))
+
+
+GeneralizedPareto.icdf, GeneralizedPareto.log_prob, GeneralizedPareto.cdf = _gpd_icdf, _gpd_log_prob, _gpd_cdf
+GeneralizedPareto.rsample = GeneralizedPareto.sample = _gpd_rsample
+
+
+# NegativeBinomial
+def _nb_sample(self, sample_shape=()):
+    from .oxideon import _poisson
+    shape = _shape(self, sample_shape)
+    p = _expand(_P(self.probs_np), shape)
+    rate = _gamma(_P(self.count_np), shape) * (p / (1.0 - p))
+    return _f32(_poisson(rate))
+
+
+def _nb_log_prob(self, value):
+    k, r, lg = _P(value), _P(self.count_np), _P(self.logits_np)
+    log1mp = -_softplus_t(lg)
+    logp = -_softplus_t(lg * -1.0)
+    ks = _where(k >= 0, k, k * 0.0)
+    out = (ks + r).lgamma() - r.lgamma() - (ks + 1.0).lgamma() + r * log1mp + _where(ks == 0, ks * 0.0, ks * logp)
+    ok = (k >= 0) & (k == k.floor())
+    return _f32(_where(ok, out, _neg_inf_like(out)))
+
+
+NegativeBinomial.sample = _nb_sample
+NegativeBinomial.log_prob = _nb_log_prob
+
+
+# OneHotCategorical
+def _ohc_sample(self, sample_shape=()):
+    from .primitives import rand
+    k = int(self.probs_np.shape[-1])
+    shape = _shape(self, sample_shape)
+    probs = _expand(_P(self.probs_np), shape)
+    cum = probs.cumsum(len(shape) - 1)
+    u = rand(list(shape[:-1]) + [1]).double() * cum.narrow(len(shape) - 1, k - 1, 1)
+    idx = (u > cum).double().sum(len(shape) - 1, keepdim=True).clamp_max(k - 1)
+    arange = _from_numpy(np.arange(k, dtype=np.float64))
+    return _f32((idx == arange).double())
+
+
+def _ohc_log_prob(self, value):
+    prod = _P(value) * _P(self.logits_np)
+    return _f32(prod.sum(len(prod.shape) - 1))
+
+
+OneHotCategorical.sample = _ohc_sample
+OneHotCategorical.log_prob = _ohc_log_prob
+
+
+# LogitRelaxedBernoulli
+def _lrb_rsample(self, sample_shape=()):
+    shape = _shape(self, sample_shape)
+    u = _uniform(shape)
+    return _f32((_expand(_P(self.logits_np), shape) + u.log() - (-u).log1p()) / _P(self.temperature_np))
+
+
+def _lrb_log_prob(self, value):
+    t = _P(self.temperature_np)
+    diff = _P(self.logits_np) - _P(value) * t
+    return _f32(t.log() + diff - _softplus_t(diff) * 2.0)
+
+
+LogitRelaxedBernoulli.rsample = LogitRelaxedBernoulli.sample = _lrb_rsample
+LogitRelaxedBernoulli.log_prob = _lrb_log_prob
+
+
+# ExpRelaxedCategorical
+def _erc_rsample(self, sample_shape=()):
+    shape = _shape(self, sample_shape)
+    u = _uniform(shape)
+    scores = (_expand(_P(self.logits_np), shape) - (-(u.log())).log()) / _P(self.temperature_np)
+    return _f32(scores - _logsumexp_last(scores, keepdim=True))
+
+
+def _erc_log_prob(self, value):
+    v = _P(value)
+    k = int(self.probs_np.shape[-1])
+    t = _P(self.temperature_np)
+    log_scale = math.lgamma(k) - t.log() * float(-(k - 1))
+    score = _P(self.logits_np) - v * t
+    score = (score - _logsumexp_last(score, keepdim=True)).sum(len(score.shape) - 1)
+    return _f32(score + log_scale)
+
+
+ExpRelaxedCategorical.rsample = ExpRelaxedCategorical.sample = _erc_rsample
+ExpRelaxedCategorical.log_prob = _erc_log_prob
+
+
+# MixtureSameFamily
+def _msf_log_prob(self, value):
+    n_ev = len(self.event_shape)
+    v = _P(value)
+    v = v.unsqueeze(len(v.shape) - n_ev)  # sample + batch + (1,) + event
+    lp = _P(self.component_distribution.log_prob(v.float()))
+    log_mix = _P(np.log(np.clip(self.mixture_distribution.probs_np, 1e-300, None)))
+    return _f32(_logsumexp_last(lp + log_mix))
+
+
+def _msf_sample(self, sample_shape=()):
+    comps = _P(self.component_distribution.sample(sample_shape))  # sample + batch + (K,) + event
+    n_ev = len(self.event_shape)
+    axis = len(comps.shape) - n_ev - 1
+    idx = _P(self.mixture_distribution.sample(sample_shape)).long()  # sample + batch
+    for _ in range(n_ev + 1):
+        idx = idx.unsqueeze(len(idx.shape))
+    target = list(comps.shape)
+    target[axis] = 1
+    idx = idx.expand(target).contiguous()
+    return _f32(comps.gather(axis, idx).squeeze(axis))
+
+
+MixtureSameFamily.log_prob = _msf_log_prob
+MixtureSameFamily.sample = _msf_sample
+
+
+# VonMises
+def _vm_log_prob(self, value):
+    from .special import i0e
+    k = _P(self.k_np)
+    log_i0 = _P(i0e(k)).log() + k.abs()
+    return _f32(k * (_P(value) - _P(self.loc_np)).cos() - math.log(2 * math.pi) - log_i0)
+
+
+def _vm_sample(self, sample_shape=()):
+    from .oxideon import _von_mises
+    shape = _shape(self, sample_shape)
+    return _f32(_von_mises(_expand(_P(self.loc_np), shape), _expand(_P(self.k_np), shape)))
+
+
+VonMises.log_prob = _vm_log_prob
+VonMises.sample = _vm_sample
+
+
+# Wishart
+def _mvlgamma_t(a: _Tensor, p: int) -> _Tensor:
+    out = a * 0.0 + p * (p - 1) / 4 * math.log(math.pi)
+    for i in range(p):
+        out = out + (a - i / 2).lgamma()
+    return out
+
+
+def _wishart_rsample(self, sample_shape=()):
+    # Bartlett decomposition: A lower triangular, chi(df - i) on the diagonal, N(0, 1) below; X = L A A^T L^T
+    p = self.event_shape[-1]
+    shape = tuple(int(s) for s in sample_shape) + tuple(self.batch_shape)
+    df = _expand(_P(self.df_np), shape)
+    below = _normal(shape + (p, p)).tril(-1)
+    dfs = df.unsqueeze(len(shape)) - _from_numpy(np.arange(p, dtype=np.float64))
+    chi = (_gamma(dfs * 0.5, shape + (p,)) * 2.0).sqrt()
+    eye = _from_numpy(np.eye(p))
+    a = below + chi.unsqueeze(len(shape) + 1) * eye
+    la = _P(self.tril_np).matmul(a)
+    return _f32(la.matmul(la.transpose(-2, -1)))
+
+
+def _wishart_log_prob(self, value):
+    from . import linalg
+    x = _P(value)
+    p = self.event_shape[-1]
+    nu = _P(self.df_np)
+    _, logdet_x = linalg.slogdet(x)
+    diag = linalg.diagonal(_P(self.tril_np), 0, -2, -1)
+    logdet_s = diag.log().sum(len(diag.shape) - 1) * 2.0
+    tr = linalg.diagonal(linalg.solve(_P(self.cov_np), x), 0, -2, -1)
+    tr = tr.sum(len(tr.shape) - 1)
+    out = (nu - p - 1.0) * 0.5 * logdet_x - tr * 0.5 - nu * (p / 2 * math.log(2)) - nu * 0.5 * logdet_s - _mvlgamma_t(nu * 0.5, p)
+    return _f32(out)
+
+
+Wishart.rsample = Wishart.sample = _wishart_rsample
+Wishart.log_prob = _wishart_log_prob
+
+
+# LKJCholesky
+def _lkj_sample(self, sample_shape=()):
+    d = self.dim
+    shape = tuple(int(s) for s in sample_shape) + tuple(self.batch_shape)
+    conc = _expand(_P(self.conc_np), shape)
+    marginal = conc + 0.5 * (d - 2)
+    offset = _from_numpy(np.concatenate([[0.0], np.arange(d - 1, dtype=np.float64)]))
+    c1 = _expand(offset + 0.5, shape + (d,))
+    c0 = marginal.unsqueeze(len(shape)) - offset * 0.5
+    ga, gb = _gamma(c1, shape + (d,)), _gamma(c0, shape + (d,))
+    y = (ga / (ga + gb)).unsqueeze(len(shape) + 1)
+    u = _normal(shape + (d, d)).tril(-1)
+    norm = (u * u).sum(len(shape) + 1, keepdim=True).sqrt()
+    u = _where(norm > 0, u / _where(norm > 0, norm, norm * 0.0 + 1.0), u * 0.0)
+    first_row = _from_numpy(np.concatenate([[0.0], np.ones(d - 1)]).reshape(d, 1))
+    u = u * first_row  # the first row of the onion is empty
+    w = y.sqrt() * u
+    diag = (1.0 - (w * w).sum(len(shape) + 1)).clamp_min(float(np.finfo(np.float64).tiny)).sqrt()
+    return _f32(w + diag.unsqueeze(len(shape) + 1) * _from_numpy(np.eye(d)))
+
+
+def _lkj_log_prob(self, value):
+    from . import linalg
+    d = self.dim
+    v = _P(value)
+    diag = linalg.diagonal(v, 0, -2, -1)
+    diag = diag.narrow(len(diag.shape) - 1, 1, d - 1)
+    conc = _P(self.conc_np)
+    order = (conc - 1.0).unsqueeze(len(conc.shape)) * 2.0 + float(d) - _from_numpy(np.arange(2, d + 1, dtype=np.float64))
+    unnorm = (order * diag.log()).sum(len(diag.shape) - 1)
+    dm1 = d - 1
+    alpha = conc + 0.5 * dm1
+    norm = 0.5 * dm1 * math.log(math.pi) + _mvlgamma_t(alpha - 0.5, dm1) - alpha.lgamma() * float(dm1)
+    return _f32(unnorm - norm)
+
+
+LKJCholesky.sample = _lkj_sample
+LKJCholesky.log_prob = _lkj_log_prob
+
+
+__all__ += [
+    "ExponentialFamily", "Chi2", "InverseGamma", "Pareto", "Kumaraswamy", "FisherSnedecor", "GeneralizedPareto",
+    "NegativeBinomial", "OneHotCategorical", "OneHotCategoricalStraightThrough", "LogitRelaxedBernoulli",
+    "RelaxedBernoulli", "ExpRelaxedCategorical", "RelaxedOneHotCategorical", "LogisticNormal", "MixtureSameFamily",
+    "VonMises", "Wishart", "LKJCholesky",
+    "Transform", "ExpTransform", "AffineTransform", "SigmoidTransform", "TanhTransform", "SoftplusTransform",
+    "AbsTransform", "PowerTransform", "SoftmaxTransform", "StickBreakingTransform", "ComposeTransform",
+    "IndependentTransform", "ReshapeTransform", "CatTransform", "StackTransform", "CumulativeDistributionTransform",
+    "CorrCholeskyTransform", "LowerCholeskyTransform", "PositiveDefiniteTransform",
 ]

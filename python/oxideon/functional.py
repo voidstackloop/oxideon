@@ -13,6 +13,7 @@ embeddings, dropout, loss functions, and functional autograd transforms.
 import math
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import numpy as np
+from ._contig import contig as _contig
 
 from .oxideon import (
     Tensor as _Tensor,
@@ -62,7 +63,7 @@ def _apply_reduction(loss: _Tensor, reduction: str, name: str) -> _Tensor:
 def _as_tensor(x: Any) -> _Tensor:
     if isinstance(x, _Tensor):
         return x
-    return _from_numpy(np.ascontiguousarray(_to_np(x)))
+    return _from_numpy(_contig(_to_np(x)))
 
 
 def _diff_pad_nd(x: _Tensor, pads, value: float = 0.0) -> _Tensor:
@@ -92,7 +93,7 @@ def _diff_pad_nd(x: _Tensor, pads, value: float = 0.0) -> _Tensor:
 def _wrap(arr: np.ndarray, like: Optional[_Tensor] = None) -> _Tensor:
     # No dtype coercion: _from_numpy supports float64 natively, and silently
     # narrowing f64 intermediates to f32 loses precision (e.g. in cumsum).
-    res = _from_numpy(np.ascontiguousarray(arr))
+    res = _from_numpy(_contig(arr))
     if like is not None:
         if hasattr(like, "dtype"):
             try:
@@ -346,12 +347,12 @@ def scaled_dot_product_attention(
     if attn_mask is not None:
         m_np = _to_np(attn_mask)
         if m_np.dtype == bool or m_np.dtype == np.bool_:
-            keep = _from_numpy(np.ascontiguousarray(m_np, dtype=np.float32))
+            keep = _from_numpy(_contig(m_np, dtype=np.float32))
             scores = _apply_sdpa_keep_mask(scores, keep)
         elif isinstance(attn_mask, _Tensor):
             scores = scores + attn_mask
         else:
-            scores = scores + _from_numpy(np.ascontiguousarray(m_np, dtype=np.float32))
+            scores = scores + _from_numpy(_contig(m_np, dtype=np.float32))
 
     attn_weights = scores.softmax(-1)
 
@@ -428,7 +429,7 @@ def _dropout_nd_mask(input: _Tensor, p: float, spatial_rank: int) -> _Tensor:
         mask = np.zeros(mask_shape, dtype=np.float32)
     else:
         mask = (np.random.rand(*mask_shape) > p).astype(np.float32) / (1.0 - p)
-    res = _from_numpy(np.ascontiguousarray(mask))
+    res = _from_numpy(_contig(mask))
     if hasattr(input, "device"):
         try:
             res = res.to(input.device)
@@ -593,7 +594,7 @@ def conv_transpose1d(
                 mask[pos] = 1
                 out = out + contrib[:, :, None] * _from_numpy(mask)
     if bias is not None:
-        b = bias if isinstance(bias, _Tensor) else _from_numpy(np.ascontiguousarray(_to_np(bias)))
+        b = bias if isinstance(bias, _Tensor) else _from_numpy(_contig(_to_np(bias)))
         out = out + b.reshape([1, -1, 1])
     return out
 
@@ -638,7 +639,7 @@ def conv_transpose2d(
                         out = out + contrib[:, :, None, None] * _from_numpy(mask)
 
     if bias is not None:
-        b = bias if isinstance(bias, _Tensor) else _from_numpy(np.ascontiguousarray(_to_np(bias)))
+        b = bias if isinstance(bias, _Tensor) else _from_numpy(_contig(_to_np(bias)))
         out = out + b.reshape([1, -1, 1, 1])
     return out
 
@@ -683,7 +684,7 @@ def conv_transpose3d(
                                 mask[pd, ph, pw] = 1
                                 out = out + contrib[:, :, None, None, None] * _from_numpy(mask)
     if bias is not None:
-        b = bias if isinstance(bias, _Tensor) else _from_numpy(np.ascontiguousarray(_to_np(bias)))
+        b = bias if isinstance(bias, _Tensor) else _from_numpy(_contig(_to_np(bias)))
         out = out + b.reshape([1, -1, 1, 1, 1])
     return out
 
@@ -702,7 +703,7 @@ def max_pool1d(input: _Tensor, kernel_size: int, stride: Optional[int] = None, p
     cols = []
     for i in range(out_l):
         win = x[:, :, i * stride : i * stride + kernel_size]
-        cols.append(win.reshape([n, c, -1]).max(dim=-1))
+        cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
     return _native_stack(cols, dim=-1)
 
 
@@ -727,7 +728,7 @@ def max_pool2d(
         cols = []
         for j in range(ow):
             win = x[:, :, i * s[0] : i * s[0] + kh, j * s[1] : j * s[1] + kw]
-            cols.append(win.reshape([n, c, -1]).max(dim=-1))
+            cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
         rows.append(_native_stack(cols, dim=-1))
     return _native_stack(rows, dim=2)
 
@@ -761,7 +762,7 @@ def max_pool3d(
                     i * s[1] : i * s[1] + kh,
                     j * s[2] : j * s[2] + kw,
                 ]
-                cols.append(win.reshape([n, c, -1]).max(dim=-1))
+                cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
             rows.append(_native_stack(cols, dim=-1))
         vols.append(_native_stack(rows, dim=2))
     return _native_stack(vols, dim=2)
@@ -801,7 +802,7 @@ def fractional_max_pool2d(
         cols = []
         for s_w in w_starts:
             win = x[:, :, s_h : s_h + kh, s_w : s_w + kw]
-            cols.append(win.reshape([n, c, -1]).max(dim=-1))
+            cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
         rows.append(_native_stack(cols, dim=-1))
     out = _native_stack(rows, dim=2)
     if return_indices:
@@ -847,7 +848,7 @@ def fractional_max_pool3d(
             cols = []
             for s_w in w_starts:
                 win = x[:, :, s_d : s_d + kd, s_h : s_h + kh, s_w : s_w + kw]
-                cols.append(win.reshape([n, c, -1]).max(dim=-1))
+                cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
             rows.append(_native_stack(cols, dim=-1))
         vols.append(_native_stack(rows, dim=2))
     out = _native_stack(vols, dim=2)
@@ -1105,7 +1106,7 @@ def adaptive_max_pool1d(input: _Tensor, output_size: int) -> _Tensor:
         start = int(math.floor(i * L_in / L_out))
         end = int(math.ceil((i + 1) * L_in / L_out))
         win = x[:, :, start:end]
-        cols.append(win.reshape([n, c, -1]).max(dim=-1))
+        cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
     return _native_stack(cols, dim=-1)
 
 
@@ -1127,7 +1128,7 @@ def adaptive_max_pool2d(input: _Tensor, output_size: Union[int, Tuple[int, int]]
             w_start = int(math.floor(w * W_in / W_out))
             w_end = int(math.ceil((w + 1) * W_in / W_out))
             win = x[:, :, h_start:h_end, w_start:w_end]
-            cols.append(win.reshape([n, c, -1]).max(dim=-1))
+            cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
         rows.append(_native_stack(cols, dim=-1))
     return _native_stack(rows, dim=2)
 
@@ -1154,7 +1155,7 @@ def adaptive_max_pool3d(input: _Tensor, output_size: Union[int, Tuple[int, int, 
                 w_start = int(math.floor(w * W_in / W_out))
                 w_end = int(math.ceil((w + 1) * W_in / W_out))
                 win = x[:, :, d_start:d_end, h_start:h_end, w_start:w_end]
-                cols.append(win.reshape([n, c, -1]).max(dim=-1))
+                cols.append(win.reshape([n, c, -1]).max(dim=-1).values)
             rows.append(_native_stack(cols, dim=-1))
         vols.append(_native_stack(rows, dim=2))
     return _native_stack(vols, dim=2)
@@ -1285,10 +1286,10 @@ def layer_norm(
     normed = (flat - mean) / (var + eps).sqrt()
     norm_x = normed.reshape(list(input.shape))
     if weight is not None:
-        w = weight if isinstance(weight, _Tensor) else _from_numpy(np.ascontiguousarray(_to_np(weight)))
+        w = weight if isinstance(weight, _Tensor) else _from_numpy(_contig(_to_np(weight)))
         norm_x = norm_x * w
     if bias is not None:
-        b = bias if isinstance(bias, _Tensor) else _from_numpy(np.ascontiguousarray(_to_np(bias)))
+        b = bias if isinstance(bias, _Tensor) else _from_numpy(_contig(_to_np(bias)))
         norm_x = norm_x + b
     return norm_x
 
@@ -1755,12 +1756,12 @@ def embedding(
     # max_norm/norm_type/scale_grad_by_freq/sparse match torch defaults (no-ops here,
     # as in the previous implementation).
     idx_np = _to_np(input).astype(int)
-    w = weight if isinstance(weight, _Tensor) else _from_numpy(np.ascontiguousarray(_to_np(weight)))
-    oh = one_hot(_from_numpy(np.ascontiguousarray(idx_np)), num_classes=w.shape[0])
+    w = weight if isinstance(weight, _Tensor) else _from_numpy(_contig(_to_np(weight)))
+    oh = one_hot(_from_numpy(_contig(idx_np)), num_classes=w.shape[0])
     oh_f = oh.to_dtype("f32") if str(oh.to_numpy().dtype) != "float32" else oh
     res = oh_f.matmul(w)
     if padding_idx is not None:
-        mask = _from_numpy(np.ascontiguousarray((idx_np != padding_idx).astype(np.float32)))
+        mask = _from_numpy(_contig((idx_np != padding_idx).astype(np.float32)))
         res = res * mask.unsqueeze(-1)
     return res
 
@@ -1793,7 +1794,7 @@ def embedding_bag(
         elif mode == "mean":
             return emb.mean(dim=1)
         else:
-            return emb.max(dim=1)
+            return emb.max(dim=1).values
 
     off = _to_np(offsets).astype(int)
     idx = _to_np(input).astype(int)
@@ -1802,7 +1803,7 @@ def embedding_bag(
     for b in range(num_bags):
         start = off[b]
         end = off[b + 1] if b + 1 < len(off) else len(idx)
-        bag_indices = _from_numpy(np.ascontiguousarray(idx[start:end]))
+        bag_indices = _from_numpy(_contig(idx[start:end]))
         bag_emb = embedding(bag_indices, weight, padding_idx=padding_idx)
         if per_sample_weights is not None:
             psw = _as_tensor(per_sample_weights).narrow(0, start, end - start)
@@ -1812,7 +1813,7 @@ def embedding_bag(
         elif mode == "mean":
             bags.append(bag_emb.mean(dim=0))
         else:
-            bags.append(bag_emb.max(dim=0))
+            bags.append(bag_emb.max(dim=0).values)
     return _native_stack(bags, dim=0)
 
 
@@ -2091,7 +2092,7 @@ def gumbel_softmax(logits: _Tensor, tau: float = 1.0, hard: bool = False, eps: f
     # Gumbel noise: -log(-log(U + eps) + eps) where U ~ Uniform(0, 1)
     u = np.random.uniform(eps, 1.0 - eps, size=list(logits.shape)).astype(np.float32)
     g = -np.log(-np.log(u))
-    g_noise = _from_numpy(np.ascontiguousarray(g))
+    g_noise = _from_numpy(_contig(g))
     y_soft = ((logits + g_noise) / float(tau)).softmax(dim)
     if not hard:
         return y_soft
@@ -2099,7 +2100,7 @@ def gumbel_softmax(logits: _Tensor, tau: float = 1.0, hard: bool = False, eps: f
     y_hard_np = np.zeros(list(y_soft.shape), dtype=np.float32)
     idx = y_soft.argmax(dim=dim).to_numpy()
     np.put_along_axis(y_hard_np, idx[..., None], 1.0, axis=dim)
-    y_hard = _from_numpy(np.ascontiguousarray(y_hard_np))
+    y_hard = _from_numpy(_contig(y_hard_np))
     return (y_hard - y_soft).detach() + y_soft
 
 
@@ -2202,10 +2203,10 @@ def multi_head_attention_forward(
         else:
             m_np = np.asarray(attn_mask)
             if m_np.dtype == bool or m_np.dtype == np.bool_:
-                keep = _from_numpy(np.ascontiguousarray(m_np, dtype=np.float32))
+                keep = _from_numpy(_contig(m_np, dtype=np.float32))
                 scores = scores * keep + (1.0 - keep) * -1e9
             else:
-                scores = scores + _from_numpy(np.ascontiguousarray(m_np, dtype=np.float32))
+                scores = scores + _from_numpy(_contig(m_np, dtype=np.float32))
 
     attn_weights = scores.softmax(-1)
     if dropout_p > 0.0 and training:
@@ -2407,4 +2408,261 @@ __all__ = [
     "jvp",
     "jacobian",
     "hessian",
+]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Max pooling with indices, dilation and ceil_mode; more losses; in-place activations; deprecated upsample aliases
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _ntuple(v: Any, n: int, name: str) -> Tuple[int, ...]:
+    if isinstance(v, (list, tuple)):
+        if len(v) != n:
+            raise ValueError(f"{name} must be an int or a sequence of {n} ints, got {v}")
+        return tuple(int(x) for x in v)
+    return (int(v),) * n
+
+
+def _max_pool_nd(input: _Tensor, nd: int, kernel_size, stride, padding, dilation, ceil_mode: bool, name: str):
+    """Argument handling for max pooling; the windows, maxima and indices are computed by the Rust kernel."""
+    from .oxideon import _max_pool_nd as _rs_max_pool_nd
+    x = _as_tensor(input)
+    if len(x.shape) not in (nd + 1, nd + 2):
+        raise ValueError(f"{name}: expected a {nd + 1}-D or {nd + 2}-D input, got shape {tuple(x.shape)}")
+    k = _ntuple(kernel_size, nd, "kernel_size")
+    s = k if stride is None or (isinstance(stride, (list, tuple)) and len(stride) == 0) else _ntuple(stride, nd, "stride")
+    return _rs_max_pool_nd(x, list(k), list(s), list(_ntuple(padding, nd, "padding")), list(_ntuple(dilation, nd, "dilation")), bool(ceil_mode))
+
+
+def _adaptive_max_pool_nd(input: _Tensor, nd: int, output_size, name: str):
+    """Argument handling for adaptive max pooling (None keeps a dimension's size); the pooling runs in Rust."""
+    from .oxideon import _adaptive_max_pool_nd as _rs_adaptive_max_pool_nd
+    x = _as_tensor(input)
+    spatial = tuple(int(v) for v in x.shape[len(x.shape) - nd:])
+    if isinstance(output_size, (list, tuple)):
+        o = tuple(spatial[i] if v is None else int(v) for i, v in enumerate(output_size))
+    else:
+        o = _ntuple(output_size, nd, "output_size")
+    if len(o) != nd or any(v <= 0 for v in o):
+        raise ValueError(f"{name}: output_size must be {nd} positive sizes, got {output_size}")
+    return _rs_adaptive_max_pool_nd(x, list(o))
+
+
+def max_pool1d_with_indices(input: _Tensor, kernel_size, stride=None, padding=0, dilation=1, ceil_mode: bool = False,
+                            return_indices: bool = False) -> Tuple[_Tensor, _Tensor]:
+    """1-D max pooling returning (values, indices); indices point into the flattened input length."""
+    return _max_pool_nd(input, 1, kernel_size, stride, padding, dilation, ceil_mode, "max_pool1d")
+
+
+def max_pool2d_with_indices(input: _Tensor, kernel_size, stride=None, padding=0, dilation=1, ceil_mode: bool = False,
+                            return_indices: bool = False) -> Tuple[_Tensor, _Tensor]:
+    """2-D max pooling returning (values, indices); indices point into the flattened H * W plane (as MaxUnpool2d expects)."""
+    return _max_pool_nd(input, 2, kernel_size, stride, padding, dilation, ceil_mode, "max_pool2d")
+
+
+def max_pool3d_with_indices(input: _Tensor, kernel_size, stride=None, padding=0, dilation=1, ceil_mode: bool = False,
+                            return_indices: bool = False) -> Tuple[_Tensor, _Tensor]:
+    """3-D max pooling returning (values, indices into the flattened D * H * W volume)."""
+    return _max_pool_nd(input, 3, kernel_size, stride, padding, dilation, ceil_mode, "max_pool3d")
+
+
+def adaptive_max_pool1d_with_indices(input: _Tensor, output_size, return_indices: bool = False) -> Tuple[_Tensor, _Tensor]:
+    """Adaptive 1-D max pooling returning (values, indices)."""
+    return _adaptive_max_pool_nd(input, 1, output_size, "adaptive_max_pool1d")
+
+
+def adaptive_max_pool2d_with_indices(input: _Tensor, output_size, return_indices: bool = False) -> Tuple[_Tensor, _Tensor]:
+    """Adaptive 2-D max pooling returning (values, indices)."""
+    return _adaptive_max_pool_nd(input, 2, output_size, "adaptive_max_pool2d")
+
+
+def adaptive_max_pool3d_with_indices(input: _Tensor, output_size, return_indices: bool = False) -> Tuple[_Tensor, _Tensor]:
+    """Adaptive 3-D max pooling returning (values, indices)."""
+    return _adaptive_max_pool_nd(input, 3, output_size, "adaptive_max_pool3d")
+
+
+def _pool_front(with_indices):
+    def pool(input, kernel_size, stride=None, padding=0, dilation=1, ceil_mode=False, return_indices=False):
+        vals, idx = with_indices(input, kernel_size, stride, padding, dilation, ceil_mode)
+        return (vals, idx) if return_indices else vals
+    return pool
+
+
+def _adaptive_front(with_indices):
+    def pool(input, output_size, return_indices=False):
+        vals, idx = with_indices(input, output_size)
+        return (vals, idx) if return_indices else vals
+    return pool
+
+
+max_pool1d = _pool_front(max_pool1d_with_indices)
+max_pool2d = _pool_front(max_pool2d_with_indices)
+max_pool3d = _pool_front(max_pool3d_with_indices)
+adaptive_max_pool1d = _adaptive_front(adaptive_max_pool1d_with_indices)
+adaptive_max_pool2d = _adaptive_front(adaptive_max_pool2d_with_indices)
+adaptive_max_pool3d = _adaptive_front(adaptive_max_pool3d_with_indices)
+for _f, _nd in ((max_pool1d, 1), (max_pool2d, 2), (max_pool3d, 3)):
+    _f.__name__ = f"max_pool{_nd}d"
+    _f.__doc__ = (f"{_nd}-D max pooling (kernel_size, stride, padding, dilation, ceil_mode as in PyTorch); with "
+                  "return_indices=True also the indices into the flattened spatial input.")
+for _f, _nd in ((adaptive_max_pool1d, 1), (adaptive_max_pool2d, 2), (adaptive_max_pool3d, 3)):
+    _f.__name__ = f"adaptive_max_pool{_nd}d"
+    _f.__doc__ = f"Adaptive {_nd}-D max pooling to output_size; with return_indices=True also the indices."
+
+
+def lp_pool3d(input: _Tensor, norm_type: float, kernel_size, stride=None, ceil_mode: bool = False) -> _Tensor:
+    """3-D power-average pooling: (sum over the window of x ** p) ** (1 / p)."""
+    if ceil_mode:
+        raise NotImplementedError("lp_pool3d: ceil_mode is not supported")
+    k = _ntuple(kernel_size, 3, "kernel_size")
+    s = k if stride is None else _ntuple(stride, 3, "stride")
+    out = avg_pool3d(_as_tensor(input).pow(float(norm_type)), k, s)
+    return (out.sign() * out.abs().relu() * float(np.prod(k))).pow(1.0 / norm_type)
+
+
+def _reduce(loss: _Tensor, reduction: str, name: str) -> _Tensor:
+    if reduction == "none":
+        return loss
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    raise ValueError(f"{name}: reduction must be 'none', 'mean' or 'sum', got {reduction!r}")
+
+
+def multi_margin_loss(input: _Tensor, target: _Tensor, p: int = 1, margin: float = 1.0, weight: Optional[_Tensor] = None,
+                      size_average=None, reduce=None, reduction: str = "mean") -> _Tensor:
+    """Multi-class hinge loss: for each sample, sum over the wrong classes j of max(0, margin - x[y] + x[j]) ** p,
+    times weight[y], divided by the number of classes."""
+    if p not in (1, 2):
+        raise ValueError("multi_margin_loss: only p = 1 and p = 2 are supported")
+    x = _as_tensor(input)
+    unbatched = len(x.shape) == 1
+    if unbatched:
+        x = x.reshape([1, -1])
+    n, c = int(x.shape[0]), int(x.shape[1])
+    y = target.detach().to_numpy().astype(np.int64).reshape(-1) if isinstance(target, _Tensor) else np.asarray(target, np.int64).reshape(-1)
+    xy = x.gather(1, _from_numpy(_contig(y.reshape(n, 1))))
+    m = (x - xy + float(margin)).relu()
+    if p == 2:
+        m = m * m
+    not_y = np.ones((n, c), dtype=np.float32)
+    not_y[np.arange(n), y] = 0.0
+    m = m * _from_numpy(not_y)
+    if weight is not None:
+        w = weight.detach().to_numpy().reshape(-1)[y].reshape(n, 1).astype(np.float32)
+        m = m * _from_numpy(_contig(w))
+    loss = m.sum(1) * (1.0 / c)
+    if unbatched:
+        loss = loss.reshape([])
+    return _reduce(loss, reduction, "multi_margin_loss")
+
+
+def multilabel_margin_loss(input: _Tensor, target: _Tensor, size_average=None, reduce=None, reduction: str = "mean") -> _Tensor:
+    """Multi-label hinge loss. `target` holds class indices per sample, ended by the first -1; the loss sums
+    max(0, 1 - (x[j] - x[i])) over listed classes j and unlisted classes i, divided by the number of classes."""
+    x = _as_tensor(input)
+    unbatched = len(x.shape) == 1
+    if unbatched:
+        x = x.reshape([1, -1])
+    n, c = int(x.shape[0]), int(x.shape[1])
+    t = (target.detach().to_numpy() if isinstance(target, _Tensor) else np.asarray(target)).astype(np.int64).reshape(n, c)
+    # the labels of a row are its entries before the first -1
+    active = np.cumprod(t >= 0, axis=1).astype(bool)
+    rows = np.broadcast_to(np.arange(n)[:, None], t.shape)[active]
+    cols = t[active]
+    listed = np.zeros((n, c), dtype=np.float32)
+    np.add.at(listed, (rows, cols), 1.0)
+    is_target = (listed > 0).astype(np.float32)
+    mask = listed[:, :, None] * (1.0 - is_target)[:, None, :]  # (n, j, i)
+    diff = x.reshape([n, c, 1]) - x.reshape([n, 1, c])
+    hinge = (1.0 - diff).relu() * _from_numpy(_contig(mask))
+    loss = hinge.sum(2).sum(1) * (1.0 / c)
+    if unbatched:
+        loss = loss.reshape([])
+    return _reduce(loss, reduction, "multilabel_margin_loss")
+
+
+def multilabel_soft_margin_loss(input: _Tensor, target: _Tensor, weight: Optional[_Tensor] = None, size_average=None,
+                                reduce=None, reduction: str = "mean") -> _Tensor:
+    """Multi-label one-versus-all logistic loss: the mean over classes of -(y log sigmoid(x) + (1 - y) log sigmoid(-x))."""
+    x = _as_tensor(input)
+    y = _as_tensor(target)
+    loss = (y * x.log_sigmoid() + (1.0 - y) * (-x).log_sigmoid()) * -1.0
+    if weight is not None:
+        loss = loss * weight
+    c = int(x.shape[-1])
+    loss = loss.sum(len(x.shape) - 1) * (1.0 / c)
+    return _reduce(loss, reduction, "multilabel_soft_margin_loss")
+
+
+def triplet_margin_with_distance_loss(anchor: _Tensor, positive: _Tensor, negative: _Tensor, *,
+                                      distance_function: Optional[Callable[[_Tensor, _Tensor], _Tensor]] = None,
+                                      margin: float = 1.0, swap: bool = False, reduction: str = "mean") -> _Tensor:
+    """Triplet loss max(0, d(a, p) - d(a, n) + margin) with any distance function (pairwise Euclidean by default);
+    `swap=True` uses min(d(a, n), d(p, n)) as the negative distance."""
+    if margin <= 0:
+        raise ValueError(f"triplet_margin_with_distance_loss: margin must be greater than 0, got {margin}")
+    dist = distance_function if distance_function is not None else pairwise_distance
+    dp = dist(anchor, positive)
+    dn = dist(anchor, negative)
+    if swap:
+        ds = dist(positive, negative)
+        dn = _ox_where(ds < dn, ds, dn)
+    return _reduce((dp - dn + float(margin)).relu(), reduction, "triplet_margin_with_distance_loss")
+
+
+def linear_cross_entropy(input: _Tensor, linear_weight: _Tensor, target: Any, *, linear_bias: Optional[_Tensor] = None,
+                         weight: Optional[_Tensor] = None, reduction: str = "mean", ignore_index: int = -100,
+                         label_smoothing: float = 0.0, **_options: Any) -> _Tensor:
+    """Cross entropy of `input @ linear_weight.T + linear_bias` against `target` (the projection to class logits and
+    the loss in one call, as for a language-model head)."""
+    logits = input.matmul(linear_weight.transpose(0, 1))
+    if linear_bias is not None:
+        logits = logits + linear_bias
+    return cross_entropy(logits, target, weight=weight, reduction=reduction, ignore_index=ignore_index,
+                         label_smoothing=label_smoothing)
+
+
+def _functional_inplace(name: str, fn: Callable[..., _Tensor]) -> Callable[..., _Tensor]:
+    def inplace(input: _Tensor, *args: Any, **kwargs: Any) -> _Tensor:
+        from .tensor_methods import _check_inplace, _write  # the same rules as Tensor's in-place methods
+        _check_inplace(input, name)
+        return _write(input, fn(input, *args, **kwargs), name)
+    inplace.__name__ = name
+    inplace.__doc__ = f"In-place `{name[:-1]}`: overwrites `input` with the result and returns it."
+    return inplace
+
+
+relu_ = _functional_inplace("relu_", lambda x: relu(x))
+elu_ = _functional_inplace("elu_", lambda x, alpha=1.0: elu(x, alpha))
+celu_ = _functional_inplace("celu_", lambda x, alpha=1.0: celu(x, alpha))
+selu_ = _functional_inplace("selu_", lambda x: selu(x))
+leaky_relu_ = _functional_inplace("leaky_relu_", lambda x, negative_slope=0.01: leaky_relu(x, negative_slope))
+hardtanh_ = _functional_inplace("hardtanh_", lambda x, min_val=-1.0, max_val=1.0: hardtanh(x, min_val, max_val))
+threshold_ = _functional_inplace("threshold_", lambda x, threshold_value, value: threshold(x, threshold_value, value))
+rrelu_ = _functional_inplace("rrelu_", lambda x, lower=0.125, upper=1.0 / 3, training=False: rrelu(x, lower, upper, training))
+
+
+def upsample(input: _Tensor, size=None, scale_factor=None, mode: str = "nearest", align_corners=None) -> _Tensor:
+    """Deprecated alias of `interpolate`."""
+    return interpolate(input, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
+
+
+def upsample_nearest(input: _Tensor, size=None, scale_factor=None) -> _Tensor:
+    """Deprecated: `interpolate(..., mode="nearest")`."""
+    return interpolate(input, size=size, scale_factor=scale_factor, mode="nearest")
+
+
+def upsample_bilinear(input: _Tensor, size=None, scale_factor=None) -> _Tensor:
+    """Deprecated: `interpolate(..., mode="bilinear", align_corners=True)` (note align_corners=True, as in PyTorch)."""
+    return interpolate(input, size=size, scale_factor=scale_factor, mode="bilinear", align_corners=True)
+
+
+__all__ += [
+    "max_pool1d_with_indices", "max_pool2d_with_indices", "max_pool3d_with_indices",
+    "adaptive_max_pool1d_with_indices", "adaptive_max_pool2d_with_indices", "adaptive_max_pool3d_with_indices",
+    "lp_pool3d", "multi_margin_loss", "multilabel_margin_loss", "multilabel_soft_margin_loss",
+    "triplet_margin_with_distance_loss", "linear_cross_entropy", "relu_", "elu_", "celu_", "selu_", "leaky_relu_",
+    "hardtanh_", "threshold_", "rrelu_", "upsample", "upsample_nearest", "upsample_bilinear",
 ]

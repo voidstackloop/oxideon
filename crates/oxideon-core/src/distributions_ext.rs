@@ -1099,6 +1099,61 @@ impl Distribution for Laplace {
 }
 
 
+// ---------------------------------------------------------------------------------------------------------------
+// Sampling primitives for the Python distributions (drawn from the global, `manual_seed`-able generator)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Standard gamma draws `Gamma(alpha, 1)` for every element of `alpha`, differentiable in `alpha` (implicit
+/// reparameterization).
+pub fn sample_standard_gamma(alpha: &Tensor) -> Result<Tensor> {
+    standard_gamma(&alpha.contiguous()?)
+}
+
+/// Poisson draws with the given (non-negative) rates, as floats.
+pub fn sample_poisson(rate: &Tensor) -> Result<Tensor> {
+    let lam = rate.to_vec::<f64>()?;
+    if lam.iter().any(|&l| l.is_nan() || l < 0.0) {
+        return Err(Error::Msg("sample_poisson: rates must be non-negative".into()));
+    }
+    let out: Vec<f64> = rng::with_rng(|r| lam.iter().map(|&l| poisson_draw(r, l)).collect());
+    Tensor::from_slice_on(&out, rate.shape(), &rate.device())?.to_dtype(if rate.dtype().is_floating_point() { rate.dtype() } else { crate::dtype::DType::F32 })
+}
+
+/// Von Mises draws (Best & Fisher 1979) with the given means and concentrations (one shape), wrapped to [-pi, pi).
+pub fn sample_von_mises(loc: &Tensor, concentration: &Tensor) -> Result<Tensor> {
+    if loc.shape() != concentration.shape() {
+        return Err(Error::Msg("sample_von_mises: loc and concentration must have one shape".into()));
+    }
+    let (mu, k) = (loc.to_vec::<f64>()?, concentration.to_vec::<f64>()?);
+    let out: Vec<f64> = rng::with_rng(|r| {
+        mu.iter()
+            .zip(&k)
+            .map(|(&m, &kappa)| {
+                let theta = if kappa < 1e-8 {
+                    std::f64::consts::PI * (2.0 * r.next_f64() - 1.0)
+                } else {
+                    let tau = 1.0 + (1.0 + 4.0 * kappa * kappa).sqrt();
+                    let rho = (tau - (2.0 * tau).sqrt()) / (2.0 * kappa);
+                    let rr = (1.0 + rho * rho) / (2.0 * rho);
+                    loop {
+                        let (u1, u2, u3) = (r.next_f64(), r.next_f64(), r.next_f64());
+                        let z = (std::f64::consts::PI * u1).cos();
+                        let f = (1.0 + rr * z) / (rr + z);
+                        let c = kappa * (rr - f);
+                        if c * (2.0 - c) - u2 > 0.0 || (c / u2).ln() + 1.0 - c >= 0.0 {
+                            let sign = if u3 > 0.5 { 1.0 } else { -1.0 };
+                            break sign * f.clamp(-1.0, 1.0).acos();
+                        }
+                    }
+                };
+                let x = theta + m + std::f64::consts::PI;
+                x - (x / std::f64::consts::TAU).floor() * std::f64::consts::TAU - std::f64::consts::PI
+            })
+            .collect()
+    });
+    Tensor::from_slice_on(&out, loc.shape(), &loc.device())?.to_dtype(if loc.dtype().is_floating_point() { loc.dtype() } else { crate::dtype::DType::F32 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

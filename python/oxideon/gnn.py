@@ -718,7 +718,7 @@ def global_max_pool(
 ) -> _Tensor:
     """Returns batch-wise graph-level max aggregations of node features."""
     if batch is None:
-        return x.max(dim=0, keepdim=True)[0]
+        return x.max(dim=0, keepdim=True).values[0]
     return scatter_max(x, batch, dim=0, dim_size=size)[0]
 
 

@@ -514,3 +514,83 @@ __all__ = [
     "make_blobs",
     "make_regression",
 ]
+
+
+class DistributedSampler(Sampler):
+    """Gives each of `num_replicas` processes its own share of the dataset indices (process `rank` takes every
+    num_replicas-th index of the, optionally shuffled, list). Call `set_epoch(epoch)` at the start of every epoch so the
+    shuffle differs between epochs but agrees across processes. Without `drop_last` the list is padded by repeating
+    indices so every process gets the same number."""
+
+    def __init__(self, dataset: Any, num_replicas: Optional[int] = None, rank: Optional[int] = None, shuffle: bool = True,
+                 seed: int = 0, drop_last: bool = False) -> None:
+        if num_replicas is None or rank is None:
+            try:
+                from . import distributed as _dist
+                num_replicas = _dist.get_world_size() if num_replicas is None else num_replicas
+                rank = _dist.get_rank() if rank is None else rank
+            except Exception:
+                num_replicas = 1 if num_replicas is None else num_replicas
+                rank = 0 if rank is None else rank
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]")
+        self.dataset, self.num_replicas, self.rank = dataset, num_replicas, rank
+        self.shuffle, self.seed, self.drop_last, self.epoch = shuffle, seed, drop_last, 0
+        n = len(dataset)
+        if drop_last and n % num_replicas:
+            self.num_samples = math.ceil((n - num_replicas) / num_replicas)
+        else:
+            self.num_samples = math.ceil(n / num_replicas)
+        self.total_size = self.num_samples * num_replicas
+
+    def __iter__(self) -> Iterator[int]:
+        n = len(self.dataset)
+        if self.shuffle:
+            indices = np.random.default_rng(self.seed + self.epoch).permutation(n).tolist()
+        else:
+            indices = list(range(n))
+        if not self.drop_last:
+            pad = self.total_size - len(indices)
+            if pad > 0:
+                indices += (indices * math.ceil(pad / max(len(indices), 1)))[:pad]
+        else:
+            indices = indices[: self.total_size]
+        return iter(indices[self.rank: self.total_size: self.num_replicas])
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        """Sets the epoch, which seeds the shuffle (so every process shuffles the same way)."""
+        self.epoch = epoch
+
+
+class StackDataset(Dataset):
+    """Combines datasets of equal length sample by sample: positional datasets give tuples, keyword datasets dicts
+    (`StackDataset(images=a, labels=b)[i] == {"images": a[i], "labels": b[i]}`)."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if args and kwargs:
+            raise ValueError("StackDataset takes either positional or keyword datasets, not both")
+        sets = list(args) if args else list(kwargs.values())
+        if not sets:
+            raise ValueError("StackDataset needs at least one dataset")
+        n = len(sets[0])
+        if any(len(s) != n for s in sets):
+            raise ValueError("Size mismatch between datasets")
+        self._length = n
+        self.datasets = tuple(args) if args else dict(kwargs)
+
+    def __getitem__(self, index: int) -> Any:
+        if isinstance(self.datasets, dict):
+            return {k: d[index] for k, d in self.datasets.items()}
+        return tuple(d[index] for d in self.datasets)
+
+    def __getitems__(self, indices: List[int]) -> List[Any]:
+        return [self[i] for i in indices]
+
+    def __len__(self) -> int:
+        return self._length
+
+
+__all__ += ["DistributedSampler", "StackDataset"]

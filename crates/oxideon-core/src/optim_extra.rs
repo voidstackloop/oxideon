@@ -1654,6 +1654,61 @@ mod extra_optimizer_tests {
     }
 }
 
+/// One step of `torch.optim.SparseAdam` on a dense gradient: only the rows (slices along dimension 0; elements of a
+/// 1-D tensor) whose gradient is non-zero have their moments and values updated, so untouched embedding rows keep
+/// both. Returns the new parameter values and moments in the parameter's dtype; `step` counts this step (1, 2, ...).
+#[allow(clippy::too_many_arguments)]
+pub fn sparse_adam_step(
+    param: &Tensor,
+    grad: &Tensor,
+    exp_avg: &Tensor,
+    exp_avg_sq: &Tensor,
+    step: u64,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    maximize: bool,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let shape = param.shape().to_vec();
+    if grad.shape() != shape.as_slice() || exp_avg.shape() != shape.as_slice() || exp_avg_sq.shape() != shape.as_slice() {
+        return Err(Error::Msg("sparse_adam_step: param, grad and the moments must have the same shape".into()));
+    }
+    if step == 0 {
+        return Err(Error::Msg("sparse_adam_step: step counts from 1".into()));
+    }
+    let mut p = param.to_vec::<f64>()?;
+    let g = grad.to_vec::<f64>()?;
+    let mut m = exp_avg.to_vec::<f64>()?;
+    let mut v = exp_avg_sq.to_vec::<f64>()?;
+    let rows = if shape.is_empty() { 1 } else { shape[0] };
+    let row_len = if rows == 0 { 0 } else { p.len() / rows };
+    let bc1 = 1.0 - beta1.powi(step as i32);
+    let bc2 = 1.0 - beta2.powi(step as i32);
+    let step_size = lr * bc2.sqrt() / bc1;
+    let sign = if maximize { -1.0 } else { 1.0 };
+    for r in 0..rows {
+        let span = r * row_len..(r + 1) * row_len;
+        if g[span.clone()].iter().all(|&x| x == 0.0) {
+            continue;
+        }
+        for i in span {
+            let gi = sign * g[i];
+            m[i] += (gi - m[i]) * (1.0 - beta1);
+            v[i] += (gi * gi - v[i]) * (1.0 - beta2);
+            p[i] -= step_size * m[i] / (v[i].sqrt() + eps);
+        }
+    }
+    let dev = param.device();
+    let dt = param.dtype();
+    Ok((
+        Tensor::from_slice_on(&p, &shape, &dev)?.to_dtype(dt)?,
+        Tensor::from_slice_on(&m, &shape, &dev)?.to_dtype(dt)?,
+        Tensor::from_slice_on(&v, &shape, &dev)?.to_dtype(dt)?,
+    ))
+}
+
+
 #[cfg(test)]
 mod lamb_tests {
     use super::*;
@@ -1690,5 +1745,24 @@ mod lamb_tests {
         opt.step().unwrap();
         other.step().unwrap();
         assert_eq!(vals(&p), vals(&q));
+    }
+}
+
+#[cfg(test)]
+mod sparse_adam_tests {
+    use super::*;
+
+    #[test]
+    fn untouched_rows_keep_values_and_moments() {
+        let p = Tensor::from_slice(&[1.0f32; 6], &[3, 2]).unwrap();
+        let g = Tensor::from_slice(&[0.0f32, 0.0, 1.0, 0.0, 0.0, 0.0], &[3, 2]).unwrap();
+        let z = p.zeros_like().unwrap();
+        let (np, nm, _) = sparse_adam_step(&p, &g, &z, &z, 1, 0.1, 0.9, 0.999, 1e-8, false).unwrap();
+        let v = np.to_vec::<f32>().unwrap();
+        assert_eq!(v[0], 1.0);
+        assert_eq!(v[4], 1.0);
+        assert!((v[2] - 0.9).abs() < 1e-6); // the first Adam step moves by lr
+        assert_eq!(v[3], 1.0); // touched row, zero entry: moves by 0
+        assert_eq!(nm.to_vec::<f32>().unwrap()[0], 0.0);
     }
 }

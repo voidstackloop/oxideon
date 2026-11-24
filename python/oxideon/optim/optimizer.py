@@ -16,6 +16,8 @@ def _copy_optim_state(value: Any) -> Any:
     """Deep-copies optimizer state values (NumPy buffers, nested containers)."""
     if isinstance(value, np.ndarray):
         return value.copy()
+    if isinstance(value, Tensor):
+        return value.detach() * 1.0
     if isinstance(value, dict):
         return {k: _copy_optim_state(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -23,6 +25,33 @@ def _copy_optim_state(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_copy_optim_state(v) for v in value)
     return value
+
+
+def _zeros(p: Tensor) -> Tensor:
+    """A zero state tensor with p's shape and dtype (Rust storage)."""
+    return p.detach() * 0.0
+
+
+def _zeros_shape(shape: Sequence[int], p: Tensor) -> Tensor:
+    """A zero state tensor of `shape` in p's dtype."""
+    z = from_numpy(np.zeros(tuple(shape), dtype=np.float32))
+    return z if p.dtype == "f32" else z.to_dtype(p.dtype)
+
+
+def _kernel(opt: "Optimizer", kind: str, p: Tensor, state: Dict[str, Any], names: Sequence[str], hyper: Dict[str, Any]) -> None:
+    """Runs the Rust update (`optim_kernels.rs`) for one parameter: the state tensors `names` go in, the updated
+    parameter and states come back."""
+    from ..oxideon import _optim_step
+    bufs = []
+    for n in names:
+        v = state[n]
+        if isinstance(v, np.ndarray):  # state from an older (NumPy-based) checkpoint
+            v = from_numpy(np.ascontiguousarray(v))
+        bufs.append(v)
+    new_p, new_bufs = _optim_step(kind, p.detach(), p.grad, bufs, {k: float(v) for k, v in hyper.items()})
+    p.assign(new_p)
+    for n, v in zip(names, new_bufs):
+        state[n] = v
 
 
 class Optimizer:
@@ -176,55 +205,19 @@ class RMSprop(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
-            alpha = group["alpha"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
-            momentum = group["momentum"]
-            centered = group["centered"]
-
+            hyper = dict(lr=group["lr"], alpha=group["alpha"], eps=group["eps"], weight_decay=group["weight_decay"],
+                         momentum=group["momentum"], centered=float(bool(group["centered"])))
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
-                    state["square_avg"] = np.zeros_like(grad)
-                    if momentum > 0:
-                        state["momentum_buffer"] = np.zeros_like(grad)
-                    if centered:
-                        state["grad_avg"] = np.zeros_like(grad)
-
-                square_avg = state["square_avg"]
-
-                if weight_decay != 0:
-                    grad = grad + weight_decay * p.to_numpy()
-
-                square_avg[:] = alpha * square_avg + (1 - alpha) * (grad ** 2)
-
-                if centered:
-                    grad_avg = state["grad_avg"]
-                    grad_avg[:] = alpha * grad_avg + (1 - alpha) * grad
-                    avg = np.sqrt(square_avg - (grad_avg ** 2) + eps)
-                else:
-                    avg = np.sqrt(square_avg + eps)
-
-                if momentum > 0:
-                    buf = state["momentum_buffer"]
-                    buf[:] = momentum * buf + grad / avg
-                    update = buf
-                else:
-                    update = grad / avg
-
-                p_data = p.to_numpy() - lr * update
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                    state["square_avg"] = _zeros(p)
+                    state["momentum_buffer"] = _zeros(p)
+                    state["grad_avg"] = _zeros(p)
+                _kernel(self, "rmsprop", p, state, ("square_avg", "momentum_buffer", "grad_avg"), hyper)
         return loss
 
 
@@ -260,38 +253,18 @@ class Adagrad(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
-            lr_decay = group["lr_decay"]
-            weight_decay = group["weight_decay"]
-            eps = group["eps"]
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
                     state["step"] = 0
-                    state["sum"] = np.full_like(grad, group["initial_accumulator_value"])
-
+                    state["sum"] = _zeros(p) + float(group["initial_accumulator_value"])
                 state["step"] += 1
-                state_sum = state["sum"]
-
-                if weight_decay != 0:
-                    grad = grad + weight_decay * p.to_numpy()
-
-                clr = lr / (1.0 + (state["step"] - 1) * lr_decay)
-                state_sum[:] += grad ** 2
-                std = np.sqrt(state_sum) + eps
-                p_data = p.to_numpy() - clr * (grad / std)
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                clr = group["lr"] / (1.0 + (state["step"] - 1) * group["lr_decay"])
+                _kernel(self, "adagrad", p, state, ("sum",), dict(clr=clr, eps=group["eps"], weight_decay=group["weight_decay"]))
         return loss
 
 
@@ -318,40 +291,17 @@ class Adadelta(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
-            rho = group["rho"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
-
+            hyper = dict(lr=group["lr"], rho=group["rho"], eps=group["eps"], weight_decay=group["weight_decay"])
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
-                    state["square_avg"] = np.zeros_like(grad)
-                    state["acc_delta"] = np.zeros_like(grad)
-
-                square_avg = state["square_avg"]
-                acc_delta = state["acc_delta"]
-
-                if weight_decay != 0:
-                    grad = grad + weight_decay * p.to_numpy()
-
-                square_avg[:] = rho * square_avg + (1 - rho) * (grad ** 2)
-                std = np.sqrt(square_avg + eps)
-                delta = (np.sqrt(acc_delta + eps) / std) * grad
-                acc_delta[:] = rho * acc_delta + (1 - rho) * (delta ** 2)
-
-                p_data = p.to_numpy() - lr * delta
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                    state["square_avg"] = _zeros(p)
+                    state["acc_delta"] = _zeros(p)
+                _kernel(self, "adadelta", p, state, ("square_avg", "acc_delta"), hyper)
         return loss
 
 
@@ -380,44 +330,20 @@ class Adamax(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
             beta1, beta2 = group["betas"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
                     state["step"] = 0
-                    state["exp_avg"] = np.zeros_like(grad)
-                    state["exp_inf"] = np.zeros_like(grad)
-
+                    state["exp_avg"] = _zeros(p)
+                    state["exp_inf"] = _zeros(p)
                 state["step"] += 1
-                exp_avg = state["exp_avg"]
-                exp_inf = state["exp_inf"]
-
-                if weight_decay != 0:
-                    grad = grad + weight_decay * p.to_numpy()
-
-                exp_avg[:] = beta1 * exp_avg + (1 - beta1) * grad
-                norm_buf = np.maximum(beta2 * exp_inf, np.abs(grad))
-                exp_inf[:] = norm_buf
-
-                bias_correction = 1 - beta1 ** state["step"]
-                clr = lr / bias_correction
-
-                p_data = p.to_numpy() - clr * (exp_avg / (exp_inf + eps))
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                _kernel(self, "adamax", p, state, ("exp_avg", "exp_inf"),
+                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=group["weight_decay"], step=state["step"]))
         return loss
 
 
@@ -449,50 +375,27 @@ class NAdam(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
             beta1, beta2 = group["betas"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
             momentum_decay = group["momentum_decay"]
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
                     state["step"] = 0
-                    state["m"] = np.zeros_like(grad)
-                    state["v"] = np.zeros_like(grad)
+                    state["m"] = _zeros(p)
+                    state["v"] = _zeros(p)
                     state["mu_product"] = 1.0
-
                 state["step"] += 1
                 step = state["step"]
-                m = state["m"]
-                v = state["v"]
-
-                if weight_decay != 0:
-                    grad = grad + weight_decay * p.to_numpy()
-
-                m[:] = beta1 * m + (1 - beta1) * grad
-                v[:] = beta2 * v + (1 - beta2) * (grad ** 2)
-
                 mu = beta1 * (1.0 - 0.5 * 0.96 ** (step * momentum_decay))
                 mu_next = beta1 * (1.0 - 0.5 * 0.96 ** ((step + 1) * momentum_decay))
                 state["mu_product"] *= mu
-                prod = state["mu_product"]
-                denom = np.sqrt(v / (1 - beta2 ** step)) + eps
-                m_hat = mu_next * m / (1 - prod * mu_next) + (1 - mu) * grad / (1 - prod)
-
-                p_data = p.to_numpy() - lr * m_hat / denom
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                _kernel(self, "nadam", p, state, ("m", "v"),
+                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=group["weight_decay"],
+                             step=step, mu=mu, mu_next=mu_next, mu_product=state["mu_product"]))
         return loss
 
 
@@ -521,57 +424,20 @@ class RAdam(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
             beta1, beta2 = group["betas"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
-            rho_inf = 2 / (1 - beta2) - 1
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
                     state["step"] = 0
-                    state["exp_avg"] = np.zeros_like(grad)
-                    state["exp_avg_sq"] = np.zeros_like(grad)
-
+                    state["exp_avg"] = _zeros(p)
+                    state["exp_avg_sq"] = _zeros(p)
                 state["step"] += 1
-                step = state["step"]
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-
-                if weight_decay != 0:
-                    grad = grad + weight_decay * p.to_numpy()
-
-                exp_avg[:] = beta1 * exp_avg + (1 - beta1) * grad
-                exp_avg_sq[:] = beta2 * exp_avg_sq + (1 - beta2) * (grad ** 2)
-
-                beta1_t = beta1 ** step
-                beta2_t = beta2 ** step
-                rho_t = rho_inf - 2 * step * beta2_t / (1 - beta2_t)
-
-                if rho_t > 4:
-                    r_t = math.sqrt(
-                        ((rho_t - 4) * (rho_t - 2) * rho_inf) / ((rho_inf - 4) * (rho_inf - 2) * rho_t)
-                    )
-                    v_hat = np.sqrt(exp_avg_sq / (1 - beta2_t)) + eps
-                    step_size = lr * r_t / (1 - beta1_t)
-                    update = step_size * exp_avg / v_hat
-                else:
-                    step_size = lr / (1 - beta1_t)
-                    update = step_size * exp_avg
-
-                p_data = p.to_numpy() - update
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                _kernel(self, "radam", p, state, ("exp_avg", "exp_avg_sq"),
+                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=group["weight_decay"], step=state["step"]))
         return loss
 
 
@@ -599,47 +465,23 @@ class ASGD(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
-            lambd = group["lambd"]
-            alpha = group["alpha"]
-            t0 = group["t0"]
-            weight_decay = group["weight_decay"]
-
+            lr, lambd, alpha, t0 = group["lr"], group["lambd"], group["alpha"], group["t0"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
                     state["step"] = 0
                     state["eta"] = lr
                     state["mu"] = 1.0
-                    state["ax"] = p.to_numpy().copy()
-
+                    state["ax"] = p.detach() * 1.0
                 state["step"] += 1
-                step = state["step"]
-                ax = state["ax"]
-
-                if weight_decay != 0:
-                    grad = grad + weight_decay * p.to_numpy()
-
-                p_data = p.to_numpy() - state["eta"] * grad
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
-                if state["mu"] != 1:
-                    ax[:] += (p.to_numpy() - ax) * state["mu"]
-                else:
-                    ax[:] = p.to_numpy()
-
-                state["eta"] = lr / ((1 + lambd * lr * step) ** alpha)
-                state["mu"] = 1 / max(1, step - t0)
-
+                _kernel(self, "asgd", p, state, ("ax",),
+                        dict(eta=state["eta"], mu=state["mu"], lambd=lambd, weight_decay=group["weight_decay"]))
+                state["eta"] = lr / ((1 + lambd * lr * state["step"]) ** alpha)
+                state["mu"] = 1 / max(1, state["step"] - t0)
         return loss
 
 
@@ -680,32 +522,34 @@ class LBFGS(Optimizer):
         if len(self.param_groups) != 1:
             raise ValueError("LBFGS doesn't support per-parameter options (parameter groups)")
 
-    def _gather_flat_grad(self) -> np.ndarray:
-        views = []
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    view = np.zeros_like(p.to_numpy())
-                else:
-                    view = p.grad.to_numpy()
-                views.append(view.reshape(-1))
-        return np.concatenate(views)
+    # The flattened parameters, gradients and history vectors are oxideon tensors, so every vector operation of the
+    # two-loop recursion (dot products, axpy updates, norms) runs in Rust.
+    def _params(self) -> List[Tensor]:
+        return [p for group in self.param_groups for p in group["params"]]
 
-    def _set_flat_params(self, flat_params: np.ndarray) -> None:
+    def _gather_flat_grad(self) -> Tensor:
+        from ..oxideon import cat
+        views = [(p.grad.detach() if p.grad is not None else p.detach() * 0.0).reshape([-1]) for p in self._params()]
+        return cat(views, 0)
+
+    def _set_flat_params(self, flat_params: Tensor) -> None:
         offset = 0
-        for group in self.param_groups:
-            for p in group["params"]:
-                numel = p.to_numpy().size
-                arr = flat_params[offset : offset + numel].reshape(p.to_numpy().shape)
-                p.assign(from_numpy(np.ascontiguousarray(arr, dtype=p.to_numpy().dtype)))
-                offset += numel
+        for p in self._params():
+            numel = int(p.numel())
+            p.assign(flat_params.narrow(0, offset, numel).reshape(list(p.shape)).to_dtype(p.dtype))
+            offset += numel
 
-    def _gather_flat_params(self) -> np.ndarray:
-        views = []
-        for group in self.param_groups:
-            for p in group["params"]:
-                views.append(p.to_numpy().reshape(-1))
-        return np.concatenate(views)
+    def _gather_flat_params(self) -> Tensor:
+        from ..oxideon import cat
+        return cat([p.detach().reshape([-1]) for p in self._params()], 0)
+
+    @staticmethod
+    def _dot(a: Tensor, b: Tensor) -> float:
+        return float((a * b).sum().item())
+
+    @staticmethod
+    def _max_abs(a: Tensor) -> float:
+        return float(a.abs().max().item()) if a.numel() else 0.0
 
     def step(self, closure: Callable[[], float]) -> float:
         if closure is None:
@@ -724,6 +568,9 @@ class LBFGS(Optimizer):
             state["s_history"] = []
             state["y_history"] = []
             state["rho_history"] = []
+        # histories saved by the NumPy-based version
+        for key in ("s_history", "y_history"):
+            state[key] = [from_numpy(np.ascontiguousarray(v)) if isinstance(v, np.ndarray) else v for v in state[key]]
 
         s_history = state["s_history"]
         y_history = state["y_history"]
@@ -731,54 +578,38 @@ class LBFGS(Optimizer):
 
         loss = closure()
         flat_grad = self._gather_flat_grad()
-        gnorm = float(np.linalg.norm(flat_grad, ord=np.inf))
-
-        if gnorm <= tolerance_grad:
+        if self._max_abs(flat_grad) <= tolerance_grad:
             return loss
 
         for _ in range(max_iter):
             # Two-loop recursion to compute direction d = -H * g
-            q = flat_grad.copy()
+            q = flat_grad * 1.0
             k = len(s_history)
             alphas = [0.0] * k
-
             for i in reversed(range(k)):
-                s = s_history[i]
-                y = y_history[i]
-                rho = rho_history[i]
-                alpha = rho * float(np.dot(s, q))
+                alpha = rho_history[i] * self._dot(s_history[i], q)
                 alphas[i] = alpha
-                q -= alpha * y
-
+                q = q - y_history[i] * alpha
             if k > 0:
-                gamma = float(np.dot(s_history[-1], y_history[-1])) / float(np.dot(y_history[-1], y_history[-1]) + 1e-12)
-                r = gamma * q
+                gamma = self._dot(s_history[-1], y_history[-1]) / (self._dot(y_history[-1], y_history[-1]) + 1e-12)
+                r = q * gamma
             else:
-                r = q.copy()
-
+                r = q
             for i in range(k):
-                s = s_history[i]
-                y = y_history[i]
-                rho = rho_history[i]
-                beta = rho * float(np.dot(y, r))
-                r += s * (alphas[i] - beta)
+                beta = rho_history[i] * self._dot(y_history[i], r)
+                r = r + s_history[i] * (alphas[i] - beta)
+            direction = r * -1.0
 
-            direction = -r
-
-            # Update parameter
             prev_flat_params = self._gather_flat_params()
-            new_flat_params = prev_flat_params + lr * direction
+            new_flat_params = prev_flat_params + direction * lr
             self._set_flat_params(new_flat_params)
 
-            # Re-evaluate
             new_loss = closure()
             new_flat_grad = self._gather_flat_grad()
 
-            # Update histories
             s_k = new_flat_params - prev_flat_params
             y_k = new_flat_grad - flat_grad
-            sy = float(np.dot(s_k, y_k))
-
+            sy = self._dot(s_k, y_k)
             if sy > 1e-10:
                 if len(s_history) >= history_size:
                     s_history.pop(0)
@@ -791,7 +622,7 @@ class LBFGS(Optimizer):
             if abs(new_loss - loss) < tolerance_change:
                 return new_loss
             loss, flat_grad = new_loss, new_flat_grad
-            if float(np.linalg.norm(flat_grad, ord=np.inf)) <= tolerance_grad:
+            if self._max_abs(flat_grad) <= tolerance_grad:
                 return loss
 
         return loss
@@ -820,38 +651,19 @@ class Lion(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
             beta1, beta2 = group["betas"]
-            weight_decay = group["weight_decay"]
-
+            hyper = dict(lr=group["lr"], beta1=beta1, beta2=beta2, weight_decay=group["weight_decay"])
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
                     state["step"] = 0
-                    state["exp_avg"] = np.zeros_like(grad)
-
+                    state["exp_avg"] = _zeros(p)
                 state["step"] += 1
-                exp_avg = state["exp_avg"]
-
-                p_data = p.to_numpy().copy()
-                if weight_decay != 0.0:
-                    p_data -= lr * weight_decay * p_data
-
-                update = np.sign(beta1 * exp_avg + (1.0 - beta1) * grad)
-                p_data -= lr * update
-                exp_avg[:] = beta2 * exp_avg + (1.0 - beta2) * grad
-
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                _kernel(self, "lion", p, state, ("exp_avg",), hyper)
         return loss
 
 
@@ -881,53 +693,20 @@ class Lamb(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
             beta1, beta2 = group["betas"]
-            eps = group["eps"]
-            weight_decay = group["weight_decay"]
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
                 if len(state) == 0:
                     state["step"] = 0
-                    state["exp_avg"] = np.zeros_like(grad)
-                    state["exp_avg_sq"] = np.zeros_like(grad)
-
+                    state["exp_avg"] = _zeros(p)
+                    state["exp_avg_sq"] = _zeros(p)
                 state["step"] += 1
-                step = state["step"]
-                exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
-
-                p_data = p.to_numpy().copy()
-                exp_avg[:] = beta1 * exp_avg + (1.0 - beta1) * grad
-                exp_avg_sq[:] = beta2 * exp_avg_sq + (1.0 - beta2) * (grad ** 2)
-
-                bias_correction1 = 1.0 - beta1 ** step
-                bias_correction2 = 1.0 - beta2 ** step
-
-                m_hat = exp_avg / bias_correction1
-                v_hat = exp_avg_sq / bias_correction2
-                adam_step = m_hat / (np.sqrt(v_hat) + eps)
-
-                if weight_decay > 0.0:
-                    adam_step += weight_decay * p_data
-
-                w_norm = float(np.linalg.norm(p_data))
-                r_norm = float(np.linalg.norm(adam_step))
-                trust_ratio = (w_norm / r_norm) if (w_norm > 0.0 and r_norm > 0.0) else 1.0
-
-                p_data -= lr * trust_ratio * adam_step
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                _kernel(self, "lamb", p, state, ("exp_avg", "exp_avg_sq"),
+                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=group["weight_decay"], step=state["step"]))
         return loss
 
 
@@ -967,71 +746,32 @@ class Adafactor(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
-            lr = group["lr"]
             eps1, eps2 = group["eps"]
-            clip_threshold = group["clip_threshold"]
-            decay_rate = group["decay_rate"]
             beta1 = group["beta1"]
-            weight_decay = group["weight_decay"]
-
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
                 state = self.state[id(p)]
-
+                shape = tuple(p.shape)
                 if len(state) == 0:
                     state["step"] = 0
-                    if grad.ndim > 1:
-                        state["exp_avg_sq_row"] = np.zeros(grad.shape[:-1], dtype=np.float32)
-                        state["exp_avg_sq_col"] = np.zeros(grad.shape[:-2] + (grad.shape[-1],), dtype=np.float32)
+                    if len(shape) > 1:
+                        state["exp_avg_sq_row"] = _zeros_shape(shape[:-1], p)
+                        state["exp_avg_sq_col"] = _zeros_shape(shape[:-2] + (shape[-1],), p)
                     else:
-                        state["exp_avg_sq"] = np.zeros_like(grad)
+                        state["exp_avg_sq"] = _zeros(p)
                     if beta1 is not None:
-                        state["exp_avg"] = np.zeros_like(grad)
-
+                        state["exp_avg"] = _zeros(p)
                 state["step"] += 1
-                step = state["step"]
-                p_data = p.to_numpy().copy()
-
-                beta2 = 1.0 - (step ** decay_rate)
-                grad_sq = grad * grad + eps1
-
-                if grad.ndim > 1:
-                    exp_avg_sq_row = state["exp_avg_sq_row"]
-                    exp_avg_sq_col = state["exp_avg_sq_col"]
-                    exp_avg_sq_row[:] = beta2 * exp_avg_sq_row + (1.0 - beta2) * np.mean(grad_sq, axis=-1)
-                    exp_avg_sq_col[:] = beta2 * exp_avg_sq_col + (1.0 - beta2) * np.mean(grad_sq, axis=-2)
-                    r_factor = exp_avg_sq_row / np.maximum(np.mean(exp_avg_sq_row, axis=-1, keepdims=True), 1e-12)
-                    v = np.expand_dims(r_factor, -1) * np.expand_dims(exp_avg_sq_col, -2)
-                else:
-                    exp_avg_sq = state["exp_avg_sq"]
-                    exp_avg_sq[:] = beta2 * exp_avg_sq + (1.0 - beta2) * grad_sq
-                    v = exp_avg_sq
-
-                u = grad / (np.sqrt(v) + eps2)
-                u_norm = float(np.linalg.norm(u))
-                if clip_threshold > 0.0 and u_norm > clip_threshold:
-                    u = u * (clip_threshold / u_norm)
-
+                names = ("exp_avg_sq_row", "exp_avg_sq_col") if len(shape) > 1 else ("exp_avg_sq",)
                 if beta1 is not None:
-                    exp_avg = state["exp_avg"]
-                    exp_avg[:] = beta1 * exp_avg + (1.0 - beta1) * u
-                    update = exp_avg
-                else:
-                    update = u
-
-                if weight_decay > 0.0:
-                    p_data -= lr * weight_decay * p_data
-
-                p_data -= lr * update
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
+                    names = names + ("exp_avg",)
+                _kernel(self, "adafactor", p, state, names,
+                        dict(lr=group["lr"], beta2=1.0 - state["step"] ** group["decay_rate"], eps1=eps1, eps2=eps2,
+                             clip_threshold=group["clip_threshold"], beta1=-1.0 if beta1 is None else beta1,
+                             weight_decay=group["weight_decay"]))
         return loss
 
 
@@ -1052,59 +792,58 @@ class Rprop(Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-
+        loss = closure() if closure is not None else None
         for group in self.param_groups:
             eta_minus, eta_plus = group["etas"]
             step_size_min, step_size_max = group["step_sizes"]
-
+            hyper = dict(eta_minus=eta_minus, eta_plus=eta_plus, step_size_min=step_size_min, step_size_max=step_size_max)
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad.to_numpy()
-                state = self.state[p]
-
+                state = self.state[id(p)]  # keyed by id like every optimizer, so state_dict round-trips keep it
                 if len(state) == 0:
                     state["step"] = 0
-                    state["prev_grad"] = np.zeros_like(grad)
-                    state["step_size"] = np.full_like(grad, group["lr"])
-
-                prev_grad = state["prev_grad"]
-                step_size = state["step_size"]
-
-                sign = grad * prev_grad
-                step_size = np.where(
-                    sign > 0,
-                    np.minimum(step_size * eta_plus, step_size_max),
-                    np.where(sign < 0, np.maximum(step_size * eta_minus, step_size_min), step_size),
-                )
-                grad = np.where(sign < 0, 0.0, grad)
-                delta = -np.sign(grad) * step_size
-
-                p_data = p.to_numpy() + delta
-                p.assign(from_numpy(np.ascontiguousarray(p_data, dtype=p_data.dtype)))
-
-                state["prev_grad"] = grad
-                state["step_size"] = step_size
+                    state["prev_grad"] = _zeros(p)
+                    state["step_size"] = _zeros(p) + float(group["lr"])
+                _kernel(self, "rprop", p, state, ("prev_grad", "step_size"), hyper)
                 state["step"] += 1
-
         return loss
 
 
-__all__ = [
-    "Optimizer",
-    "RMSprop",
-    "Adagrad",
-    "Adadelta",
-    "Adamax",
-    "NAdam",
-    "RAdam",
-    "ASGD",
-    "LBFGS",
-    "Lion",
-    "Lamb",
-    "Adafactor",
-    "Rprop",
-]
+class SparseAdam(Optimizer):
+    """Adam for parameters whose gradients touch few rows (embedding tables): each step updates the moments and the
+    values only for the rows whose gradient is non-zero; untouched rows keep their moments and values (a "lazy" Adam,
+    as `torch.optim.SparseAdam` does with sparse gradients). A row is a slice along dimension 0 (an element for 1-D
+    parameters)."""
+
+    def __init__(self, params: Union[Iterable[Tensor], Sequence[Dict[str, Any]]], lr: float = 1e-3,
+                 betas: Tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, maximize: bool = False):
+        if not 0.0 < lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 < eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+        super().__init__(params, dict(lr=lr, betas=betas, eps=eps, maximize=maximize))
+
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+        from ..oxideon import _sparse_adam_step
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            lr, (beta1, beta2), eps = group["lr"], group["betas"], group["eps"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[id(p)]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = p.detach() * 0.0
+                    state["exp_avg_sq"] = p.detach() * 0.0
+                state["step"] += 1
+                new_p, state["exp_avg"], state["exp_avg_sq"] = _sparse_adam_step(
+                    p.detach(), p.grad, state["exp_avg"], state["exp_avg_sq"], state["step"], lr, beta1, beta2, eps,
+                    bool(group["maximize"]))
+                p.assign(new_p)
+        return loss
