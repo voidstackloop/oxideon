@@ -1,12 +1,13 @@
-//! Pure-Rust PNG and JPEG (baseline and progressive) image decoders returning `[C, H, W]` [`Tensor`]s.
+//! Pure-Rust PNG and JPEG (baseline and progressive) image decoders returning `[C, H, W]` [`Tensor`]s, plus a PNG encoder.
 //!
 //! Zero external image crate dependencies: decodes PNG (including Adam7 interlacing; gray / RGB / palette / alpha, 1-16 bit, all 5 scanline filters,
 //! stored + fixed Huffman + dynamic Huffman DEFLATE) and baseline DCT JPEG (`SOF0`) directly
-//! in `oxideon-core`.
+//! in `oxideon-core`. [`encode_png`] / [`save_image`] write 8-bit gray / gray+alpha / RGB / RGBA PNGs using stored DEFLATE blocks.
 
 use std::path::Path;
 
 use crate::backend::{CpuStorage, Storage};
+use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::tensor::Tensor;
@@ -1210,30 +1211,129 @@ pub fn load_image(path: impl AsRef<Path>) -> Result<Tensor> {
     decode_image_tensor(&bytes)
 }
 
+// ---------------------------------------------------------------------------
+// PNG encoder (stored DEFLATE blocks, no external dependencies)
+// ---------------------------------------------------------------------------
+
+/// CRC-32 (IEEE 802.3, as used by PNG chunks).
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            let m = (c & 1).wrapping_neg();
+            c = (c >> 1) ^ (0xEDB8_8320 & m);
+        }
+    }
+    !c
+}
+
+/// Adler-32 checksum (zlib trailer).
+fn adler32(data: &[u8]) -> u32 {
+    let (mut s1, mut s2) = (1u32, 0u32);
+    for chunk in data.chunks(5552) {
+        for &b in chunk {
+            s1 += b as u32;
+            s2 += s1;
+        }
+        s1 %= 65521;
+        s2 %= 65521;
+    }
+    (s2 << 16) | s1
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, ctype: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let crc_start = out.len();
+    out.extend_from_slice(ctype);
+    out.extend_from_slice(data);
+    let crc = crc32(&out[crc_start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// Encodes interleaved 8-bit pixels (`height * width * channels` bytes, row-major, HWC) into a PNG file.
+///
+/// `channels` selects the color type: 1 = grayscale, 2 = grayscale + alpha, 3 = RGB, 4 = RGBA.
+/// The image data is wrapped in uncompressed (stored) DEFLATE blocks, so the output is valid and
+/// round-trips through [`decode_png`] but is not size-optimized.
+pub fn encode_png(pixels: &[u8], width: usize, height: usize, channels: usize) -> Result<Vec<u8>> {
+    let color_type = match channels {
+        1 => 0u8,
+        2 => 4,
+        3 => 2,
+        4 => 6,
+        _ => return Err(Error::Msg(format!("encode_png: unsupported channel count {channels} (expected 1, 2, 3 or 4)"))),
+    };
+    if width == 0 || height == 0 {
+        return Err(Error::Msg(format!("encode_png: image dimensions must be non-zero, got {width}x{height}")));
+    }
+    if width > u32::MAX as usize || height > u32::MAX as usize {
+        return Err(Error::Msg(format!("encode_png: image dimensions {width}x{height} exceed the PNG limit")));
+    }
+    let row_bytes = width
+        .checked_mul(channels)
+        .ok_or_else(|| Error::Msg("encode_png: image size overflow".into()))?;
+    let expected = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| Error::Msg("encode_png: image size overflow".into()))?;
+    if pixels.len() != expected {
+        return Err(Error::Msg(format!(
+            "encode_png: expected {expected} bytes for {width}x{height}x{channels}, got {}",
+            pixels.len()
+        )));
+    }
+
+    // Scanlines: filter type 0 (None) followed by the row bytes.
+    let mut raw = Vec::with_capacity(expected + height);
+    for row in pixels.chunks_exact(row_bytes) {
+        raw.push(0);
+        raw.extend_from_slice(row);
+    }
+
+    // zlib stream made of stored blocks (max 65535 bytes each).
+    let mut zlib = Vec::with_capacity(raw.len() + raw.len() / 65535 * 5 + 11);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    let mut blocks = raw.chunks(65535).peekable();
+    while let Some(block) = blocks.next() {
+        zlib.push(u8::from(blocks.peek().is_none())); // BFINAL, BTYPE = 00 (stored)
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = Vec::with_capacity(zlib.len() + 64);
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(height as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
+    write_png_chunk(&mut png, b"IHDR", &ihdr);
+    write_png_chunk(&mut png, b"IDAT", &zlib);
+    write_png_chunk(&mut png, b"IEND", &[]);
+    Ok(png)
+}
+
+/// Writes a `[C, H, W]` `u8` [`Tensor`] (1-4 channels) to `path` as a PNG file.
+pub fn save_image(tensor: &Tensor, path: impl AsRef<Path>) -> Result<()> {
+    if tensor.dtype() != DType::U8 {
+        return Err(Error::Msg(format!("save_image: expected a u8 tensor, got {:?}", tensor.dtype())));
+    }
+    let shape = tensor.shape();
+    if shape.len() != 3 {
+        return Err(Error::Msg(format!("save_image: expected a [C, H, W] tensor, got shape {shape:?}")));
+    }
+    let (c, h, w) = (shape[0], shape[1], shape[2]);
+    let hwc = tensor.permute(&[1, 2, 0])?.contiguous()?.to_vec::<u8>()?;
+    let png = encode_png(&hwc, w, h, c)?;
+    std::fs::write(path.as_ref(), png)
+        .map_err(|e| Error::Msg(format!("save_image '{}': {e}", path.as_ref().display())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn crc32(data: &[u8]) -> u32 {
-        let mut c = 0xFFFF_FFFFu32;
-        for &b in data {
-            c ^= b as u32;
-            for _ in 0..8 {
-                let m = (c & 1).wrapping_neg();
-                c = (c >> 1) ^ (0xEDB8_8320 & m);
-            }
-        }
-        !c
-    }
-
-    fn adler32(data: &[u8]) -> u32 {
-        let (mut s1, mut s2) = (1u32, 0u32);
-        for &b in data {
-            s1 = (s1 + b as u32) % 65521;
-            s2 = (s2 + s1) % 65521;
-        }
-        (s2 << 16) | s1
-    }
 
     fn png_chunk(ctype: &[u8; 4], data: &[u8], out: &mut Vec<u8>) {
         out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -1329,5 +1429,53 @@ mod tests {
         assert_eq!(&v[4..8], &[0, 255, 0, 255]);
         // Channel 2 (B): [0, 0, 255, 0]
         assert_eq!(&v[8..12], &[0, 0, 255, 0]);
+    }
+
+    #[test]
+    fn encode_png_round_trips_all_channel_counts() {
+        for channels in 1..=4usize {
+            let (w, h) = (5, 3);
+            let px: Vec<u8> = (0..w * h * channels).map(|i| (i * 37 % 256) as u8).collect();
+            let png = encode_png(&px, w, h, channels).unwrap();
+            assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+            let (out, ow, oh, oc) = decode_png(&png).unwrap();
+            assert_eq!((ow, oh, oc), (w, h, channels));
+            assert_eq!(out, px, "channels = {channels}");
+        }
+    }
+
+    #[test]
+    fn encode_png_splits_large_images_into_multiple_stored_blocks() {
+        // 200 * 200 * 3 + 200 filter bytes = 120_200 raw bytes -> two stored blocks
+        let (w, h) = (200, 200);
+        let px: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+        let png = encode_png(&px, w, h, 3).unwrap();
+        let (out, ow, oh, oc) = decode_png(&png).unwrap();
+        assert_eq!((ow, oh, oc), (w, h, 3));
+        assert_eq!(out, px);
+    }
+
+    #[test]
+    fn encode_png_rejects_invalid_input() {
+        assert!(encode_png(&[0; 3], 1, 1, 5).is_err());
+        assert!(encode_png(&[0; 3], 1, 1, 0).is_err());
+        assert!(encode_png(&[], 0, 1, 3).is_err());
+        assert!(encode_png(&[0; 5], 1, 2, 3).is_err(), "buffer length must match width*height*channels");
+    }
+
+    #[test]
+    fn save_image_writes_chw_tensor_that_load_image_reads_back() {
+        let (c, h, w) = (3, 2, 4);
+        let chw: Vec<u8> = (0..c * h * w).map(|i| (i * 11) as u8).collect();
+        let t = Tensor::from_storage(Storage::new_cpu(CpuStorage::U8(chw.clone())), Layout::contiguous(vec![c, h, w]));
+        let path = std::env::temp_dir().join(format!("oxideon_save_image_{}.png", std::process::id()));
+        save_image(&t, &path).unwrap();
+        let back = load_image(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.shape(), &[c, h, w]);
+        assert_eq!(back.to_vec::<u8>().unwrap(), chw);
+
+        let bad = Tensor::from_storage(Storage::new_cpu(CpuStorage::U8(vec![0; 4])), Layout::contiguous(vec![2, 2]));
+        assert!(save_image(&bad, &path).is_err());
     }
 }
