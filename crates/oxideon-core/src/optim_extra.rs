@@ -1682,7 +1682,7 @@ pub fn sparse_adam_step(
     let mut m = exp_avg.to_vec::<f64>()?;
     let mut v = exp_avg_sq.to_vec::<f64>()?;
     let rows = if shape.is_empty() { 1 } else { shape[0] };
-    let row_len = if rows == 0 { 0 } else { p.len() / rows };
+    let row_len = p.len().checked_div(rows).unwrap_or(0);
     let bc1 = 1.0 - beta1.powi(step as i32);
     let bc2 = 1.0 - beta2.powi(step as i32);
     let step_size = lr * bc2.sqrt() / bc1;

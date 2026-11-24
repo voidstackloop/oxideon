@@ -320,7 +320,7 @@ mod tests {
         assert!((sq[0] - 0.025).abs() < 1e-15);
         let want = 1.0 - 0.1 * 0.5 / (0.025f64.sqrt() + 1e-8);
         assert!((np.to_vec::<f64>().unwrap()[0] - want).abs() < 1e-12);
-        assert!(optim_step("rmsprop", &p, &g, &[z.clone()], &h(&[("lr", 0.1)])).is_err());
+        assert!(optim_step("rmsprop", &p, &g, std::slice::from_ref(&z), &h(&[("lr", 0.1)])).is_err());
         assert!(optim_step("nope", &p, &g, &[], &h(&[])).is_err());
     }
 
