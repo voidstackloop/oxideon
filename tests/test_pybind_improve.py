@@ -129,11 +129,12 @@ def test_gen_stubs_skips_unbalanced_input():
 def test_gen_stubs_idempotent():
     import subprocess
     import sys
-    from pathlib import Path
     init_py = ROOT / 'python/oxideon/__init__.py'
     init_pyi = (ROOT / 'python/oxideon/__init__.pyi')
-    before_py = init_py.read_text(encoding="utf-8")
-    before_pyi = init_pyi.read_text(encoding="utf-8")
+    before_py_bytes = init_py.read_bytes()
+    before_pyi_bytes = init_pyi.read_bytes()
+    before_py = before_py_bytes.decode("utf-8")
+    before_pyi = before_pyi_bytes.decode("utf-8")
     try:
         proc = subprocess.run(
             [sys.executable, str(ROOT / 'tools/gen_stubs.py')],
@@ -144,5 +145,5 @@ def test_gen_stubs_idempotent():
         assert init_py.read_text(encoding="utf-8") == before_py, 'regen changed __init__.py'
         assert init_pyi.read_text(encoding="utf-8") == before_pyi, 'regen changed __init__.pyi'
     finally:
-        init_py.write_text(before_py, encoding="utf-8")
-        init_pyi.write_text(before_pyi, encoding="utf-8")
+        init_py.write_bytes(before_py_bytes)
+        init_pyi.write_bytes(before_pyi_bytes)

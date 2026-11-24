@@ -18,7 +18,7 @@
 [![Clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen.svg)]()
 [![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-[Why Oxideon?](#why-oxideon) · [Getting Started](#getting-started) · [Quick Tour](#quick-tour) · [PyTorch Cheat Sheet](#pytorch-cheat-sheet) · [Interop](#ecosystem-interop) · [Architecture](#how-its-organized) · [Docs](docs/)
+[Browser Demo](https://voidstackloop.github.io/oxideon/) · [Why Oxideon?](#why-oxideon) · [Getting Started](#getting-started) · [Quick Tour](#quick-tour) · [PyTorch Cheat Sheet](#pytorch-cheat-sheet) · [Interop](#ecosystem-interop) · [Architecture](#how-its-organized) · [Docs](docs/)
 
 </div>
 
@@ -37,6 +37,10 @@ Most deep learning stacks force a trade-off: either you use Python on top of a m
 ---
 
 ## Getting Started
+
+### Try it in your browser (no install)
+
+Run Oxideon's Rust tensor + autograd engine compiled to WebAssembly live at **[https://voidstackloop.github.io/oxideon/](https://voidstackloop.github.io/oxideon/)** — trains an MLP interactively right in your browser.
 
 ### Install from PyPI
 

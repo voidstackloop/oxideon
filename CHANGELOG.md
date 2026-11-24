@@ -60,6 +60,12 @@
   reproducible.
 
 ### Fixes
+- Bug hunt against PyTorch (regression tests in `tests/test_bug_hunt.py`): method-form binary ops accept Python scalars; `//`, `%`, `<<`, `>>`, unary `+`; integer `/` and `div` give floats; `x += y` writes in place (out-of-place when autograd is involved); `nan_to_num` keeps 0-d shape and gradient; `angle(-0.0)`; `x.to(y.dtype)` / `.to("float64")` / `.to(np.float64)`.
+- `max`/`min` with a dim return `(values, indices)`; `sort`/`topk`/`median`/`mode`/`kthvalue`/`cummax` return named tuples; `max(other)` is the elementwise maximum.
+- Reductions over several dims (`sum`, `mean`, `var`, `std`, `amax`, `amin`, `logsumexp`, `nansum`, `nanmean`), `var`/`std` `correction=`, differentiable `amax`/`amin` (ties share the gradient), full `prod`/`all`/`any`/`count_nonzero` return 0-d tensors.
+- Differentiable `repeat`, `tile`, `repeat_interleave`, `hstack`/`vstack`/`dstack`, `diag_embed`, `take`, `index_add`, `index_copy`, `meshgrid`, `cumulative_trapezoid`; `einsum` is the native differentiable kernel (keeps dtype); `where` with a Python scalar; `put`, `scatter(value)`; varargs `permute`/`expand`/`flip`, `T`/`mT`/`H`/`mH`; `triu_indices`/`tril_indices` return one 2xN tensor.
+- Advanced indexing (`x[[0, 2]]`, `x[[0, 1], [1, 2]]`, `x[:, idx]`, masks) is one differentiable gather with PyTorch's placement rules (replaces the O(n^2) one-hot path).
+- 0-d NumPy results no longer become shape `(1,)` (`np.ascontiguousarray` replaced by `_contig`).
 - Optimizers that disagreed with PyTorch: `RMSprop` added `eps` inside the square root (`sqrt(v + eps)` instead of
   `sqrt(v) + eps`), `RAdam` switched to the rectified update at rho > 4 instead of 5 and scaled `eps` differently, `ASGD` never
   applied its decay `lambd` to the parameters, `Adamax` added `eps` after the max instead of inside it; `Rprop` keyed its state by

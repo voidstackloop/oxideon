@@ -4,151 +4,370 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Oxideon — Live Deep Learning in WebAssembly</title>
+<meta name="description" content="Run Oxideon's Rust tensor engine, reverse-mode autograd, and AdamW optimizer live in your browser via WebAssembly.">
 <link rel="icon" type="image/svg+xml" href="./assets/oxideon-logo.svg">
 <style>
   :root {
-    --bg: #0b0f19;
+    --bg: #080c16;
+    --bg-elev: #0f172a;
     --card: #111827;
-    --line: #1f2937;
+    --card-border: #1e293b;
     --fg: #f3f4f6;
-    --mute: #9ca3af;
+    --mute: #94a3b8;
     --acc: #60a5fa;
+    --acc-strong: #2563eb;
     --ok: #34d399;
     --bad: #f87171;
     --pink: #f472b6;
+    --amber: #fbbf24;
+    --violet: #a78bfa;
   }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); margin: 0; padding: 1.25rem; }
-  main { max-width: 960px; margin: 0 auto; }
-  header { margin-bottom: 1rem; }
-  h1 { color: var(--acc); margin: 0 0 .25rem; font-size: 1.75rem; }
-  h2 { margin: 0 0 .35rem; font-size: 1.15rem; }
-  p { color: var(--mute); line-height: 1.5; margin: .25rem 0 .75rem; }
-  .badges { display: flex; flex-wrap: wrap; gap: .5rem; margin: .5rem 0 .75rem; font-size: .8rem; }
-  .badge { background: #1e293b; border: 1px solid #334155; padding: .2rem .55rem; border-radius: 999px; color: #cbd5e1; text-decoration: none; }
-  .badge:hover { border-color: var(--acc); color: var(--acc); }
-  .status { font-size: .85rem; padding: .55rem .8rem; border-radius: 8px; background: #052e1a; color: var(--ok); border: 1px solid #14532d; margin: .75rem 0 1rem; }
-  .status.err { background: #3b0d0d; color: var(--bad); border-color: #7f1d1d; }
-  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1.15rem 1.25rem; margin-bottom: 1rem; }
-  .row { display: flex; flex-wrap: wrap; gap: .65rem; align-items: center; margin: .5rem 0; }
-  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; align-items: start; margin-top: .5rem; }
-  label { color: var(--mute); font-size: .88rem; }
-  select, input[type=range] { accent-color: var(--acc); }
-  select, input[type=number] { background: #1f2937; color: var(--fg); border: 1px solid #374151; border-radius: 6px; padding: .32rem .55rem; }
-  button { background: #2563eb; color: #fff; border: 0; padding: .48rem 1rem; font-weight: 600; border-radius: 8px; cursor: pointer; font-size: .88rem; }
-  button:hover:not(:disabled) { background: #1d4ed8; }
-  button.sec { background: #374151; }
-  button.sec:hover:not(:disabled) { background: #4b5563; }
-  button:disabled { background: #1f2937; color: #6b7280; cursor: default; }
-  pre { background: #030712; border: 1px solid var(--line); border-radius: 8px; padding: .75rem; margin: .5rem 0 0; color: var(--ok); font-size: .84rem; white-space: pre-wrap; overflow-x: auto; line-height: 1.45; }
-  canvas { max-width: 100%; background: #030712; border: 1px solid var(--line); border-radius: 8px; display: block; }
-  #train-cv { width: 100%; max-width: 340px; height: auto; aspect-ratio: 1 / 1; cursor: crosshair; }
-  .legend { margin-top: .4rem; font-size: .84rem; }
-  .legend span { margin-right: 1rem; }
-  .metrics { display: flex; flex-wrap: wrap; gap: 1rem; margin: .5rem 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .86rem; }
-  .metric b { color: var(--acc); }
-  footer { color: var(--mute); font-size: .8rem; text-align: center; margin: 1.5rem 0; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(circle at top center, #131c31 0%, var(--bg) 52%);
+    color: var(--fg);
+    margin: 0;
+    padding: 1.25rem;
+    line-height: 1.5;
+  }
+  main { max-width: 1020px; margin: 0 auto; }
   a { color: var(--acc); }
+  :where(a:any-link, button, select, input):focus-visible {
+    outline: 3px solid var(--acc);
+    outline-offset: 2px;
+  }
+
+  .hero {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.15rem;
+    align-items: center;
+    padding: 1rem 1.25rem;
+    background: linear-gradient(135deg, rgba(30, 41, 59, 0.72), rgba(15, 23, 42, 0.92));
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    margin-bottom: .9rem;
+  }
+  .hero-logo { border-radius: 14px; flex-shrink: 0; display: block; }
+  .hero-body { flex: 1 1 320px; min-width: 0; }
+  h1 { color: #93c5fd; margin: 0 0 .3rem; font-size: clamp(1.35rem, 2.5vw, 1.85rem); letter-spacing: -0.01em; }
+  h2 { margin: 0 0 .35rem; font-size: 1.15rem; color: #e2e8f0; }
+  p { color: var(--mute); margin: .25rem 0 .7rem; font-size: .94rem; }
+  code { background: rgba(15, 23, 42, 0.9); border: 1px solid #1e293b; padding: .1rem .32rem; border-radius: 5px; font-size: .86em; color: #e2e8f0; }
+
+  .badges { display: flex; flex-wrap: wrap; gap: .45rem; margin: .5rem 0 0; font-size: .82rem; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    min-block-size: 2rem;
+    background: #1e293b;
+    border: 1px solid #334155;
+    padding: .25rem .7rem;
+    border-radius: 999px;
+    color: #e2e8f0;
+    text-decoration: none;
+    transition: border-color .15s, color .15s;
+  }
+  .badge:hover { border-color: var(--acc); color: #93c5fd; }
+
+  .jump-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem;
+    margin: 0 0 .9rem;
+  }
+  .jump-link {
+    display: inline-flex;
+    align-items: center;
+    min-block-size: 2rem;
+    padding: .2rem .65rem;
+    border-radius: 8px;
+    font-size: .83rem;
+    color: #cbd5e1;
+    background: #0f172a;
+    border: 1px solid var(--card-border);
+    text-decoration: none;
+  }
+  .jump-link:hover { border-color: var(--acc); color: var(--fg); }
+
+  .status {
+    font-size: .88rem;
+    padding: .6rem .9rem;
+    border-radius: 10px;
+    background: #052e1a;
+    color: var(--ok);
+    border: 1px solid #14532d;
+    margin: 0 0 1rem;
+  }
+  .status.err { background: #3b0d0d; color: var(--bad); border-color: #7f1d1d; }
+
+  section {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 1.2rem 1.3rem;
+    margin-bottom: 1rem;
+    contain: layout style paint;
+  }
+  section.lazy-section {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 24rem;
+  }
+  .section-head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: .5rem;
+  }
+  .pill {
+    font-size: .76rem;
+    color: #93c5fd;
+    background: rgba(37, 99, 235, 0.16);
+    border: 1px solid rgba(96, 165, 250, 0.35);
+    border-radius: 999px;
+    padding: .15rem .55rem;
+  }
+
+  .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin: .55rem 0; }
+  .ctrl-group { display: inline-flex; align-items: center; gap: .38rem; color: var(--mute); font-size: .88rem; }
+  select, input[type=number], input[type=range] { accent-color: var(--acc); }
+  select, input[type=number] {
+    min-block-size: 2.25rem;
+    background: #1f2937;
+    color: var(--fg);
+    border: 1px solid #374151;
+    border-radius: 8px;
+    padding: .32rem .55rem;
+    font-size: .88rem;
+  }
+  button {
+    min-block-size: 2.25rem;
+    min-inline-size: 2.25rem;
+    background: var(--acc-strong);
+    color: #fff;
+    border: 0;
+    padding: .45rem .95rem;
+    font-weight: 600;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: .88rem;
+  }
+  button:hover:not(:disabled) { background: #1d4ed8; }
+  button.sec { background: #334155; }
+  button.sec:hover:not(:disabled) { background: #475569; }
+  button.ghost { background: transparent; border: 1px solid #334155; color: #cbd5e1; }
+  button.ghost:hover:not(:disabled) { border-color: var(--acc); color: var(--fg); }
+  button:disabled { background: #1f2937; color: #6b7280; cursor: default; }
+
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; align-items: start; margin-top: .65rem; }
+  figure { margin: 0; }
+  figcaption { color: var(--mute); font-size: .8rem; margin-top: .38rem; }
+
+  canvas {
+    max-width: 100%;
+    background: #030712;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    display: block;
+  }
+  #train-cv { width: 100%; max-width: 360px; height: auto; aspect-ratio: 1 / 1; cursor: crosshair; touch-action: manipulation; }
+  #loss-cv { width: 100%; height: auto; aspect-ratio: 3 / 2; }
+  #act-cv { width: 100%; height: auto; aspect-ratio: 880 / 280; cursor: crosshair; }
+
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: .55rem;
+    margin: .6rem 0;
+  }
+  .stat {
+    background: #0b1220;
+    border: 1px solid #1e293b;
+    border-radius: 9px;
+    padding: .45rem .65rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .stat-k { display: block; font-size: .74rem; color: var(--mute); text-transform: uppercase; letter-spacing: .04em; }
+  .stat-v { display: block; font-size: 1rem; font-weight: 700; color: var(--acc); }
+
+  pre {
+    background: #030712;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    padding: .8rem .9rem;
+    margin: .6rem 0 0;
+    color: var(--ok);
+    font-size: .84rem;
+    white-space: pre-wrap;
+    overflow-x: auto;
+    line-height: 1.48;
+  }
+
+  .legend { display: flex; flex-wrap: wrap; gap: .9rem; margin-top: .45rem; font-size: .84rem; align-items: center; }
+  .legend label { display: inline-flex; align-items: center; gap: .3rem; cursor: pointer; color: #cbd5e1; }
+
+  .bars { margin-top: .65rem; display: grid; gap: .45rem; }
+  .bar-row { display: grid; grid-template-columns: 150px 1fr 90px; gap: .6rem; align-items: center; font-size: .83rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .bar-track { height: 12px; background: #0f172a; border: 1px solid #1e293b; border-radius: 999px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 999px; transition: width .15s ease-out; }
+
+  .probe-line { margin-top: .35rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; color: #cbd5e1; min-block-size: 1.3rem; }
+  footer { color: var(--mute); font-size: .82rem; text-align: center; margin: 1.4rem 0 .8rem; }
 </style>
 </head>
 <body>
 <main>
-  <header style="display:flex;gap:1rem;align-items:center;">
-    <img src="./assets/oxideon-logo.svg" alt="Oxideon logo" width="60" height="60" style="border-radius:14px;flex-shrink:0;">
-    <div>
-    <h1>Oxideon — Live Deep Learning in WebAssembly</h1>
-    <p>Running the real <code>oxideon-core</code> tensor engine, reverse-mode autograd, and <code>AdamW</code> optimizer directly in your browser. Zero server calls.</p>
-    <div class="badges">
-      <a class="badge" href="https://github.com/voidstackloop/oxideon">GitHub</a>
-      <a class="badge" href="https://pypi.org/project/oxideon/">pip install oxideon</a>
-      <a class="badge" href="https://crates.io/crates/oxideon-core">cargo add oxideon-core</a>
-    </div>
+  <header class="hero">
+    <img class="hero-logo" src="./assets/oxideon-logo.svg" alt="Oxideon logo" width="60" height="60" fetchpriority="high">
+    <div class="hero-body">
+      <h1>Oxideon — Live Deep Learning in WebAssembly</h1>
+      <p>Runs the real <code>oxideon-core</code> tensor engine, reverse-mode autograd, and <code>AdamW</code> optimizer locally in your browser with zero server calls.</p>
+      <nav class="badges" aria-label="Project links">
+        <a class="badge" href="https://github.com/voidstackloop/oxideon">GitHub</a>
+        <a class="badge" href="https://pypi.org/project/oxideon/">pip install oxideon</a>
+        <a class="badge" href="https://crates.io/crates/oxideon-core">cargo add oxideon-core</a>
+        <a class="badge" href="https://colab.research.google.com/github/voidstackloop/oxideon/blob/main/examples/oxideon_quickstart.ipynb">Colab Quickstart</a>
+      </nav>
     </div>
   </header>
 
-  <div id="status" class="status">Loading WebAssembly module...</div>
+  <nav class="jump-nav" aria-label="Demo sections">
+    <a class="jump-link" href="#training">1. Live Neural Net</a>
+    <a class="jump-link" href="#autograd">2. Autograd &amp; Grad Check</a>
+    <a class="jump-link" href="#matmul">3. Matmul Speed &amp; ULP</a>
+    <a class="jump-link" href="#activations">4. Activation Curves</a>
+    <a class="jump-link" href="#softmax">5. Stable Softmax</a>
+  </nav>
 
-  <section>
-    <h2>1. Live Neural Network Training (Rust Autograd + AdamW in WASM)</h2>
-    <p>Trains a 2-hidden-layer MLP (<code>Linear → tanh → Linear → tanh → Linear</code>, cross-entropy loss, <code>AdamW</code>) step by step inside Rust WASM. Click the plot to add extra points (toggle class below).</p>
+  <div id="status" class="status" role="status" aria-live="polite">Loading WebAssembly module...</div>
+
+  <section id="training" class="training-section">
+    <div class="section-head">
+      <h2>1. Live Neural Network Training (Rust Autograd + AdamW)</h2>
+      <span class="pill" id="pt-count">160 points</span>
+    </div>
+    <p>Trains a 2-hidden-layer MLP (<code>Linear → tanh → Linear → tanh → Linear</code>, cross-entropy loss, <code>AdamW</code>) directly inside Rust WASM. Click the plot to paint custom data points and watch the decision boundary adapt.</p>
     <div class="row">
-      <label>Dataset
+      <label class="ctrl-group" for="tr-data">Dataset
         <select id="tr-data">
           <option value="spiral" selected>Spiral</option>
           <option value="moons">Two Moons</option>
           <option value="xor">XOR</option>
           <option value="circle">Concentric Circles</option>
+          <option value="clusters">Gaussian Clusters</option>
         </select>
       </label>
-      <label>Hidden
+      <label class="ctrl-group" for="tr-hid">Hidden
         <select id="tr-hid"><option>16</option><option selected>24</option><option>40</option></select>
       </label>
-      <label>LR
+      <label class="ctrl-group" for="tr-lr">LR
         <select id="tr-lr"><option value="0.01">0.01</option><option value="0.03" selected>0.03</option><option value="0.06">0.06</option></select>
       </label>
-      <label>Paint
+      <label class="ctrl-group" for="tr-paint">Paint
         <select id="tr-paint"><option value="1">Class 1 (pink)</option><option value="0">Class 0 (blue)</option></select>
       </label>
-      <button id="tr-toggle" disabled>Train</button>
-      <button id="tr-step" class="sec" disabled>Step +10</button>
-      <button id="tr-reset" class="sec" disabled>Reset</button>
+    </div>
+    <div class="row">
+      <button id="tr-toggle" type="button" disabled>Train</button>
+      <button id="tr-step" class="sec" type="button" disabled>Step +10</button>
+      <button id="tr-step50" class="sec" type="button" disabled>Step +50</button>
+      <button id="tr-clear" class="ghost" type="button" disabled>Clear Painted</button>
+      <button id="tr-reset" class="sec" type="button" disabled>Reset</button>
     </div>
     <div class="metrics">
-      <span>Step: <b id="m-step">0</b></span>
-      <span>Loss: <b id="m-loss">-</b></span>
-      <span>Accuracy: <b id="m-acc">-</b></span>
-      <span>Avg step: <b id="m-ms">-</b></span>
+      <div class="stat"><span class="stat-k">Steps</span><span class="stat-v" id="m-step">0</span></div>
+      <div class="stat"><span class="stat-k">Loss</span><span class="stat-v" id="m-loss">-</span></div>
+      <div class="stat"><span class="stat-k">Accuracy</span><span class="stat-v" id="m-acc" style="color:var(--ok)">-</span></div>
+      <div class="stat"><span class="stat-k">Step Time</span><span class="stat-v" id="m-ms">-</span></div>
     </div>
     <div class="grid2">
-      <div>
-        <canvas id="train-cv" width="320" height="320"></canvas>
-      </div>
-      <div>
-        <canvas id="loss-cv" width="480" height="320"></canvas>
-      </div>
+      <figure>
+        <canvas id="train-cv" width="360" height="360" aria-label="2D decision boundary and training samples"></canvas>
+        <figcaption id="train-probe">Hover plot to query WASM probabilities; click to add a point.</figcaption>
+      </figure>
+      <figure>
+        <canvas id="loss-cv" width="510" height="340" aria-label="Training loss and accuracy chart"></canvas>
+        <figcaption>Emerald: cross-entropy loss &middot; Blue: classification accuracy (%).</figcaption>
+      </figure>
     </div>
   </section>
 
-  <section>
+  <section id="autograd" class="lazy-section">
     <h2>2. Reverse-Mode Autograd &amp; Gradient Verification</h2>
-    <p>Builds a live computation graph in Rust WASM (`loss = ((x * w + b).tanh()).mean()`), runs <code>loss.backward()</code>, and verifies <code>x.grad()</code> against numerical finite differences.</p>
+    <p>Builds a live computation graph in Rust WASM, calls <code>loss.backward()</code>, and compares exact analytical gradients against double-precision numerical finite differences.</p>
     <div class="row">
-      <label>x = [<input id="ag-x0" type="number" step="0.1" value="1.2" style="width:72px">, <input id="ag-x1" type="number" step="0.1" value="-0.7" style="width:72px">]</label>
-      <label>w = [<input id="ag-w0" type="number" step="0.1" value="0.8" style="width:72px">, <input id="ag-w1" type="number" step="0.1" value="1.5" style="width:72px">]</label>
-      <button id="ag-run" disabled>Run Backward</button>
+      <label class="ctrl-group" for="ag-expr">Graph
+        <select id="ag-expr">
+          <option value="tanh_mean" selected>mean(tanh(x * w + b))</option>
+          <option value="silu_mse">mean((silu(x * w + b) - 0.5)^2)</option>
+          <option value="gelu_res">mean(gelu(x * w + b) + x)</option>
+        </select>
+      </label>
+      <label class="ctrl-group" for="ag-x0">x[0] <input id="ag-x0" type="number" step="0.1" value="1.2" style="width:74px"></label>
+      <label class="ctrl-group" for="ag-x1">x[1] <input id="ag-x1" type="number" step="0.1" value="-0.7" style="width:74px"></label>
+      <label class="ctrl-group" for="ag-w0">w[0] <input id="ag-w0" type="number" step="0.1" value="0.8" style="width:74px"></label>
+      <label class="ctrl-group" for="ag-w1">w[1] <input id="ag-w1" type="number" step="0.1" value="1.5" style="width:74px"></label>
+      <button id="ag-run" type="button" disabled>Run Backward</button>
     </div>
     <pre id="ag-out">Loading...</pre>
   </section>
 
-  <section>
+  <section id="matmul" class="lazy-section">
     <h2>3. Matrix Multiply: WASM Speed &amp; Float64 Accuracy</h2>
-    <p>Multiplies two random <i>n</i>×<i>n</i> <code>f32</code> matrices using Oxideon in WebAssembly and compares accuracy against an exact <code>f64</code> reference and naive JS <code>f32</code> loop.</p>
+    <p>Multiplies two random <i>n</i>&times;<i>n</i> <code>f32</code> matrices in WebAssembly and compares latency and worst ULP error against naive JavaScript loops and an <code>f64</code> reference.</p>
     <div class="row">
-      <label>Size <select id="mm-n"><option>64</option><option>128</option><option selected>256</option><option>384</option></select></label>
-      <button id="mm-run" disabled>Run Benchmark</button>
+      <label class="ctrl-group" for="mm-n">Size
+        <select id="mm-n"><option>64</option><option>128</option><option selected>256</option><option>384</option></select>
+      </label>
+      <button id="mm-run" type="button" disabled>Run Benchmark</button>
     </div>
+    <div class="bars" id="mm-bars" aria-live="polite"></div>
     <pre id="mm-out">Loading...</pre>
   </section>
 
-  <section>
+  <section id="activations" class="lazy-section">
     <h2>4. Activation Curves vs Exact Float64 Reference</h2>
-    <p>Evaluates 2,000 points on <code>[-6, 6]</code> in WASM (solid) plotted over exact <code>float64</code> JS curves (dashed).</p>
-    <div class="row"><button id="act-run" disabled>Redraw</button></div>
-    <canvas id="act-cv" width="880" height="270"></canvas>
-    <div class="legend" id="act-legend"></div>
+    <p>Evaluates 2,000 points on <code>[-6, 6]</code> in WASM (solid) over exact <code>float64</code> JS curves (dashed). Move cursor over the plot to inspect exact values.</p>
+    <div class="row">
+      <button id="act-run" type="button" disabled>Redraw</button>
+      <div class="legend" id="act-legend"></div>
+    </div>
+    <figure>
+      <canvas id="act-cv" width="880" height="280" aria-label="Activation function comparison plot"></canvas>
+      <figcaption class="probe-line" id="act-probe">Hover plot to inspect activation values at x.</figcaption>
+    </figure>
     <pre id="act-out"></pre>
   </section>
 
-  <section>
+  <section id="softmax" class="lazy-section">
     <h2>5. Numerically Stable Softmax</h2>
-    <p>Scales logits far past float64 <code>exp()</code> overflow (~709). Naive JS collapses to <code>NaN</code>; Oxideon shifts by max logit first.</p>
+    <p>Scales logits past float64 <code>exp()</code> overflow (~709). Naive JS overflows to <code>NaN</code>; Oxideon subtracts max logit before exponentiating.</p>
     <div class="row">
-      <label>Logit scale <input id="sm-scale" type="range" min="1" max="2000" value="900"> <b id="sm-scale-v">900</b></label>
+      <label class="ctrl-group" for="sm-scale">Logit scale
+        <input id="sm-scale" type="range" min="1" max="2000" value="900">
+        <b id="sm-scale-v">900</b>
+      </label>
+      <button class="ghost sm-preset" type="button" data-v="1">1</button>
+      <button class="ghost sm-preset" type="button" data-v="50">50</button>
+      <button class="ghost sm-preset" type="button" data-v="710">710 (JS NaN)</button>
+      <button class="ghost sm-preset" type="button" data-v="1500">1500</button>
     </div>
+    <div class="bars" id="sm-bars"></div>
     <pre id="sm-out">Loading...</pre>
   </section>
 
-  <footer>Source: <a href="https://github.com/voidstackloop/oxideon">github.com/voidstackloop/oxideon</a> &middot; <code>pip install oxideon</code> &middot; <code>cargo add oxideon-core</code></footer>
+  <footer>
+    Source: <a href="https://github.com/voidstackloop/oxideon">github.com/voidstackloop/oxideon</a> &middot;
+    <code>pip install oxideon</code> &middot;
+    <code>cargo add oxideon-core</code>
+  </footer>
 </main>
 
 <script type="module">
@@ -161,7 +380,7 @@ const fmt = v => v === 0 ? "0" : Math.abs(v) < 1e-3 || Math.abs(v) >= 1e5 ? v.to
 const time = fn => { const t = performance.now(); const r = fn(); return [r, performance.now() - t]; };
 
 // ---- 1. Live MLP Training in WASM
-let pts = [], labels = [], trainer = null, running = false, raf = 0, lossHist = [];
+let pts = [], labels = [], baseCount = 0, trainer = null, running = false, pausedByVisibility = false, raf = 0, lossHist = [], accHist = [];
 
 function genDataset(kind) {
   pts = []; labels = [];
@@ -188,6 +407,14 @@ function genDataset(kind) {
       y = sy * (0.2 + 0.65 * Math.random());
       pts.push(x, y); labels.push(sx * sy > 0 ? 1 : 0);
       continue;
+    } else if (kind === "clusters") {
+      const angle = (i % 4) * (Math.PI / 2) + 0.45;
+      const cls = (i % 4) % 2;
+      const r = 0.58;
+      x = r * Math.cos(angle) + (Math.random() + Math.random() - 1) * 0.24;
+      y = r * Math.sin(angle) + (Math.random() + Math.random() - 1) * 0.24;
+      pts.push(x, y); labels.push(cls);
+      continue;
     } else {
       const r = c === 0 ? 0.35 * Math.sqrt(Math.random() + 0.1) : 0.65 + 0.28 * Math.random();
       const a = Math.random() * 2 * Math.PI;
@@ -195,12 +422,15 @@ function genDataset(kind) {
     }
     pts.push(x, y); labels.push(c);
   }
+  baseCount = labels.length;
+  $("pt-count").textContent = `${labels.length} points`;
 }
 
 function resetTrainer() {
   if (trainer) trainer.free();
   trainer = new ox.WasmMlpTrainer(+$("tr-hid").value, +$("tr-lr").value);
   lossHist = [];
+  accHist = [];
   $("m-step").textContent = "0";
   $("m-loss").textContent = "-";
   $("m-acc").textContent = "-";
@@ -209,7 +439,7 @@ function resetTrainer() {
   drawLoss();
 }
 
-const GRID = 48;
+const GRID = 56;
 const gridPts = new Float32Array(GRID * GRID * 2);
 for (let i = 0; i < GRID; i++) {
   for (let j = 0; j < GRID; j++) {
@@ -230,24 +460,33 @@ function drawTrain() {
     const img = heatCtx.createImageData(GRID, GRID);
     for (let i = 0; i < GRID * GRID; i++) {
       const p = probs[i];
-      img.data[i * 4] = Math.round(244 * p + 37 * (1 - p));
-      img.data[i * 4 + 1] = Math.round(114 * p + 99 * (1 - p));
-      img.data[i * 4 + 2] = Math.round(182 * p + 235 * (1 - p));
+      const boundary = Math.exp(-Math.pow((p - 0.5) * 14, 2)) * 55;
+      img.data[i * 4] = Math.min(255, Math.round(244 * p + 37 * (1 - p) + boundary));
+      img.data[i * 4 + 1] = Math.min(255, Math.round(114 * p + 99 * (1 - p) + boundary));
+      img.data[i * 4 + 2] = Math.min(255, Math.round(182 * p + 235 * (1 - p) + boundary));
       img.data[i * 4 + 3] = 175;
     }
     heatCtx.putImageData(img, 0, 0);
     g.imageSmoothingEnabled = true;
     g.drawImage(heatOff, 0, 0, W, H);
   }
+  // Subtle coordinate axes
+  g.strokeStyle = "rgba(255, 255, 255, 0.14)";
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(0, H / 2); g.lineTo(W, H / 2);
+  g.moveTo(W / 2, 0); g.lineTo(W / 2, H);
+  g.stroke();
+
   for (let i = 0; i < labels.length; i++) {
     const cx = (pts[i * 2] + 1) * 0.5 * W;
     const cy = (1 - pts[i * 2 + 1]) * 0.5 * H;
     g.beginPath();
-    g.arc(cx, cy, 4, 0, 2 * Math.PI);
+    g.arc(cx, cy, i >= baseCount ? 5.2 : 4.1, 0, 2 * Math.PI);
     g.fillStyle = labels[i] === 1 ? "#f472b6" : "#60a5fa";
     g.fill();
-    g.lineWidth = 1.2;
-    g.strokeStyle = "#0b0f19";
+    g.lineWidth = i >= baseCount ? 1.8 : 1.2;
+    g.strokeStyle = i >= baseCount ? "#ffffff" : "#080c16";
     g.stroke();
   }
 }
@@ -255,16 +494,41 @@ function drawTrain() {
 function drawLoss() {
   const cv = $("loss-cv"), g = cv.getContext("2d"), W = cv.width, H = cv.height;
   g.clearRect(0, 0, W, H);
-  g.strokeStyle = "#1f2937"; g.lineWidth = 1;
-  g.strokeRect(36, 16, W - 52, H - 44);
-  g.fillStyle = "#9ca3af"; g.font = "12px sans-serif";
-  g.fillText("Training Loss (cross-entropy)", 44, 34);
+  const padL = 42, padR = 42, padT = 18, padB = 30;
+  const cw = W - padL - padR, ch = H - padT - padB;
+
+  g.strokeStyle = "#1e293b"; g.lineWidth = 1;
+  g.strokeRect(padL, padT, cw, ch);
+  for (let t = 1; t < 4; t++) {
+    const gy = padT + (ch * t) / 4;
+    g.beginPath(); g.moveTo(padL, gy); g.lineTo(padL + cw, gy); g.stroke();
+  }
+
+  g.fillStyle = "#94a3b8"; g.font = "12px sans-serif";
+  g.fillText("Training Loss & Accuracy", padL + 8, padT + 16);
+  g.fillText("100%", padL + cw + 4, padT + 10);
+  g.fillText("0%", padL + cw + 8, padT + ch);
+
   if (lossHist.length < 2) return;
   const maxL = Math.max(0.8, ...lossHist);
-  g.strokeStyle = "#34d399"; g.lineWidth = 2; g.beginPath();
+  g.fillStyle = "#34d399";
+  g.fillText(maxL.toFixed(2), 4, padT + 10);
+  g.fillText("0.0", 12, padT + ch);
+
+  // Accuracy curve (blue)
+  g.strokeStyle = "#60a5fa"; g.lineWidth = 1.8; g.beginPath();
+  for (let i = 0; i < accHist.length; i++) {
+    const px = padL + (i / Math.max(1, accHist.length - 1)) * cw;
+    const py = padT + (1 - accHist[i]) * ch;
+    i === 0 ? g.moveTo(px, py) : g.lineTo(px, py);
+  }
+  g.stroke();
+
+  // Loss curve (emerald)
+  g.strokeStyle = "#34d399"; g.lineWidth = 2.2; g.beginPath();
   for (let i = 0; i < lossHist.length; i++) {
-    const px = 36 + (i / Math.max(1, lossHist.length - 1)) * (W - 52);
-    const py = 16 + (1 - Math.min(lossHist[i], maxL) / maxL) * (H - 44);
+    const px = padL + (i / Math.max(1, lossHist.length - 1)) * cw;
+    const py = padT + (1 - Math.min(lossHist[i], maxL) / maxL) * ch;
     i === 0 ? g.moveTo(px, py) : g.lineTo(px, py);
   }
   g.stroke();
@@ -274,7 +538,8 @@ function runSteps(epochs) {
   const [res, ms] = time(() => trainer.train_steps(Float32Array.from(pts), Uint32Array.from(labels), epochs));
   const loss = res[0], acc = res[1];
   lossHist.push(loss);
-  if (lossHist.length > 200) lossHist.shift();
+  accHist.push(acc);
+  if (lossHist.length > 220) { lossHist.shift(); accHist.shift(); }
   $("m-step").textContent = String(trainer.step_count());
   $("m-loss").textContent = loss.toFixed(4);
   $("m-acc").textContent = `${(acc * 100).toFixed(1)}%`;
@@ -284,55 +549,125 @@ function runSteps(epochs) {
 }
 
 function loop() {
-  if (!running) return;
+  if (!running || pausedByVisibility) return;
   runSteps(5);
   raf = requestAnimationFrame(loop);
 }
 
-$("tr-toggle").onclick = () => {
-  running = !running;
+function setTrainingActive(active) {
+  running = active;
   $("tr-toggle").textContent = running ? "Pause" : "Train";
-  if (running) loop(); else cancelAnimationFrame(raf);
-};
+  cancelAnimationFrame(raf);
+  if (running && !pausedByVisibility) loop();
+}
+
+$("tr-toggle").onclick = () => setTrainingActive(!running);
 $("tr-step").onclick = () => runSteps(10);
+$("tr-step50").onclick = () => runSteps(50);
+$("tr-clear").onclick = () => {
+  pts.length = baseCount * 2;
+  labels.length = baseCount;
+  $("pt-count").textContent = `${labels.length} points`;
+  drawTrain();
+};
 $("tr-reset").onclick = () => { genDataset($("tr-data").value); resetTrainer(); };
 $("tr-data").onchange = () => { genDataset($("tr-data").value); resetTrainer(); };
 $("tr-hid").onchange = resetTrainer;
 $("tr-lr").onchange = resetTrainer;
-$("train-cv").onclick = ev => {
-  const r = ev.target.getBoundingClientRect();
+
+const trainCv = $("train-cv");
+trainCv.onclick = ev => {
+  const r = trainCv.getBoundingClientRect();
   const x = ((ev.clientX - r.left) / r.width) * 2 - 1;
   const y = 1 - ((ev.clientY - r.top) / r.height) * 2;
   pts.push(x, y);
   labels.push(+$("tr-paint").value);
+  $("pt-count").textContent = `${labels.length} points`;
   drawTrain();
 };
+trainCv.onmousemove = ev => {
+  if (!trainer) return;
+  const r = trainCv.getBoundingClientRect();
+  const x = ((ev.clientX - r.left) / r.width) * 2 - 1;
+  const y = 1 - ((ev.clientY - r.top) / r.height) * 2;
+  const p = trainer.predict_probs(Float32Array.from([x, y]))[0];
+  $("train-probe").textContent = `Cursor (${x.toFixed(2)}, ${y.toFixed(2)}) → P(pink) = ${(p * 100).toFixed(1)}% | P(blue) = ${((1 - p) * 100).toFixed(1)}%`;
+};
+
+// Efficient background processing: pause rAF training when offscreen or tab hidden
+const trainSection = $("training");
+const setVisibilityPause = skip => {
+  pausedByVisibility = skip;
+  if (skip) cancelAnimationFrame(raf);
+  else if (running) loop();
+};
+if ("contentVisibility" in document.documentElement.style) {
+  trainSection.addEventListener("contentvisibilityautostatechange", ev => setVisibilityPause(ev.skipped));
+} else if ("IntersectionObserver" in window) {
+  const io = new IntersectionObserver(entries => {
+    setVisibilityPause(!entries[0].isIntersecting);
+  }, { rootMargin: "200px" });
+  io.observe(trainSection);
+}
+document.addEventListener("visibilitychange", () => setVisibilityPause(document.hidden));
 
 // ---- 2. Autograd check
 $("ag-run").onclick = () => {
+  const expr = $("ag-expr").value;
   const xVals = [+$("ag-x0").value, +$("ag-x1").value];
   const wVals = [+$("ag-w0").value, +$("ag-w1").value];
-  const x = T(xVals, [1, 2]), w = T(wVals, [1, 2]), b = T([0.25, -0.4], [1, 2]);
+  const bVals = [0.25, -0.4];
+  const x = T(xVals, [1, 2]), w = T(wVals, [1, 2]), b = T(bVals, [1, 2]);
   x.set_requires_grad(true); w.set_requires_grad(true);
-  const z = x.mul(w).add(b).tanh().mean();
+  const lin = x.mul(w).add(b);
+  let z, extra = [];
+  if (expr === "tanh_mean") {
+    z = lin.tanh().mean();
+  } else if (expr === "silu_mse") {
+    const tgt = T([0.5, 0.5], [1, 2]);
+    const diff = lin.silu().sub(tgt);
+    z = diff.mul(diff).mean();
+    extra.push(tgt, diff);
+  } else {
+    z = lin.gelu().add(x).mean();
+  }
   const val = z.to_f32_vec()[0];
   z.backward();
   const gx = x.grad().to_f32_vec(), gw = w.grad().to_f32_vec();
-  // Finite diff check for x
+
+  const scalarEval = (xv, wv) => {
+    let acc = 0;
+    for (let i = 0; i < 2; i++) {
+      const u = xv[i] * wv[i] + bVals[i];
+      if (expr === "tanh_mean") acc += Math.tanh(u);
+      else if (expr === "silu_mse") { const s = u / (1 + Math.exp(-u)); acc += (s - 0.5) ** 2; }
+      else acc += 0.5 * u * (1 + erf(u / Math.SQRT2)) + xv[i];
+    }
+    return 0.5 * acc;
+  };
   const eps = 1e-4;
-  const fd = [0, 1].map(idx => {
-    const f = dx => {
-      const xp = [...xVals]; xp[idx] += dx;
-      return 0.5 * (Math.tanh(xp[0] * wVals[0] + 0.25) + Math.tanh(xp[1] * wVals[1] - 0.4));
-    };
-    return (f(eps) - f(-eps)) / (2 * eps);
+  const fdX = [0, 1].map(idx => {
+    const xp0 = [...xVals], xp1 = [...xVals];
+    xp0[idx] += eps; xp1[idx] -= eps;
+    return (scalarEval(xp0, wVals) - scalarEval(xp1, wVals)) / (2 * eps);
   });
+  const fdW = [0, 1].map(idx => {
+    const wp0 = [...wVals], wp1 = [...wVals];
+    wp0[idx] += eps; wp1[idx] -= eps;
+    return (scalarEval(xVals, wp0) - scalarEval(xVals, wp1)) / (2 * eps);
+  });
+  const maxErr = Math.max(
+    Math.abs(gx[0] - fdX[0]), Math.abs(gx[1] - fdX[1]),
+    Math.abs(gw[0] - fdW[0]), Math.abs(gw[1] - fdW[1])
+  );
   $("ag-out").textContent =
 `forward loss = ${val.toFixed(6)}
 x.grad() (Oxideon WASM autograd): [${gx[0].toFixed(6)}, ${gx[1].toFixed(6)}]
-finite-diff check (float64):    [${fd[0].toFixed(6)}, ${fd[1].toFixed(6)}]
-w.grad() (Oxideon WASM autograd): [${gw[0].toFixed(6)}, ${gw[1].toFixed(6)}]`;
-  [x, w, b, z].forEach(o => o.free());
+x finite-diff (float64):         [${fdX[0].toFixed(6)}, ${fdX[1].toFixed(6)}]
+w.grad() (Oxideon WASM autograd): [${gw[0].toFixed(6)}, ${gw[1].toFixed(6)}]
+w finite-diff (float64):         [${fdW[0].toFixed(6)}, ${fdW[1].toFixed(6)}]
+max |autograd - finite_diff|:    ${maxErr.toExponential(2)}`;
+  [x, w, b, lin, z, ...extra].forEach(o => o.free());
 };
 
 // ---- 3. Matmul
@@ -360,9 +695,12 @@ $("mm-run").onclick = () => {
     en = Math.max(en, Math.abs(naive[i * n + j] - ref[i * n + j]) * u);
   }
   const gf = 2 * n ** 3 / (ms / 1000) / 1e9;
+  const maxMs = Math.max(ms, msNaive, 0.01);
+  $("mm-bars").innerHTML = `
+    <div class="bar-row"><span>Oxideon WASM</span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, ms / maxMs * 100).toFixed(1)}%;background:var(--ok)"></div></div><span>${ms.toFixed(2)} ms</span></div>
+    <div class="bar-row"><span>Naive JS</span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(3, msNaive / maxMs * 100).toFixed(1)}%;background:var(--acc)"></div></div><span>${msNaive.toFixed(1)} ms</span></div>`;
   $("mm-out").textContent =
-`${n}x${n} @ ${n}x${n}
-Oxideon (WebAssembly): ${ms.toFixed(2)} ms (${gf.toFixed(2)} GFLOP/s)  |  Naive JS: ${msNaive.toFixed(0)} ms
+`${n}x${n} @ ${n}x${n} (${gf.toFixed(2)} GFLOP/s in Oxideon WASM, ${(msNaive / Math.max(ms, 0.01)).toFixed(1)}x vs naive JS)
 Worst error vs f64 (ULPs of 2^-24): Oxideon = ${fmt(eo)}, Naive f32 JS = ${fmt(en)}`;
 };
 
@@ -375,23 +713,32 @@ function erf(x) {
   return x < 0 ? -r : r;
 }
 const ACT = {
-  gelu: { ref: x => 0.5 * x * (1 + erf(x / Math.SQRT2)), color: "#f472b6" },
-  silu: { ref: x => x / (1 + Math.exp(-x)), color: "#60a5fa" },
-  tanh: { ref: Math.tanh, color: "#34d399" },
-  relu: { ref: x => Math.max(0, x), color: "#fbbf24" },
+  gelu:    { ref: x => 0.5 * x * (1 + erf(x / Math.SQRT2)), color: "#f472b6", enabled: true },
+  silu:    { ref: x => x / (1 + Math.exp(-x)),              color: "#60a5fa", enabled: true },
+  tanh:    { ref: Math.tanh,                                color: "#34d399", enabled: true },
+  sigmoid: { ref: x => 1 / (1 + Math.exp(-x)),              color: "#a78bfa", enabled: true },
+  relu:    { ref: x => Math.max(0, x),                      color: "#fbbf24", enabled: true },
 };
-$("act-legend").innerHTML = Object.entries(ACT).map(([k, v]) => `<span style="color:${v.color}">&#9632; ${k}</span>`).join("");
-$("act-run").onclick = () => {
+$("act-legend").innerHTML = Object.entries(ACT).map(([k, v]) =>
+  `<label><input type="checkbox" class="act-cb" data-act="${k}" checked><span style="color:${v.color}">&#9632; ${k}</span></label>`
+).join("");
+
+let lastActValues = {};
+function drawActivations() {
   const N = 2000, xs = new Float32Array(N);
   for (let i = 0; i < N; i++) xs[i] = -6 + 12 * i / (N - 1);
   const x = T(xs, [N]);
   const cv = $("act-cv"), g = cv.getContext("2d"), W = cv.width, H = cv.height;
   g.clearRect(0, 0, W, H);
   const X = v => (v + 6) / 12 * W, Y = v => H / 2 - v * (H / 2) / 6.2;
-  g.strokeStyle = "#1f2937"; g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(W, Y(0)); g.moveTo(X(0), 0); g.lineTo(X(0), H); g.stroke();
+  g.strokeStyle = "#1e293b"; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(0, Y(0)); g.lineTo(W, Y(0)); g.moveTo(X(0), 0); g.lineTo(X(0), H); g.stroke();
   let lines = "function   max |Oxideon - f64 ref|\n";
+  lastActValues = {};
   for (const [name, a] of Object.entries(ACT)) {
+    if (!a.enabled) continue;
     const y = x[name](), ys = y.to_f32_vec(); y.free();
+    lastActValues[name] = ys;
     let maxErr = 0;
     g.strokeStyle = a.color; g.lineWidth = 2; g.setLineDash([]); g.beginPath();
     for (let i = 0; i < N; i++) { const px = X(xs[i]), py = Y(ys[i]); i ? g.lineTo(px, py) : g.moveTo(px, py); maxErr = Math.max(maxErr, Math.abs(ys[i] - a.ref(xs[i]))); }
@@ -403,22 +750,45 @@ $("act-run").onclick = () => {
   }
   g.setLineDash([]); x.free();
   $("act-out").textContent = lines.trimEnd();
+}
+$("act-run").onclick = drawActivations;
+document.querySelectorAll(".act-cb").forEach(cb => {
+  cb.onchange = () => {
+    ACT[cb.dataset.act].enabled = cb.checked;
+    if (ox) drawActivations();
+  };
+});
+$("act-cv").onmousemove = ev => {
+  if (!ox) return;
+  const r = ev.target.getBoundingClientRect();
+  const u = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+  const xv = -6 + 12 * u;
+  const idx = Math.min(1999, Math.max(0, Math.round(u * 1999)));
+  const parts = Object.entries(lastActValues).map(([k, arr]) => `${k}=${arr[idx].toFixed(3)}`);
+  $("act-probe").textContent = `x = ${xv.toFixed(2)} → ${parts.join("  |  ")}`;
 };
 
 // ---- 5. Softmax
 function updateSoftmax() {
   const s = +$("sm-scale").value;
+  $("sm-scale").value = s;
   $("sm-scale-v").textContent = s;
   const v = [1, 0.5, 0.25, 0, -0.5].map(u => u * s);
   const naiveE = v.map(Math.exp), z = naiveE.reduce((p, q) => p + q, 0), naive = naiveE.map(e => e / z);
   const t = T(v, [1, v.length]), r = t.softmax(-1), p = r.to_f32_vec(); t.free(); r.free();
   const sum = Array.from(p).reduce((a, b) => a + b, 0);
+  $("sm-bars").innerHTML = Array.from(p).map((prob, idx) =>
+    `<div class="bar-row"><span>logit ${v[idx].toFixed(1)}</span><div class="bar-track"><div class="bar-fill" style="width:${(prob * 100).toFixed(1)}%;background:var(--ok)"></div></div><span>${(prob * 100).toFixed(2)}%</span></div>`
+  ).join("");
   $("sm-out").textContent =
 `logits:           [${v.join(", ")}]
 Oxideon softmax:  [${Array.from(p).map(fmt).join(", ")}]   sum = ${sum.toFixed(6)}
 Naive JS softmax: [${naive.map(fmt).join(", ")}]${naive.some(Number.isNaN) ? "   <- NaN (overflow)" : ""}`;
 }
 $("sm-scale").oninput = updateSoftmax;
+document.querySelectorAll(".sm-preset").forEach(btn => {
+  btn.onclick = () => { $("sm-scale").value = btn.dataset.v; updateSoftmax(); };
+});
 
 // ---- Boot & Auto-run all demos
 try {
@@ -427,13 +797,13 @@ try {
   await ox.default();
   const sess = new ox.WasmInferenceSession();
   status.textContent = `Oxideon WebAssembly ready in ${(performance.now() - t0).toFixed(0)} ms (WebGPU: ${sess.has_webgpu() ? "enabled" : "CPU WASM backend"}).`;
-  for (const b of ["tr-toggle", "tr-step", "tr-reset", "ag-run", "mm-run", "act-run"]) $(b).disabled = false;
+  for (const b of ["tr-toggle", "tr-step", "tr-step50", "tr-clear", "tr-reset", "ag-run", "mm-run", "act-run"]) $(b).disabled = false;
   genDataset("spiral");
   resetTrainer();
   runSteps(20);
   $("ag-run").click();
   $("mm-run").click();
-  $("act-run").click();
+  drawActivations();
   updateSoftmax();
 } catch (e) {
   status.className = "status err";
