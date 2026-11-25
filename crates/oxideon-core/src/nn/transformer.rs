@@ -833,6 +833,11 @@ impl CausalLM {
 
     /// Forward pass using a stateful [`KVCache`] for incremental autoregressive decoding.
     pub fn forward_cached(&self, tokens: &Tensor, cache: &mut KVCache) -> Result<Tensor> {
+        if tokens.numel() == 0 {
+            return Err(Error::Msg(
+                "forward_cached: input sequence cannot be empty".into(),
+            ));
+        }
         if cache.layers.len() != self.blocks.len() {
             return Err(Error::Msg(format!(
                 "forward_cached: cache has {} layers but the model has {} (cache built for another model?)",
@@ -1075,6 +1080,11 @@ impl CausalLM {
 
 impl Module for CausalLM {
     fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
+        if tokens.numel() == 0 {
+            return Err(Error::Msg(
+                "CausalLM::forward: input sequence cannot be empty".into(),
+            ));
+        }
         let mut h = self.tok_emb.forward(tokens)?;
         for blk in &self.blocks {
             h = blk.forward_rope(&h, &self.rope)?;

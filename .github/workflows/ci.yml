@@ -56,6 +56,16 @@ jobs:
       - name: Robustness tests (release profile, Ubuntu only)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --release --test robustness
+      # Build and exercise the macOS wheel in the same runner instead of queuing two additional
+      # hosted arm64 macOS jobs (which hit hosted-runner acquisition timeouts under queue contention).
+      - name: Wheel build and test (macOS, Python 3.12)
+        if: matrix.os == 'macos-latest'
+        run: |
+          python -m pip install maturin numpy
+          maturin build --out dist
+          python -m pip install --no-index --find-links dist oxideon
+          python tests/test_python_package.py
+          python tests/test_python_ergonomics.py
 
   # The wheel is built once per OS (the extension is abi3, so one wheel serves every supported Python) and then
   # installed and exercised under each supported Python version below.
@@ -65,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest]
     defaults:
       run:
         shell: bash
@@ -89,19 +99,8 @@ jobs:
       fail-fast: false
       # ubuntu-latest is now 26.04, which setup-python has no Python 3.9 for: the wheel jobs are pinned to 24.04
       matrix:
-        os: [ubuntu-24.04, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-        exclude:
-          # Wheel is abi3-py39 (identical binary across Python 3.9–3.13); Ubuntu and Windows test every version
-          # while macOS tests 3.12 to avoid competing for limited hosted macOS runner concurrency.
-          - os: macos-latest
-            python: "3.9"
-          - os: macos-latest
-            python: "3.10"
-          - os: macos-latest
-            python: "3.11"
-          - os: macos-latest
-            python: "3.13"
     defaults:
       run:
         shell: bash

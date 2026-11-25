@@ -18,16 +18,20 @@ find_program(CARGO_EXECUTABLE cargo REQUIRED)
 if(WIN32)
   set(OXIDEON_LIB_FILE "${OXIDEON_LIB_DIR}/oxideon.dll")
   set(OXIDEON_IMPLIB_FILE "${OXIDEON_LIB_DIR}/oxideon.dll.lib")
+  set(OXIDEON_BYPRODUCTS "${OXIDEON_LIB_FILE}" "${OXIDEON_IMPLIB_FILE}")
 elseif(APPLE)
   set(OXIDEON_LIB_FILE "${OXIDEON_LIB_DIR}/liboxideon.dylib")
+  set(OXIDEON_BYPRODUCTS "${OXIDEON_LIB_FILE}")
 else()
   set(OXIDEON_LIB_FILE "${OXIDEON_LIB_DIR}/liboxideon.so")
+  set(OXIDEON_BYPRODUCTS "${OXIDEON_LIB_FILE}")
 endif()
 
 add_custom_target(oxideon_rust ALL
   COMMAND "${CARGO_EXECUTABLE}" build --release -p oxideon
           --manifest-path "${OXIDEON_ROOT}/Cargo.toml"
           --target-dir "${OXIDEON_CARGO_TARGET_DIR}"
+  BYPRODUCTS ${OXIDEON_BYPRODUCTS}
   COMMENT "Building the Oxideon shared library with cargo"
   USES_TERMINAL)
 
