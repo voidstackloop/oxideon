@@ -181,6 +181,12 @@ class _HookHandle:
     def remove(self):
         self.hooks_dict.pop(self.id, None)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.remove()
+
 
 # ---------------------------------------------------------------------------
 # Base Module Class

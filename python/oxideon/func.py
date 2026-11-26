@@ -262,33 +262,21 @@ def functional_call(
     parameter_and_buffer_dicts: Dict[str, Any],
     args: Any = (),
     kwargs: Optional[Dict[str, Any]] = None,
+    *,
+    tie_weights: bool = True,
+    strict: bool = False,
 ) -> Any:
     """Invokes `module(*args, **kwargs)` with parameters temporarily substituted by `parameter_and_buffer_dicts`."""
-    kwargs = kwargs or {}
-    saved_attrs = {}
+    from .nn_utils import apply_with_weights
 
-    try:
-        # Swap parameters/buffers
-        for name, tensor_val in parameter_and_buffer_dicts.items():
-            parts = name.split(".")
-            curr = module
-            for p in parts[:-1]:
-                curr = getattr(curr, p)
-            last_part = parts[-1]
-            if hasattr(curr, last_part):
-                saved_attrs[name] = getattr(curr, last_part)
-                setattr(curr, last_part, tensor_val)
-
-        return module(*args, **kwargs)
-    finally:
-        # Restore original parameters/buffers
-        for name, orig_val in saved_attrs.items():
-            parts = name.split(".")
-            curr = module
-            for p in parts[:-1]:
-                curr = getattr(curr, p)
-            last_part = parts[-1]
-            setattr(curr, last_part, orig_val)
+    return apply_with_weights(
+        module,
+        parameter_and_buffer_dicts,
+        args=args,
+        kwargs=kwargs,
+        tie_weights=tie_weights,
+        strict=strict,
+    )
 
 
 def make_functional(module: Any) -> Tuple[Callable[..., Any], Dict[str, Any]]:

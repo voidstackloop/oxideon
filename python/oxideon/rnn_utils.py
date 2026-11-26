@@ -1,11 +1,11 @@
-"""Packed sequence utilities for recurrent neural networks.
-
-Mirrors torch.nn.utils.rnn:
+"""Packed and padded sequence utilities for recurrent neural networks:
 - PackedSequence
 - pack_padded_sequence
 - pad_packed_sequence
 - pad_sequence
+- unpad_sequence
 - pack_sequence
+- unpack_sequence
 """
 
 from typing import List, Optional, Sequence, Tuple, Union
@@ -127,8 +127,11 @@ def pad_sequence(
     sequences: Sequence[Tensor],
     batch_first: bool = False,
     padding_value: float = 0.0,
+    padding_side: str = "right",
 ) -> Tensor:
-    """Pad a list of variable length Tensors with `padding_value`."""
+    """Pad a list of variable length Tensors with `padding_value` (`padding_side` in `{'right', 'left'}`)."""
+    if padding_side not in ("right", "left"):
+        raise ValueError(f"padding_side must be 'right' or 'left', got {padding_side!r}")
     lengths = [s.shape[0] for s in sequences]
     max_len = max(lengths) if lengths else 0
     batch_size = len(sequences)
@@ -139,12 +142,53 @@ def pad_sequence(
     out = np.full((max_len, batch_size) + sample.shape[1:], padding_value, dtype=sample.dtype)
     for i, s in enumerate(sequences):
         s_np = s.to_numpy()
-        out[: s_np.shape[0], i] = s_np
+        seq_len = s_np.shape[0]
+        if padding_side == "right":
+            out[:seq_len, i] = s_np
+        else:
+            out[max_len - seq_len :, i] = s_np
 
     if batch_first:
         axes = (1, 0) + tuple(range(2, out.ndim))
         out = np.transpose(out, axes)
     return from_numpy(np.ascontiguousarray(out))
+
+
+def unpad_sequence(
+    padded_sequences: Tensor,
+    lengths: Union[Tensor, Sequence[int]],
+    batch_first: bool = False,
+    padding_side: str = "right",
+) -> List[Tensor]:
+    """Unpads a padded Tensor into a list of variable-length Tensors."""
+    if padding_side not in ("right", "left"):
+        raise ValueError(f"padding_side must be 'right' or 'left', got {padding_side!r}")
+    if isinstance(lengths, Tensor):
+        len_list = [int(x) for x in lengths.to_numpy().flatten()]
+    else:
+        len_list = [int(x) for x in lengths]
+
+    arr = padded_sequences.to_numpy()
+    if not batch_first:
+        axes = (1, 0) + tuple(range(2, arr.ndim))
+        arr = np.transpose(arr, axes)
+
+    if len(len_list) != arr.shape[0]:
+        raise ValueError(
+            f"unpad_sequence: lengths count ({len(len_list)}) does not match batch size ({arr.shape[0]})"
+        )
+
+    max_len = arr.shape[1]
+    out: List[Tensor] = []
+    for i, seq_len in enumerate(len_list):
+        if seq_len < 0 or seq_len > max_len:
+            raise ValueError(f"unpad_sequence: invalid sequence length {seq_len} for max length {max_len}")
+        slc = arr[i, :seq_len] if padding_side == "right" else arr[i, max_len - seq_len :]
+        t = from_numpy(np.ascontiguousarray(slc))
+        if padded_sequences.requires_grad:
+            t.requires_grad_(True)
+        out.append(t)
+    return out
 
 
 def pack_sequence(
@@ -155,3 +199,20 @@ def pack_sequence(
     lengths = [s.shape[0] for s in sequences]
     padded = pad_sequence(sequences)
     return pack_padded_sequence(padded, lengths, batch_first=False, enforce_sorted=enforce_sorted)
+
+
+def unpack_sequence(packed_sequences: PackedSequence) -> List[Tensor]:
+    """Unpacks a `PackedSequence` into a list of variable-length Tensors."""
+    padded, lengths = pad_packed_sequence(packed_sequences, batch_first=True)
+    return unpad_sequence(padded, lengths, batch_first=True)
+
+
+__all__ = [
+    "PackedSequence",
+    "pack_padded_sequence",
+    "pad_packed_sequence",
+    "pad_sequence",
+    "unpad_sequence",
+    "pack_sequence",
+    "unpack_sequence",
+]

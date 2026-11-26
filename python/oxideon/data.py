@@ -1,6 +1,6 @@
 """Dataset and DataLoader pipeline for Oxideon.
 
-Provides PyTorch-compatible `Dataset`, `TensorDataset`, `DataLoader`,
+Provides `Dataset`, `TensorDataset`, `DataLoader`, samplers,
 and dataset splitting helpers (`random_split`).
 """
 
@@ -55,6 +55,27 @@ class Subset(Dataset):
 
     def __len__(self) -> int:
         return len(self.indices)
+
+
+def to_tensors(data: Any) -> Any:
+    """Recursively converts NumPy arrays and numeric scalars inside nested structures into Oxideon `Tensor`s
+    without adding a batch dimension.
+    """
+    if isinstance(data, Tensor):
+        return data
+    if isinstance(data, np.ndarray):
+        if data.dtype.kind in ("S", "U", "O"):
+            return data
+        return Tensor.from_numpy(np.ascontiguousarray(data))
+    if isinstance(data, (np.bool_, np.number)):
+        return Tensor.from_numpy(np.asarray(data))
+    if isinstance(data, tuple) and hasattr(data, "_fields"):
+        return type(data)(*(to_tensors(d) for d in data))
+    if isinstance(data, (tuple, list)):
+        return type(data)(to_tensors(d) for d in data)
+    if isinstance(data, dict):
+        return {k: to_tensors(v) for k, v in data.items()}
+    return data
 
 
 def default_collate(batch: List[Any]) -> Any:
@@ -593,4 +614,4 @@ class StackDataset(Dataset):
         return self._length
 
 
-__all__ += ["DistributedSampler", "StackDataset"]
+__all__ += ["DistributedSampler", "StackDataset", "to_tensors"]

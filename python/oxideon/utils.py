@@ -1,27 +1,30 @@
-"""High-level deep learning utilities: model summary, gradient clipping, seeding, and benchmarking."""
+"""High-level deep learning, training, parameterization, tree-mapping, and workflow utilities."""
 
+import math
 import os
 import random
 import sys
 import time
+import types
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from . import data
-from . import checkpoint as checkpoint
+from . import checkpoint as _checkpoint_mod
 from . import rnn_utils as rnn
-__path__ = []  # Exposes 'from oxideon.utils.data import ...'
-sys.modules["oxideon.utils.data"] = data
-sys.modules["oxideon.utils.checkpoint"] = checkpoint
-sys.modules["oxideon.utils.rnn"] = rnn
-sys.modules["oxideon.nn.utils.rnn"] = rnn
+from . import treemap as treemap
+from . import nn_utils as _nn_utils
+from . import utils_ext as _utils_ext
+from . import workflow_utils as _workflow_utils
+
+__path__ = []  # Exposes 'from oxideon.utils.<submod> import ...'
 
 from .oxideon import manual_seed as _manual_seed, cat as _native_cat
 from .primitives import no_grad as _no_grad
 
 
 def parameters_to_vector(parameters):
-    """Convert parameters to one flattened 1-D vector (torch.nn.utils.parameters_to_vector)."""
+    """Concatenates an iterable of parameter tensors into a single flattened 1-D vector."""
     vecs = [p.reshape([-1]) for p in parameters]
     if not vecs:
         from .oxideon import zeros
@@ -30,29 +33,33 @@ def parameters_to_vector(parameters):
 
 
 def vector_to_parameters(vec, parameters):
-    """Convert one flattened 1-D vector back to the parameter shapes in-place."""
+    """Copies slices of a flattened 1-D vector back into `parameters` in-place."""
     pointer = 0
     with _no_grad():
         for p in parameters:
             num_param = p.numel()
-            p.copy_(vec[pointer:pointer + num_param].reshape(list(p.shape)))
+            p.copy_(vec[pointer : pointer + num_param].reshape(list(p.shape)))
             pointer += num_param
 
 
 def set_seed(seed: int = 42):
-    """Sets random seeds deterministically across Oxideon, NumPy, and Python standard random."""
+    """Sets random seeds deterministically across Oxideon, NumPy, and Python's `random` module."""
     random.seed(seed)
     np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     _manual_seed(seed)
 
 
-def clip_grad_norm_(parameters, max_norm: float, norm_type: float = 2.0) -> float:
-    """Clips gradient norm of an iterable of parameters.
+set_random_seed = set_seed
 
-    The norm is computed over all gradients together as a single vector.
-    Gradients are modified in-place or via parameter set_grad.
-    """
+
+def clip_grad_norm_(
+    parameters,
+    max_norm: float,
+    norm_type: float = 2.0,
+    error_if_nonfinite: bool = False,
+) -> float:
+    """Clips the joint Lp norm of gradients across `parameters` to at most `max_norm`."""
     max_norm = float(max_norm)
     norm_type = float(norm_type)
 
@@ -68,29 +75,30 @@ def clip_grad_norm_(parameters, max_norm: float, norm_type: float = 2.0) -> floa
         return 0.0
 
     if norm_type == float("inf"):
-        total_norm = max(float(g.abs().max().item()) for g in grads)
-    elif norm_type <= 0.0:
+        total = max(float(g.abs().max().item()) for g in grads)
+    elif norm_type <= 0.0 or math.isnan(norm_type):
         raise ValueError(f"clip_grad_norm_ requires norm_type > 0 or inf, got {norm_type}")
     else:
-        # True Lp norm over all gradient elements (torch semantics): summing
-        # per-tensor L2 norms is only correct for p == 2.
-        total_norm = 0.0
+        total = 0.0
         for g in grads:
-            total_norm += float(g.abs().powf(norm_type).sum().item())
-        total_norm = total_norm ** (1.0 / norm_type)
+            total += float(g.abs().powf(norm_type).sum().item())
+        total = total ** (1.0 / norm_type)
 
-    clip_coef = max_norm / (total_norm + 1e-6)
+    if error_if_nonfinite and (math.isnan(total) or math.isinf(total)):
+        raise RuntimeError(f"The total norm of order {norm_type} for gradients is non-finite ({total}).")
+
+    clip_coef = max_norm / (total + 1e-6)
     if clip_coef < 1.0:
         for p, g in zip(param_list, grads):
             scaled_g = g.mul_scalar(clip_coef)
             if hasattr(p, "set_grad"):
                 p.set_grad(scaled_g)
 
-    return total_norm
+    return total
 
 
 def clip_grad_value_(parameters, clip_value: float):
-    """Clips gradient values of an iterable of parameters to `[-clip_value, clip_value]`."""
+    """Clips gradient values of an iterable of parameters elementwise to `[-clip_value, clip_value]`."""
     clip_value = float(clip_value)
     for p in parameters:
         g = p.grad() if hasattr(p, "grad") and callable(p.grad) else getattr(p, "grad", None)
@@ -100,7 +108,6 @@ def clip_grad_value_(parameters, clip_value: float):
                 p.set_grad(clamped)
 
 
-# Native dtype tag -> bytes per element for model_summary size estimates.
 _DTYPE_NUM_BYTES = {
     "f32": 4, "f64": 8, "f16": 2, "bf16": 2,
     "i32": 4, "i64": 8, "u8": 1, "bool": 1,
@@ -108,15 +115,8 @@ _DTYPE_NUM_BYTES = {
 
 
 def model_summary(model, input_size=None) -> str:
-    """Generates a detailed tabular architectural summary of an Oxideon `nn.Module`.
-
-    Displays:
-      - Layer names & classes
-      - Parameter counts (weights, biases)
-      - Trainable vs frozen status
-      - Estimated memory size
-      - Total parameters breakdown
-    """
+    """Generates a tabular architectural summary of an Oxideon `nn.Module`."""
+    del input_size
     header = f"{'Layer (type)':<32} {'Param Shapes':<26} {'Param #':<12} {'Trainable':<10}"
     separator = "=" * len(header)
     subsep = "-" * len(header)
@@ -173,7 +173,7 @@ def model_summary(model, input_size=None) -> str:
 
 
 class BenchmarkTimer:
-    """High-resolution precision benchmarking timer context manager."""
+    """High-resolution wall-clock benchmarking context manager."""
 
     def __init__(self, description: str = "Benchmark", warmup: int = 1, iterations: int = 10):
         self.description = description
@@ -197,7 +197,7 @@ class BenchmarkTimer:
 
 
 class SummaryWriter:
-    """Lightweight experiment tracking and event writer (TensorBoard / JSON compatible)."""
+    """Structured experiment metric, histogram, image, hyperparameter, and graph event writer."""
 
     def __init__(self, log_dir: str = "runs"):
         self.log_dir = log_dir
@@ -227,6 +227,107 @@ class SummaryWriter:
         for sub_tag, val in tag_scalar_dict.items():
             full_tag = f"{main_tag}/{sub_tag}"
             self.add_scalar(full_tag, val, global_step=global_step, walltime=walltime)
+
+    def add_histogram(
+        self,
+        tag: str,
+        values: Any,
+        global_step: int = 0,
+        bins: int = 30,
+        walltime: Optional[float] = None,
+    ) -> None:
+        arr = values.detach().to_numpy() if hasattr(values, "to_numpy") else np.asarray(values)
+        flat = arr.astype(np.float64).reshape(-1)
+        counts, edges = np.histogram(flat, bins=int(bins)) if flat.size > 0 else (np.array([], dtype=np.int64), np.array([], dtype=np.float64))
+        ts = time.time() if walltime is None else float(walltime)
+        self.events.append({
+            "type": "histogram",
+            "tag": tag,
+            "step": global_step,
+            "counts": counts.tolist(),
+            "bin_edges": edges.tolist(),
+            "min": float(np.min(flat)) if flat.size else 0.0,
+            "max": float(np.max(flat)) if flat.size else 0.0,
+            "mean": float(np.mean(flat)) if flat.size else 0.0,
+            "std": float(np.std(flat)) if flat.size else 0.0,
+            "walltime": ts,
+        })
+
+    def add_image(
+        self,
+        tag: str,
+        img_tensor: Any,
+        global_step: int = 0,
+        dataformats: str = "CHW",
+        walltime: Optional[float] = None,
+    ) -> None:
+        arr = img_tensor.detach().to_numpy() if hasattr(img_tensor, "to_numpy") else np.asarray(img_tensor)
+        fmt = dataformats.upper()
+        if fmt == "HWC" and arr.ndim == 3:
+            arr = np.transpose(arr, (2, 0, 1))
+        elif fmt == "HW" and arr.ndim == 2:
+            arr = arr[None, :, :]
+        ts = time.time() if walltime is None else float(walltime)
+        self.events.append({
+            "type": "image",
+            "tag": tag,
+            "step": global_step,
+            "shape": list(arr.shape),
+            "min": float(np.min(arr)) if arr.size else 0.0,
+            "max": float(np.max(arr)) if arr.size else 0.0,
+            "walltime": ts,
+        })
+
+    def add_images(
+        self,
+        tag: str,
+        img_tensor: Any,
+        global_step: int = 0,
+        dataformats: str = "NCHW",
+        walltime: Optional[float] = None,
+    ) -> None:
+        arr = img_tensor.detach().to_numpy() if hasattr(img_tensor, "to_numpy") else np.asarray(img_tensor)
+        fmt = dataformats.upper()
+        if fmt == "NHWC" and arr.ndim == 4:
+            arr = np.transpose(arr, (0, 3, 1, 2))
+        ts = time.time() if walltime is None else float(walltime)
+        self.events.append({
+            "type": "images",
+            "tag": tag,
+            "step": global_step,
+            "shape": list(arr.shape),
+            "count": int(arr.shape[0]) if arr.ndim >= 1 else 0,
+            "walltime": ts,
+        })
+
+    def add_hparams(
+        self,
+        hparam_dict: Dict[str, Any],
+        metric_dict: Dict[str, float],
+        global_step: int = 0,
+    ) -> None:
+        clean_metrics = {
+            k: float(v.item() if hasattr(v, "item") else v) for k, v in metric_dict.items()
+        }
+        self.events.append({
+            "type": "hparams",
+            "step": global_step,
+            "hparams": dict(hparam_dict),
+            "metrics": clean_metrics,
+            "walltime": time.time(),
+        })
+        for mk, mv in clean_metrics.items():
+            self.add_scalar(mk, mv, global_step=global_step)
+
+    def add_graph(self, model: Any, input_to_model: Any = None) -> None:
+        del input_to_model
+        summary = model_summary(model) if hasattr(model, "parameters") else repr(model)
+        self.events.append({
+            "type": "graph",
+            "model_class": type(model).__name__,
+            "summary": summary,
+            "walltime": time.time(),
+        })
 
     def add_text(self, tag: str, text_string: str, global_step: int = 0):
         self.events.append({
@@ -303,15 +404,135 @@ def get_device(tensor_or_model: Any) -> str:
     return "cpu"
 
 
-from . import data
+# Re-exports from new Oxideon utility modules
+from .checkpoint import checkpoint  # noqa: E402
+from .treemap import (  # noqa: E402
+    TreeSchema,
+    LeafSchema,
+    register_tree_node,
+    unregister_tree_node,
+    is_nested,
+    tree_is_leaf,
+    tree_flatten,
+    tree_unflatten,
+    tree_leaves,
+    tree_schema,
+    tree_map,
+    tree_map_,
+    tree_map_only,
+    tree_all,
+    tree_any,
+    tree_all_only,
+    tree_any_only,
+    broadcast_tree_prefix,
+    flatten_nested,
+    assert_same_structure,
+    pack_sequence_as,
+    map_structure,
+)
+from .nn_utils import (  # noqa: E402
+    total_norm,
+    weight_norm,
+    remove_weight_norm,
+    spectral_norm,
+    remove_spectral_norm,
+    fuse_conv_batchnorm_weights,
+    fuse_conv_batchnorm,
+    fuse_linear_batchnorm_weights,
+    fuse_linear_batchnorm,
+    fast_init,
+    apply_with_weights,
+    bind_reparam,
+    unbind_reparam,
+    has_reparam,
+    cache_reparam,
+    ln_structured_prune,
+    mask_prune,
+    identity_prune,
+    is_pruned,
+    fusion,
+    reparam,
+    prune,
+)
+from .utils_ext import (  # noqa: E402
+    HookHandle,
+    ephemeral_hook,
+    RuntimeInfo,
+    collect_runtime_info,
+    format_runtime_info,
+    FlopProfiler,
+    count_flops,
+    fetch_weights_url,
+    TimingReport,
+    MicroTimer,
+    TimingComparison,
+    hooks,
+    sysinfo,
+    flops,
+    dlpack,
+    weights_cache,
+    timing,
+)
+from .workflow_utils import (  # noqa: E402
+    one_hot_encode,
+    axis_normalize,
+    pad_sequences,
+    pack_batch,
+    unpack_batch,
+    compute_class_weight,
+    compute_sample_weight,
+    sliding_window_dataset,
+    split_dataset,
+    image_folder_dataset,
+    text_folder_dataset,
+    ProgressBar,
+    fetch_artifact,
+    verify_checksum,
+    SerializationScope,
+    serialization_scope,
+    register_serializable,
+    get_registered_objects,
+    get_registered_name,
+    get_registered_object,
+    serialize_config,
+    deserialize_config,
+    CheckpointVault,
+    ShadowWeightEMA,
+)
 
-from .checkpoint import checkpoint
+events = types.ModuleType("oxideon.utils.events")
+events.SummaryWriter = SummaryWriter  # type: ignore[attr-defined]
+events.__all__ = ["SummaryWriter"]  # type: ignore[attr-defined]
+
+# Submodule registrations under `oxideon.utils.*` and `oxideon.nn.utils.*`
+sys.modules["oxideon.utils.data"] = data
+sys.modules["oxideon.utils.checkpoint"] = _checkpoint_mod
+sys.modules["oxideon.utils.rnn"] = rnn
+sys.modules["oxideon.utils.treemap"] = treemap
+sys.modules["oxideon.utils.hooks"] = hooks
+sys.modules["oxideon.utils.sysinfo"] = sysinfo
+sys.modules["oxideon.utils.flops"] = flops
+sys.modules["oxideon.utils.dlpack"] = dlpack
+sys.modules["oxideon.utils.weights_cache"] = weights_cache
+sys.modules["oxideon.utils.timing"] = timing
+sys.modules["oxideon.utils.events"] = events
+
+sys.modules["oxideon.nn.utils"] = sys.modules[__name__]
+sys.modules["oxideon.nn.utils.rnn"] = rnn
+sys.modules["oxideon.nn.utils.fusion"] = fusion
+sys.modules["oxideon.nn.utils.reparam"] = reparam
+sys.modules["oxideon.nn.utils.prune"] = prune
 
 
 __all__ = [
+    # Core utilities
+    "parameters_to_vector",
+    "vector_to_parameters",
     "set_seed",
+    "set_random_seed",
     "clip_grad_norm_",
     "clip_grad_value_",
+    "total_norm",
     "model_summary",
     "BenchmarkTimer",
     "SummaryWriter",
@@ -321,4 +542,83 @@ __all__ = [
     "get_device",
     "data",
     "checkpoint",
+    # Tree mapping & nested container utilities
+    "TreeSchema",
+    "LeafSchema",
+    "register_tree_node",
+    "unregister_tree_node",
+    "is_nested",
+    "tree_is_leaf",
+    "tree_flatten",
+    "tree_unflatten",
+    "tree_leaves",
+    "tree_schema",
+    "tree_map",
+    "tree_map_",
+    "tree_map_only",
+    "tree_all",
+    "tree_any",
+    "tree_all_only",
+    "tree_any_only",
+    "broadcast_tree_prefix",
+    "flatten_nested",
+    "assert_same_structure",
+    "pack_sequence_as",
+    "map_structure",
+    # Neural parameterization, fusion & pruning
+    "weight_norm",
+    "remove_weight_norm",
+    "spectral_norm",
+    "remove_spectral_norm",
+    "fuse_conv_batchnorm_weights",
+    "fuse_conv_batchnorm",
+    "fuse_linear_batchnorm_weights",
+    "fuse_linear_batchnorm",
+    "fast_init",
+    "apply_with_weights",
+    "bind_reparam",
+    "unbind_reparam",
+    "has_reparam",
+    "cache_reparam",
+    "ln_structured_prune",
+    "mask_prune",
+    "identity_prune",
+    "is_pruned",
+    # Runtime, FLOP profiling, hooks & microtiming
+    "HookHandle",
+    "ephemeral_hook",
+    "RuntimeInfo",
+    "collect_runtime_info",
+    "format_runtime_info",
+    "FlopProfiler",
+    "count_flops",
+    "fetch_weights_url",
+    "TimingReport",
+    "MicroTimer",
+    "TimingComparison",
+    # Data encoding, folder/window loaders, progress, caching, serialization & EMA
+    "one_hot_encode",
+    "axis_normalize",
+    "pad_sequences",
+    "pack_batch",
+    "unpack_batch",
+    "compute_class_weight",
+    "compute_sample_weight",
+    "sliding_window_dataset",
+    "split_dataset",
+    "image_folder_dataset",
+    "text_folder_dataset",
+    "ProgressBar",
+    "fetch_artifact",
+    "verify_checksum",
+    "SerializationScope",
+    "serialization_scope",
+    "register_serializable",
+    "get_registered_objects",
+    "get_registered_name",
+    "get_registered_object",
+    "serialize_config",
+    "deserialize_config",
+    "CheckpointVault",
+    "ShadowWeightEMA",
 ]
