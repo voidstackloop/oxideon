@@ -1,7 +1,7 @@
 """Comprehensive Fast Fourier Transform (FFT) Suite for Oxideon.
 
-Provides multi-dimensional discrete Fourier transforms matching the PyTorch `torch.fft`
-specification, including forward, inverse, real-to-complex, complex-to-real, Hermitian,
+Provides multi-dimensional discrete Fourier transforms,
+including forward, inverse, real-to-complex, complex-to-real, Hermitian,
 frequency calculations, and spectral shift operations.
 """
 

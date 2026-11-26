@@ -1,6 +1,6 @@
 """Comprehensive Execution & Memory Profiling Suite for Oxideon.
 
-Provides PyTorch-compatible `torch.profiler` interfaces for deep operational benchmarking,
+Provides profiling interfaces for deep operational benchmarking,
 shape logging, hierarchical call tree analysis, and Chrome Trace JSON export.
 """
 
@@ -256,8 +256,8 @@ def schedule(wait: int = 0, warmup: int = 0, active: int = 1, repeat: int = 1, s
     return schedule_fn
 
 
-def tensorboard_trace_handler(dir_name: str) -> Callable[[profile], None]:
-    """Returns an on_trace_ready handler that outputs Chrome trace files into dir_name."""
+def chrome_trace_handler(dir_name: str) -> Callable[[profile], None]:
+    """Returns an `on_trace_ready` handler that writes Chrome trace JSON files into `dir_name`."""
     os.makedirs(dir_name, exist_ok=True)
 
     def handler(prof: profile) -> None:
@@ -265,6 +265,9 @@ def tensorboard_trace_handler(dir_name: str) -> Callable[[profile], None]:
         prof.export_chrome_trace(file_path)
 
     return handler
+
+
+tensorboard_trace_handler = chrome_trace_handler
 
 
 sys.modules["oxideon.profiler"] = sys.modules[__name__]
@@ -275,5 +278,6 @@ __all__ = [
     "profile",
     "record_function",
     "schedule",
+    "chrome_trace_handler",
     "tensorboard_trace_handler",
 ]

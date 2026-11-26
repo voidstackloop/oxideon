@@ -1,6 +1,6 @@
 """Model Hub and Pretrained Checkpoint Registry for Oxideon.
 
-Provides PyTorch-compatible `torch.hub` interfaces to download, cache, and instantiate
+Provides hub interfaces to download, cache, and instantiate
 community models and weight checkpoints directly from repository URLs or local directories.
 """
 

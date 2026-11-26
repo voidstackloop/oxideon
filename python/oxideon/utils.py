@@ -466,12 +466,19 @@ from .utils_ext import (  # noqa: E402
     TimingReport,
     MicroTimer,
     TimingComparison,
+    model_to_dot,
+    model_to_mermaid,
+    freeze_module_types,
+    freeze_by_prefix,
+    MemoryFootprint,
+    estimate_memory_footprint,
     hooks,
     sysinfo,
     flops,
     dlpack,
     weights_cache,
     timing,
+    graph_viz,
 )
 from .workflow_utils import (  # noqa: E402
     one_hot_encode,
@@ -485,6 +492,13 @@ from .workflow_utils import (  # noqa: E402
     split_dataset,
     image_folder_dataset,
     text_folder_dataset,
+    read_wav_tensor,
+    save_wav_tensor,
+    audio_folder_dataset,
+    csv_dataset,
+    jsonl_dataset,
+    VocabularyIndex,
+    build_vocabulary,
     ProgressBar,
     fetch_artifact,
     verify_checksum,
@@ -498,6 +512,15 @@ from .workflow_utils import (  # noqa: E402
     deserialize_config,
     CheckpointVault,
     ShadowWeightEMA,
+)
+from .serialization import (  # noqa: E402
+    save_sharded,
+    load_sharded,
+)
+from .testing import (  # noqa: E402
+    assert_finite,
+    assert_shapes,
+    gradgradcheck,
 )
 
 events = types.ModuleType("oxideon.utils.events")
@@ -515,6 +538,7 @@ sys.modules["oxideon.utils.flops"] = flops
 sys.modules["oxideon.utils.dlpack"] = dlpack
 sys.modules["oxideon.utils.weights_cache"] = weights_cache
 sys.modules["oxideon.utils.timing"] = timing
+sys.modules["oxideon.utils.graph_viz"] = graph_viz
 sys.modules["oxideon.utils.events"] = events
 
 sys.modules["oxideon.nn.utils"] = sys.modules[__name__]
@@ -539,6 +563,8 @@ __all__ = [
     "count_parameters",
     "freeze",
     "unfreeze",
+    "freeze_module_types",
+    "freeze_by_prefix",
     "get_device",
     "data",
     "checkpoint",
@@ -584,7 +610,7 @@ __all__ = [
     "mask_prune",
     "identity_prune",
     "is_pruned",
-    # Runtime, FLOP profiling, hooks & microtiming
+    # Runtime, FLOP profiling, graph rendering, hooks & microtiming
     "HookHandle",
     "ephemeral_hook",
     "RuntimeInfo",
@@ -596,7 +622,11 @@ __all__ = [
     "TimingReport",
     "MicroTimer",
     "TimingComparison",
-    # Data encoding, folder/window loaders, progress, caching, serialization & EMA
+    "model_to_dot",
+    "model_to_mermaid",
+    "MemoryFootprint",
+    "estimate_memory_footprint",
+    # Data encoding, folder/window loaders, vocabulary, progress, caching, serialization & EMA
     "one_hot_encode",
     "axis_normalize",
     "pad_sequences",
@@ -608,6 +638,13 @@ __all__ = [
     "split_dataset",
     "image_folder_dataset",
     "text_folder_dataset",
+    "read_wav_tensor",
+    "save_wav_tensor",
+    "audio_folder_dataset",
+    "csv_dataset",
+    "jsonl_dataset",
+    "VocabularyIndex",
+    "build_vocabulary",
     "ProgressBar",
     "fetch_artifact",
     "verify_checksum",
@@ -621,4 +658,10 @@ __all__ = [
     "deserialize_config",
     "CheckpointVault",
     "ShadowWeightEMA",
+    "save_sharded",
+    "load_sharded",
+    # Numerical & shape contract assertions
+    "assert_finite",
+    "assert_shapes",
+    "gradgradcheck",
 ]

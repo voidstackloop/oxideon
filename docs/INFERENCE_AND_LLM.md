@@ -146,7 +146,7 @@ attn_out = ox.flash_attention_forward(
     causal=True,       # Autoregressive lower-triangular causal mask
 )
 
-# 2. PyTorch-style Module interface
+# 2. Module interface
 tiled_attn = ox.TiledAttention(
     embed_dim=512,
     num_heads=8,

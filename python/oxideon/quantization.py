@@ -452,7 +452,7 @@ def quantize_dynamic(
     """Recursively replaces all `Linear` (and optionally `Embedding`) modules in `model` with quantized modules.
 
     Args:
-        model: Target PyTorch/Oxideon Module.
+        model: Target Oxideon Module.
         dtype: Quantization target ('qint8', 'fp8_e4m3', 'fp8_e5m2').
         per_channel: Whether to use per-channel row-wise quantization for linear weights.
         quantize_embeddings: Whether to also quantize Embedding layers into QuantizedEmbedding.

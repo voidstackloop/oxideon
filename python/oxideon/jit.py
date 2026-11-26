@@ -1,6 +1,6 @@
 """High-Performance JIT Compilation, Graph Tracing, and Execution Engine for Oxideon.
 
-Provides PyTorch-compatible `torch.jit` interfaces including `trace`, `script`,
+Provides graph compilation interfaces including `trace`, `script`,
 and serialization of compiled computation graphs.
 """
 
@@ -248,7 +248,7 @@ def load(path: Union[str, os.PathLike]) -> ScriptModule:
 
 
 class CompiledCallable:
-    """torch.compile-style wrapper that traces & caches execution graphs by input shape/dtype."""
+    """Graph-compiling wrapper that traces and caches execution graphs by input shape and dtype."""
 
     def __init__(self, fn: Callable[..., Any], backend: str = "inductor", fullgraph: bool = False):
         self.fn = fn

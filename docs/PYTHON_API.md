@@ -3,7 +3,7 @@
 **Package:** `oxideon`  
 **Version:** `0.1.0`  
 **Python Compatibility:** Python $\ge 3.9$ (`abi3`)  
-**Public Symbols:** 2,339 public symbols (4,835 typed signatures)
+**Public Symbols:** 2,996 public symbols (5,946 typed signatures)
 
 ---
 
@@ -30,7 +30,8 @@
 20. [Frontier Optimizers, Loss Functions & Synthetic Data (`ox.optim_ext`, `ox.losses_ext`, `ox.synthetic_data`, `ox.uncertainty_quant`, `ox.interpret`, `ox.func`)](#20-frontier-optimizers-loss-functions--synthetic-data)
 21. [Tensor Utilities (`ox.tensor_utils`)](#21-tensor-utilities-oxtensor_utils)
 22. [Model & Training Diagnostics (`ox.diagnostics`)](#22-model--training-diagnostics-oxdiagnostics)
-23. [More PyTorch Parity (functional, linalg, special, fft, nn, optim, data)](#23-more-pytorch-parity)
+23. [Extended Operators & Modules (functional, linalg, special, fft, nn, optim, data)](#23-extended-operators--modules)
+24. [Workflow, Tree-Mapping, Parameterization & Vision Utilities (`ox.utils`, `ox.treemap`, `ox.vision.utils`)](#24-workflow-tree-mapping-parameterization--vision-utilities)
 
 ---
 
@@ -679,7 +680,7 @@ Oxideon natively integrates 52 high-level features across 10 flagship systems an
 
 ## 21. Tensor Utilities (`ox.tensor_utils`)
 
-PyTorch-named helpers, all also available at the top level (`ox.lerp`, `ox.logsumexp`, ...). Those built from tensor
+Core tensor helpers, all also available at the top level (`ox.lerp`, `ox.logsumexp`, ...). Those built from tensor
 operations stay differentiable; the ones that go through NumPy (marked *no graph*) return fresh tensors.
 
 - **Shape and layout:** `ravel`, `movedim` / `moveaxis`, `swapaxes` / `swapdims`, `tensor_split`, `hsplit`, `vsplit`, `dsplit`,
@@ -698,7 +699,7 @@ operations stay differentiable; the ones that go through NumPy (marked *no graph
 
 ### Tensor methods (`ox.tensor_methods`)
 
-Importing oxideon also attaches 149 PyTorch-style methods to `Tensor` (`ox.tensor_methods.ADDED` lists them):
+Importing oxideon also attaches 149 convenience methods to `Tensor` (`ox.tensor_methods.ADDED` lists them):
 
 - **Method forms** of the functions above and of `amax`, `amin`, `outer`, `inner`, `dot`, `vdot`, `mv`, `allclose`, `isclose`, `unique`,
   `unique_consecutive`, `diagflat`, `deg2rad`, `rad2deg`, `histogram`, plus `x.where(cond, y)` and `x.trace()`.
@@ -706,10 +707,10 @@ Importing oxideon also attaches 149 PyTorch-style methods to `Tensor` (`ox.tenso
   `divide(rounding_mode=None | "trunc" | "floor")`, `floor_divide`, `reciprocal`, `multiply`, `subtract(alpha=)`, `absolute`, `dist(p)`,
   `new_full`, `reshape_as`, `sum_to_size`, `split_with_sizes`, `is_same_size`, `is_nonzero`, `element_size`.
 - **In-place forms** (`x.exp_()`, `x.clamp_min_(0)`, `x.lerp_(y, 0.1)`, `x.addcmul_(a, b, value=)`, the comparison, logical and bitwise
-  ones, ...). Like PyTorch they keep the shape, refuse a float result in an integer tensor, refuse a tensor that requires grad
+  ones, ...). They keep the shape, refuse a float result in an integer tensor, refuse a tensor that requires grad
   outside `ox.no_grad()`, and refuse non-contiguous views.
 
-`true_divide` / `divide` follow PyTorch and return a float tensor for integer inputs; note that the `/` operator on two integer
+`true_divide` / `divide` return a float tensor for integer inputs; note that the `/` operator on two integer
 tensors still truncates (`7 / 2 == 3`).
 
 ```python
@@ -753,9 +754,9 @@ print(dg.lr_find(model, loss_fn, loader).suggestion)
 
 ---
 
-## 23. More PyTorch Parity
+## 23. Extended Operators & Modules
 
-Each item behaves like its PyTorch namesake and is checked against it in `tests/test_torch_parity_extra.py`.
+Extended operators, factorizations, special functions, layers, optimizers, and samplers across core submodules:
 
 - **`ox.functional`:** `max_pool1d/2d/3d` and `adaptive_max_pool1d/2d/3d` now take `dilation`, `ceil_mode` and `return_indices`
   (indices into the flattened spatial input, as `MaxUnpool` expects), plus the `*_with_indices` forms; `lp_pool3d`;
@@ -765,7 +766,7 @@ Each item behaves like its PyTorch namesake and is checked against it in `tests/
 - **`ox.linalg`:** `cholesky_ex`, `inv_ex`, `solve_ex`, `lu_factor_ex` (error codes instead of exceptions); `ldl_factor`,
   `ldl_factor_ex`, `ldl_solve` (Bunch-Kaufman, LAPACK's compact format); `matrix_sqrth`, `polar`, `matmul`. The
   factorizations and solves run in Rust (`oxideon-core/src/lapack.rs`). `lu_factor` returns
-  PyTorch's 1-based pivots and `lu_solve` expects them, so factors move freely between the two libraries.
+  1-based pivots and `lu_solve` expects them.
 - **`ox.special`:** `hermite_polynomial_he`, `shifted_chebyshev_polynomial_t/u/v/w`, `modified_bessel_i0`, `modified_bessel_i1`.
 - **`ox.fft`:** `hfft2`, `hfftn`, `ihfft2`, `ihfftn` (complex values as a trailing (real, imag) dimension, like the rest of `ox.fft`).
 - **`ox.nn`:** `MaxPool1d/2d/3d` and `AdaptiveMaxPool1d/2d/3d` with the new options, `LPPool3d`, `LazyConv1d`, `LazyConv3d`,
@@ -774,3 +775,32 @@ Each item behaves like its PyTorch namesake and is checked against it in `tests/
   `NLLLoss2d` and `Container`.
 - **`ox.optim.SparseAdam`:** lazy Adam for embedding tables (only rows with a non-zero gradient are updated).
 - **`ox.data`:** `DistributedSampler` (with `set_epoch`) and `StackDataset`.
+
+---
+
+## 24. Workflow, Tree-Mapping, Parameterization & Vision Utilities
+
+Oxideon provides a comprehensive, zero-external-dependency suite of training, nested-tree, parameterization, data-pipeline, checkpointing, profiling, testing, and computer-vision utilities across `ox.utils`, `ox.nn.utils`, `ox.treemap`, `ox.data`, `ox.serialization`, `ox.testing`, and `ox.vision.utils`.
+
+```python
+import oxideon as ox
+
+# Nested container tree transformations
+batch = {"inputs": ox.ones([4, 8]), "targets": [ox.zeros([4]), ox.ones([4])]}
+scaled = ox.tree_map(lambda t: t * 2.0, batch)
+ox.assert_same_structure(batch, scaled)
+ox.assert_finite(scaled)
+dims = ox.assert_shapes([(scaled["inputs"], ("B", "D")), (scaled["targets"][0], ("B",))])
+
+# Parameterizations and selective layer freezing
+layer = ox.weight_norm(ox.nn.Linear(8, 4))
+y = layer(scaled["inputs"])
+flops = ox.count_flops(layer, scaled["inputs"])
+```
+
+- **Nested Container & Tree Mapping (`ox.treemap`, `ox.utils.treemap`)** - `tree_flatten`, `tree_unflatten`, `tree_leaves`, `tree_schema`, `tree_map`, `tree_map_`, `tree_map_only`, `tree_all`, `tree_any`, `tree_all_only`, `tree_any_only`, `broadcast_tree_prefix`, `flatten_nested`, `assert_same_structure`, `pack_sequence_as`, `map_structure`, `is_nested`, `tree_is_leaf`, `register_tree_node`, `unregister_tree_node`, `TreeSchema`, and `LeafSchema`.
+- **Parameterizations, Fusion & Pruning (`ox.nn.utils`)** - `weight_norm` / `remove_weight_norm`, `spectral_norm` / `remove_spectral_norm`, `bind_reparam` / `unbind_reparam` / `has_reparam` / `cache_reparam` (`ox.nn.utils.reparam`), `fuse_conv_batchnorm` / `fuse_conv_batchnorm_weights` / `fuse_linear_batchnorm` / `fuse_linear_batchnorm_weights` (`ox.nn.utils.fusion`), `ln_structured_prune` / `mask_prune` / `identity_prune` / `is_pruned` (`ox.nn.utils.prune`), `fast_init`, `apply_with_weights`, `total_norm`, `clip_grad_norm_` (`error_if_nonfinite`), `freeze_module_types`, and `freeze_by_prefix`.
+- **Dataset Combinators, Samplers & Folder/Tabular Loaders (`ox.data`, `ox.utils`)** - Functional `Dataset` pipeline methods `.map()`, `.filter()`, `.cache()`, `.repeat()`, `.take()`, `.skip()`, and `.window()` (`MappedDataset`, `FilteredDataset`, `CachedDataset`, `RepeatedDataset`, `TakenDataset`, `SkippedDataset`, `WindowedDataset`); `padded_collate`, `to_tensors`, `stratified_split`, `BalancedClassSampler`, `LengthBucketSampler`, `InfiniteDataLoader`, and `cycle_batches`; directory, sequence, and structured-file builders `image_folder_dataset`, `text_folder_dataset`, `audio_folder_dataset`, `csv_dataset`, `jsonl_dataset`, `sliding_window_dataset`, `split_dataset`, `read_wav_tensor`, `save_wav_tensor`, `VocabularyIndex`, and `build_vocabulary`; `pad_sequences`, `one_hot_encode`, `axis_normalize`, `compute_class_weight`, `compute_sample_weight`, `pack_batch`, and `unpack_batch`; plus `padding_side` support on `pad_sequence`, `unpad_sequence`, and `unpack_sequence` (`ox.nn.utils.rnn`).
+- **Checkpointing, Config Registry & EMA (`ox.utils`, `ox.serialization`)** - `save_sharded` and `load_sharded` (multi-file `.safetensors` sharding with `.safetensors.index.json` manifests), `CheckpointVault` (rotating directory checkpoints with `max_to_keep`), `ShadowWeightEMA` (`average_parameters()` evaluation swap), `fetch_artifact` and `verify_checksum` (SHA-256/MD5 verification and path-safe archive extraction), `SerializationScope` / `serialization_scope`, `register_serializable`, `serialize_config`, and `deserialize_config`.
+- **Profiling, Memory Footprint, Architecture Graphs, Hooks & Numerical Checks (`ox.utils`, `ox.testing`, `ox.profiler`)** - `FlopProfiler` and `count_flops` (`ox.utils.flops`), `MemoryFootprint` and `estimate_memory_footprint`, `MicroTimer` / `TimingReport` / `TimingComparison` (`ox.utils.timing`), `collect_runtime_info` / `format_runtime_info` (`ox.utils.sysinfo`), `HookHandle` and `ephemeral_hook` (`ox.utils.hooks`), `model_to_dot` and `model_to_mermaid` (`ox.utils.graph_viz`), `chrome_trace_handler`, `ProgressBar`, `SummaryWriter` (`add_scalar`, `add_scalars`, `add_histogram`, `add_image`, `add_images`, `add_hparams`, `add_graph`), `gradcheck`, `gradgradcheck`, `assert_finite`, and `assert_shapes`.
+- **Vision Annotation & Image Grids (`ox.vision.utils`)** - `image_grid`, `save_image` (pure-Python PNG encoder writing to paths or binary streams), `draw_bounding_boxes` (with built-in bitmap font labels), `draw_segmentation_masks`, and `draw_keypoints` (with visibility flags and skeleton `connectivity`).

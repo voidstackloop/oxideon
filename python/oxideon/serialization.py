@@ -1,8 +1,8 @@
 """Model serialization and checkpointing for Oxideon.
 
-Provides HuggingFace-compatible `save_file` and `load_file` functions,
-full model checkpointing via `save` and `load`, safetensors metadata inspection,
-and high-performance in-memory buffer serialization.
+Provides `save_file` and `load_file` functions, sharded `.safetensors`
+checkpointing (`save_sharded`, `load_sharded`), full model checkpointing via
+`save` and `load`, header metadata inspection, and in-memory buffer serialization.
 """
 
 from collections import OrderedDict
@@ -255,7 +255,7 @@ def load(
     if not os.path.exists(path_str):
         raise FileNotFoundError(f"No such file: '{path_str}'")
 
-    # Only PARSE failures fall back to pickle for torch-style checkpoint
+    # Only PARSE failures fall back to pickle for legacy checkpoint
     # extensions; model-application errors (strict mismatches) raised by
     # `load_file` must propagate, never masquerade as unpickle errors.
     try:
@@ -292,6 +292,196 @@ def load(
     return result
 
 
+_DTYPE_ITEMSIZE = {
+    "bool": 1,
+    "u8": 1,
+    "uint8": 1,
+    "i8": 1,
+    "int8": 1,
+    "f16": 2,
+    "float16": 2,
+    "bf16": 2,
+    "bfloat16": 2,
+    "i16": 2,
+    "int16": 2,
+    "f32": 4,
+    "float32": 4,
+    "i32": 4,
+    "int32": 4,
+    "f64": 8,
+    "float64": 8,
+    "i64": 8,
+    "int64": 8,
+}
+
+
+def _parse_byte_size(size: Union[int, str]) -> int:
+    if isinstance(size, int) and not isinstance(size, bool):
+        if size <= 0:
+            raise ValueError(f"max_shard_size must be > 0, got {size}")
+        return size
+    if not isinstance(size, str):
+        raise TypeError(f"max_shard_size must be int or str, got {type(size).__name__}")
+    s = size.strip().upper()
+    units = [
+        ("TIB", 1024**4),
+        ("GIB", 1024**3),
+        ("MIB", 1024**2),
+        ("KIB", 1024),
+        ("TB", 1000**4),
+        ("GB", 1000**3),
+        ("MB", 1000**2),
+        ("KB", 1000),
+        ("B", 1),
+    ]
+    for suffix, mult in units:
+        if s.endswith(suffix):
+            num_str = s[: -len(suffix)].strip()
+            val = int(float(num_str) * mult)
+            if val <= 0:
+                raise ValueError(f"max_shard_size must be > 0, got {size!r}")
+            return val
+    val = int(float(s))
+    if val <= 0:
+        raise ValueError(f"max_shard_size must be > 0, got {size!r}")
+    return val
+
+
+def _tensor_nbytes(t: Tensor) -> int:
+    numel = 1
+    for d in getattr(t, "shape", ()):
+        numel *= int(d)
+    dtype_str = str(getattr(t, "dtype", "f32")).lower()
+    return numel * _DTYPE_ITEMSIZE.get(dtype_str, 4)
+
+
+def save_sharded(
+    tensors: Union[Dict[str, Tensor], Sequence[Tuple[str, Tensor]], Any],
+    directory: Union[str, os.PathLike],
+    max_shard_size: Union[int, str] = "2GB",
+    base_name: str = "model",
+    metadata: Optional[Dict[str, str]] = None,
+) -> str:
+    """Splits a model or tensor dictionary across numbered `.safetensors` shards and writes an `.index.json` manifest.
+
+    Returns the absolute path to `<base_name>.safetensors.index.json`.
+    """
+    limit_bytes = _parse_byte_size(max_shard_size)
+    out_dir = Path(directory).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    extra_meta = dict(metadata) if metadata is not None else {}
+    if hasattr(tensors, "state_dict") and callable(tensors.state_dict):
+        extra_meta.setdefault("oxideon_class", type(tensors).__name__)
+        items = list(tensors.state_dict().items())
+    elif isinstance(tensors, dict):
+        items = list(tensors.items())
+    else:
+        items = list(tensors)
+
+    if not items:
+        raise ValueError("save_sharded requires at least one tensor")
+
+    shards: List[OrderedDict] = []
+    cur_shard: OrderedDict = OrderedDict()
+    cur_bytes = 0
+    total_bytes = 0
+
+    for key, val in items:
+        if not isinstance(val, Tensor):
+            raise TypeError(f"save_sharded expects Tensor values, got {type(val).__name__} for key {key!r}")
+        nb = _tensor_nbytes(val)
+        total_bytes += nb
+        if cur_shard and (cur_bytes + nb > limit_bytes):
+            shards.append(cur_shard)
+            cur_shard = OrderedDict()
+            cur_bytes = 0
+        cur_shard[str(key)] = val
+        cur_bytes += nb
+
+    if cur_shard:
+        shards.append(cur_shard)
+
+    num_shards = len(shards)
+    weight_map: Dict[str, str] = {}
+    for idx, shard_dict in enumerate(shards, start=1):
+        shard_fname = f"{base_name}-{idx:05d}-of-{num_shards:05d}.safetensors"
+        shard_path = out_dir / shard_fname
+        shard_meta = dict(extra_meta)
+        shard_meta["format"] = "safetensors"
+        shard_meta["shard_index"] = str(idx)
+        shard_meta["num_shards"] = str(num_shards)
+        save_file(shard_dict, shard_path, metadata=shard_meta)
+        for k in shard_dict:
+            weight_map[k] = shard_fname
+
+    index_payload = {
+        "metadata": {
+            "total_size": total_bytes,
+            "num_shards": num_shards,
+            **extra_meta,
+        },
+        "weight_map": weight_map,
+    }
+    index_path = out_dir / f"{base_name}.safetensors.index.json"
+    with open(index_path, "w", encoding="utf-8") as f:
+        json.dump(index_payload, f, indent=2)
+    return str(index_path)
+
+
+def load_sharded(
+    directory_or_index: Union[str, os.PathLike],
+    device: Optional[str] = None,
+    model: Optional[Any] = None,
+    strict: bool = True,
+) -> Union[Dict[str, Tensor], Any]:
+    """Loads a sharded `.safetensors` checkpoint from a directory or `.safetensors.index.json` manifest."""
+    target = Path(directory_or_index).expanduser().resolve()
+    if target.is_dir():
+        candidates = sorted(target.glob("*.safetensors.index.json"))
+        if not candidates:
+            raise FileNotFoundError(f"No '*.safetensors.index.json' manifest found in '{target}'")
+        index_path = candidates[0]
+        shard_root = target
+    elif target.is_file():
+        index_path = target
+        shard_root = target.parent
+    else:
+        raise FileNotFoundError(f"No such file or directory: '{target}'")
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    weight_map = manifest.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"Invalid or empty 'weight_map' in '{index_path}'")
+
+    # Load each unique shard file once while validating against path traversal
+    loaded_shards: Dict[str, Dict[str, Tensor]] = {}
+    for shard_fname in dict.fromkeys(weight_map.values()):
+        shard_path = (shard_root / shard_fname).resolve()
+        if shard_root not in shard_path.parents and shard_path != shard_root:
+            raise ValueError(f"Unsafe shard path outside checkpoint directory blocked: {shard_fname!r}")
+        loaded_shards[shard_fname] = load_file(shard_path, device=device)
+
+    combined: OrderedDict = OrderedDict()
+    for tensor_name, shard_fname in weight_map.items():
+        shard_tensors = loaded_shards[shard_fname]
+        if tensor_name not in shard_tensors:
+            raise KeyError(f"Tensor {tensor_name!r} listed in index but missing from shard '{shard_fname}'")
+        combined[tensor_name] = shard_tensors[tensor_name]
+
+    if model is not None:
+        if hasattr(model, "load_state_dict") and callable(model.load_state_dict):
+            model.load_state_dict(combined, strict=strict)
+            if device is not None and hasattr(model, "to"):
+                model.to(device=device)
+            return model
+        raise TypeError(f"Target model of type {type(model).__name__} lacks load_state_dict() method.")
+
+    return combined
+
+
 __all__ = [
     "save_file",
     "load_file",
@@ -301,5 +491,7 @@ __all__ = [
     "inspect_safetensors",
     "save",
     "load",
+    "save_sharded",
+    "load_sharded",
     "PICKLE_EXTENSIONS",
 ]

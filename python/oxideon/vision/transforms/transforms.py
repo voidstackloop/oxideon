@@ -309,7 +309,7 @@ def _shift_hue(arr: np.ndarray, delta: float) -> np.ndarray:
 class ColorJitter:
     """Randomly changes brightness, contrast, saturation, and hue of an image.
 
-    Expects float images in [0, 1]. Ranges follow torchvision: brightness,
+    Expects float images in [0, 1]. Brightness,
     contrast, and saturation are non-negative magnitudes, hue is in [0, 0.5].
     """
 

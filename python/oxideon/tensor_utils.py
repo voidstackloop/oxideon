@@ -1,4 +1,4 @@
-"""Tensor utilities with PyTorch-compatible names: shape helpers, elementwise math, reductions, logical and bitwise
+"""Core tensor utilities: shape helpers, elementwise math, reductions, logical and bitwise
 operators, and top-level forms of linear-algebra and special functions.
 
 Everything here works on `oxideon.Tensor` (and on anything `numpy.asarray` accepts). Functions built from tensor
@@ -352,7 +352,7 @@ def numel(x: _Tensor) -> int:
 
 
 def result_type(a: Any, b: Any) -> str:
-    """The dtype that `a + b` has. Tensors promote like PyTorch (within a category the wider dtype, across categories the higher one); a Python scalar only changes the result when it is of a
+    """The dtype that `a + b` has. Tensors promote within a category to the wider dtype and across categories to the higher one; a Python scalar only changes the result when it is of a
     higher category (bool < int < float) than the tensor, then to int64 / float32."""
     def info(v):
         if isinstance(v, _Tensor):
@@ -369,7 +369,7 @@ def result_type(a: Any, b: Any) -> str:
     (da, ta), (db, tb) = info(a), info(b)
     rank = {"b": 0, "u": 1, "i": 1, "f": 2, "c": 3}
     if ta and tb:
-        # like PyTorch (not NumPy): int64 + float32 is float32, the dtype of the higher category wins
+        # int64 + float32 promotes to float32: the dtype of the higher category wins
         out = np.promote_types(da, db) if rank[da.kind] == rank[db.kind] else (da if rank[da.kind] > rank[db.kind] else db)
     elif ta or tb:
         (dt, ds) = (da, db) if ta else (db, da)
@@ -490,7 +490,7 @@ def scatter_reduce(x: _Tensor, dim: int, index: _Tensor, src: _Tensor, reduce: s
     """Reduces the values of `src` into a copy of `x` at the positions in `index` along `dim`, with `reduce` one of
     "sum", "prod", "mean", "amax", "amin". With `include_self=False` the original values of `x` at the touched positions
     do not take part. Computed in Rust; "sum" and "mean" are differentiable. `src` may be larger than `index` (only the
-    part `index` covers is used, as in PyTorch)."""
+    part `index` covers is used)."""
     if reduce not in ("sum", "prod", "mean", "amax", "amin"):
         raise ValueError(f"unknown reduce {reduce!r}")
     from .oxideon import _scatter_reduce

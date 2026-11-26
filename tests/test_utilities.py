@@ -461,3 +461,296 @@ def test_vision_utils_grid_save_and_drawing():
     drawn_kp = ox.vision.utils.draw_keypoints(canvas, kpts, connectivity=[(0, 1), (1, 2)], colors="#00FFFF", radius=2)
     assert int(drawn_kp.to_numpy()[1, 4, 4]) == 255
     assert int(drawn_kp.to_numpy()[2, 11, 11]) == 255
+
+
+# ---------------------------------------------------------------------------
+# 6. `data` Combinators, `padded_collate`, `stratified_split` & Samplers
+# ---------------------------------------------------------------------------
+
+def test_dataset_combinators_samplers_and_padded_collate():
+    calls = {"n": 0}
+
+    def _transform(t):
+        calls["n"] += 1
+        return t * 3.0
+
+    base = ox.TensorDataset(ox.Tensor.arange(0.0, 10.0, 1.0))
+    cached = base.map(_transform).cache()
+    assert len(cached) == 10
+    assert float(cached[2].item()) == 6.0
+    assert float(cached[2].item()) == 6.0
+    assert calls["n"] == 1  # second access came from cache
+
+    sliced = cached.skip(2).take(5).repeat(2)
+    assert len(sliced) == 10
+    assert [float(x.item()) for x in sliced] == [6.0, 9.0, 12.0, 15.0, 18.0] * 2
+
+    evens = base.filter(lambda t: int(t.item()) % 2 == 0)
+    even_batches = list(ox.DataLoader(evens, batch_size=2))
+    assert len(even_batches) == 3
+    assert even_batches[0].to_numpy().tolist() == [0.0, 2.0]
+
+    wins = base.window(size=4, shift=2, stride=1, drop_remainder=True)
+    assert len(wins) == 4
+    assert wins[1].to_numpy().tolist() == [2.0, 3.0, 4.0, 5.0]
+
+    # Left/right `pad_sequence` + `unpad_sequence` + `padded_collate`
+    seqs = [ox.tensor([1.0, 2.0]), ox.tensor([3.0, 4.0, 5.0]), ox.tensor([6.0])]
+    left_pad = ox.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=-1.0, padding_side="left")
+    unpadded_left = ox.nn.utils.rnn.unpad_sequence(left_pad, [2, 3, 1], batch_first=True, padding_side="left")
+    assert [t.to_numpy().tolist() for t in unpadded_left] == [[1.0, 2.0], [3.0, 4.0, 5.0], [6.0]]
+
+    class _VarSeqDataset(ox.Dataset):
+        def __init__(self):
+            self.items = [
+                (ox.tensor([1.0]), 0),
+                (ox.tensor([1.0, 2.0, 3.0, 4.0]), 1),
+                (ox.tensor([5.0, 6.0]), 0),
+                (ox.tensor([7.0, 8.0, 9.0, 10.0]), 1),
+            ]
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, idx):
+            return self.items[idx]
+
+    var_ds = _VarSeqDataset()
+    bucket_sampler = ox.LengthBucketSampler([1, 4, 2, 4], batch_size=2, shuffle=False)
+    bucket_loader = ox.DataLoader(var_ds, batch_sampler=bucket_sampler, collate_fn=ox.padded_collate(pad_value=0.0))
+    b_batches = list(bucket_loader)
+    assert sorted(list(bx.shape) for bx, _ in b_batches) == [[2, 2], [2, 4]]
+
+    # `stratified_split` & `BalancedClassSampler` & `cycle_batches`
+    labels = [0] * 80 + [1] * 20
+    full_ds = ox.TensorDataset(ox.Tensor.arange(0.0, 100.0, 1.0), ox.tensor(labels))
+    tr_sub, va_sub = ox.stratified_split(full_ds, labels, [0.8, 0.2], seed=42)
+    assert len(tr_sub) == 80 and len(va_sub) == 20
+    tr_ones = sum(int(full_ds[i][1].item()) for i in tr_sub.indices)
+    va_ones = sum(int(full_ds[i][1].item()) for i in va_sub.indices)
+    assert tr_ones == 16 and va_ones == 4
+
+    bal_sampler = ox.BalancedClassSampler(labels, samples_per_class=30, seed=7)
+    sampled_classes = [labels[i] for i in bal_sampler]
+    assert sampled_classes.count(0) == 30 and sampled_classes.count(1) == 30
+
+    tiny_loader = ox.DataLoader(ox.TensorDataset(ox.tensor([1.0, 2.0, 3.0])), batch_size=2)
+    stream = ox.cycle_batches(tiny_loader)
+    pulled = [next(stream).to_numpy().tolist() for _ in range(5)]
+    assert pulled == [[1.0, 2.0], [3.0], [1.0, 2.0], [3.0], [1.0, 2.0]]
+
+
+# ---------------------------------------------------------------------------
+# 7. WAV Audio I/O, `audio_folder_dataset` & `VocabularyIndex`
+# ---------------------------------------------------------------------------
+
+def test_wav_io_audio_folder_and_vocabulary_index():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        t_axis = np.linspace(0.0, 1.0, 400, endpoint=False, dtype=np.float32)
+        stereo = np.stack([0.5 * np.sin(2 * np.pi * 5 * t_axis), -0.25 * np.cos(2 * np.pi * 5 * t_axis)], axis=0)
+
+        p16 = ox.save_wav_tensor(ox.from_numpy(stereo), root / "tone16.wav", sample_rate=16000, bits_per_sample=16)
+        w16, sr16 = ox.read_wav_tensor(p16)
+        assert sr16 == 16000 and list(w16.shape) == [2, 400]
+        assert np.allclose(w16.to_numpy(), stereo, atol=2e-4)
+
+        pf32 = ox.save_wav_tensor(
+            ox.from_numpy(stereo), root / "tonef32.wav", sample_rate=8000, bits_per_sample=32, encoding="float"
+        )
+        wf32_mono, srf32 = ox.read_wav_tensor(pf32, mono=True)
+        assert srf32 == 8000 and list(wf32_mono.shape) == [1, 400]
+        assert np.allclose(wf32_mono.to_numpy()[0], stereo.mean(axis=0), atol=1e-6)
+
+        # `audio_folder_dataset` with class subdirectories, resampling & variable-length padding
+        for cls_idx, cls_name in enumerate(["speech", "music"]):
+            cdir = root / "audio_ds" / cls_name
+            cdir.mkdir(parents=True, exist_ok=True)
+            for k in range(3):
+                n_frames = 200 + 80 * k + 40 * cls_idx
+                sig = np.full((1, n_frames), 0.1 * (cls_idx + 1), dtype=np.float32)
+                ox.save_wav_tensor(sig, cdir / f"clip_{k}.wav", sample_rate=16000)
+
+        tr_aud, va_aud = ox.audio_folder_dataset(
+            root / "audio_ds",
+            batch_size=2,
+            target_sample_rate=8000,
+            validation_split=0.34,
+            subset="both",
+            seed=11,
+        )
+        assert tr_aud.class_names == ["music", "speech"]
+        aw, ay = next(iter(tr_aud))
+        assert aw.shape[0] == 2 and aw.shape[1] == 1
+        assert list(ay.shape) == [2]
+
+    # `build_vocabulary` & `VocabularyIndex`
+    corpus = ["alpha beta gamma", "alpha beta", "alpha delta"]
+    vocab = ox.build_vocabulary(corpus, min_freq=1)
+    assert len(vocab) == 6  # <pad>, <unk>, alpha, beta, delta, gamma
+    assert vocab["alpha"] == 2
+    assert vocab["unseen_word"] == vocab.unk_index
+
+    enc1 = vocab.encode("alpha unseen_word beta")
+    assert enc1.to_numpy().tolist() == [2, 1, 3]
+    assert vocab.decode(enc1, skip_specials=True) == "alpha beta"
+
+    batch_ids = vocab.encode_batch(["alpha", "alpha beta gamma"], padding_side="left")
+    assert batch_ids.to_numpy().tolist() == [[0, 0, 2], [2, 3, 5]]
+
+    restored = ox.VocabularyIndex.from_dict(vocab.to_dict())
+    assert restored.get_itos() == vocab.get_itos()
+
+
+# ---------------------------------------------------------------------------
+# 8. Architecture Graphs, Selective Freezing, Numerical Checks & Sharded Saves
+# ---------------------------------------------------------------------------
+
+def test_graph_viz_freezing_testing_and_sharded_safetensors():
+    model = ox.nn.Sequential(
+        ox.nn.Linear(6, 8),
+        ox.nn.BatchNorm1d(8),
+        ox.nn.ReLU(),
+        ox.nn.Linear(8, 3),
+    )
+    sample_x = ox.randn([4, 6])
+
+    dot_src = ox.model_to_dot(model, sample_input=sample_x, rankdir="LR")
+    assert "digraph Model" in dot_src and "rankdir=\"LR\"" in dot_src
+    assert "(4, 6)" in dot_src and "(4, 3)" in dot_src and "n0 -> n1;" in dot_src
+
+    mmd_src = ox.model_to_mermaid(model, sample_input=sample_x, direction="TD")
+    assert mmd_src.startswith("flowchart TD") and "n0 --> n1" in mmd_src
+
+    # Selective freezing helpers
+    n_bn = ox.freeze_module_types(model, ox.nn.BatchNorm1d, freeze=True)
+    assert n_bn == 2
+    assert all(not p.requires_grad for p in model[1].parameters())
+    assert all(p.requires_grad for p in model[0].parameters())
+
+    n_pref = ox.freeze_by_prefix(model, "0.", freeze=True)
+    assert n_pref == 2
+    assert all(not p.requires_grad for p in model[0].parameters())
+    ox.freeze_by_prefix(model, ["0.", "1."], freeze=False)
+    assert all(p.requires_grad for p in model.parameters())
+
+    # `gradgradcheck`, `assert_finite`, `assert_shapes`
+    x2 = ox.Tensor([1.5, -2.0], [2], requires_grad=True)
+    assert ox.testing.gradgradcheck(lambda z: (z * z * z).sum(), x2)
+
+    ox.assert_finite({"a": ox.tensor([1.0, 2.0]), "b": [ox.tensor([0.0])]})
+    with pytest.raises(AssertionError, match="NaN"):
+        ox.assert_finite({"bad": ox.tensor([1.0, float("nan")])})
+
+    resolved = ox.assert_shapes(
+        [
+            (ox.zeros([4, 10, 16]), ("B", "T", "D")),
+            (ox.zeros([4, 10, 32]), ("B", "T", 32)),
+            (ox.zeros([2, 3, 4, 16]), (..., "B", "D")),
+        ]
+    )
+    assert resolved == {"B": 4, "T": 10, "D": 16}
+    with pytest.raises(AssertionError, match="Symbolic dimension 'B'"):
+        ox.assert_shapes([(ox.zeros([4, 8]), ("B", "D")), (ox.zeros([5, 8]), ("B", "D"))])
+
+    # `save_sharded` & `load_sharded`
+    with tempfile.TemporaryDirectory() as tmpdir:
+        shard_dir = Path(tmpdir) / "sharded_ckpt"
+        # Force multiple shards with a small byte threshold (each 8x6 f32 weight is 192 bytes)
+        idx_file = ox.save_sharded(model, shard_dir, max_shard_size="128B", base_name="net")
+        assert os.path.exists(idx_file)
+        shard_files = sorted(shard_dir.glob("net-*-of-*.safetensors"))
+        assert len(shard_files) >= 3
+
+        loaded_dict = ox.load_sharded(shard_dir)
+        orig_dict = model.state_dict()
+        assert list(loaded_dict.keys()) == list(orig_dict.keys())
+        for k in orig_dict:
+            assert np.allclose(loaded_dict[k].to_numpy(), orig_dict[k].to_numpy())
+
+        fresh_model = ox.nn.Sequential(
+            ox.nn.Linear(6, 8),
+            ox.nn.BatchNorm1d(8),
+            ox.nn.ReLU(),
+            ox.nn.Linear(8, 3),
+        )
+        ox.load_sharded(idx_file, model=fresh_model)
+        model.eval()
+        fresh_model.eval()
+        assert np.allclose(model(sample_x).to_numpy(), fresh_model(sample_x).to_numpy(), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 9. Tabular CSV / JSONL Loaders, Memory Footprint & Chrome Trace Handler
+# ---------------------------------------------------------------------------
+
+def test_csv_jsonl_datasets_and_memory_footprint():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+
+        # `csv_dataset`: missing cells filled by defaults, numeric columns packed into [B, F]
+        csv_path = root / "samples.csv"
+        csv_path.write_text(
+            "f1,f2,note,target\n"
+            "1.5,2.0,ok,1\n"
+            ",4.0,ok,0\n"
+            "3.5,,skip,1\n"
+            "5.0,6.0,ok,0\n",
+            encoding="utf-8",
+        )
+        csv_loader = ox.csv_dataset(
+            csv_path,
+            batch_size=2,
+            select_columns=["f1", "f2", "target"],
+            label_name="target",
+            column_defaults={"f1": -1.0, "f2": 0.5, "target": 0},
+        )
+        xb, yb = next(iter(csv_loader))
+        assert list(xb.shape) == [2, 2]
+        assert np.allclose(xb.to_numpy(), [[1.5, 2.0], [-1.0, 4.0]])
+        assert yb.to_numpy().tolist() == [1, 0]
+
+        # `jsonl_dataset`: field selection, defaults, label separation
+        jsonl_path = root / "records.jsonl"
+        jsonl_path.write_text(
+            '{"vec": [1.0, 2.0], "score": 0.5, "label": 1}\n'
+            '{"vec": [3.0, 4.0], "label": 0}\n'
+            "\n"
+            '{"vec": [5.0, 6.0], "score": 1.5, "label": 1}\n',
+            encoding="utf-8",
+        )
+        jl_loader = ox.jsonl_dataset(
+            jsonl_path,
+            batch_size=2,
+            fields=["vec", "score", "label"],
+            label_field="label",
+            field_defaults={"score": 0.0},
+        )
+        j_feat, j_lbl = next(iter(jl_loader))
+        assert list(j_feat["vec"].shape) == [2, 2]
+        assert np.allclose(j_feat["score"].to_numpy(), [0.5, 0.0])
+        assert j_lbl.to_numpy().tolist() == [1, 0]
+
+        # `estimate_memory_footprint` & `MemoryFootprint`
+        net = ox.nn.Sequential(ox.nn.Linear(4, 6), ox.nn.ReLU(), ox.nn.Linear(6, 2))
+        x_in = ox.randn([3, 4])
+        fp = ox.estimate_memory_footprint(net, sample_input=x_in, optimizer_states=2, backward=True)
+        # Params: (4*6 + 6) + (6*2 + 2) = 30 + 14 = 44 f32 elements = 176 bytes
+        assert fp.parameter_bytes == 176
+        assert fp.trainable_parameter_bytes == 176
+        assert fp.gradient_bytes == 176
+        assert fp.optimizer_state_bytes == 352
+        assert fp.activation_bytes > 0
+        assert fp.total_training_bytes > fp.total_inference_bytes
+        assert "Parameters (total)" in fp.summary()
+
+        # `chrome_trace_handler`
+        trace_dir = root / "traces"
+        handler = ox.profiler.chrome_trace_handler(str(trace_dir))
+        with ox.profiler.profile(on_trace_ready=handler) as prof:
+            with ox.profiler.record_function("linear_step"):
+                _ = net(x_in)
+        handler(prof)
+        assert len(list(trace_dir.glob("trace_*.json"))) >= 1
+
+

@@ -1,5 +1,5 @@
-"""`np.ascontiguousarray` that keeps 0-d arrays 0-d (NumPy promotes them to shape (1,), which made scalar results of
-reductions come back as 1-element tensors instead of PyTorch's 0-d ones)."""
+"""`np.ascontiguousarray` wrapper that keeps 0-d arrays 0-d (NumPy promotes them to shape (1,), which would turn scalar
+reduction results into 1-element tensors instead of 0-d scalars)."""
 import numpy as np
 
 

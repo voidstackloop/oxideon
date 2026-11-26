@@ -1,8 +1,8 @@
-"""PyTorch-style `Tensor` methods attached at import time: method forms of the module-level functions (`x.logsumexp(1)`,
+"""Ergonomic `Tensor` methods attached at import time: method forms of the module-level functions (`x.logsumexp(1)`,
 `x.amax(0)`, `x.movedim(0, -1)`, ...), comparison and division aliases (`x.gt(y)`, `x.true_divide(y)`, ...), and in-place
 variants (`x.exp_()`, `x.clamp_min_(0)`, `x.lerp_(y, 0.5)`, ...).
 
-In-place methods follow PyTorch's rules: the result must keep the tensor's shape and must be castable to its dtype (an
+In-place methods enforce safety invariants: the result must keep the tensor's shape and must be castable to its dtype (an
 integer tensor cannot take a float result), a tensor that requires grad is refused while gradients are enabled (wrap the
 update in `no_grad`), and a non-contiguous view is refused because writing it would not reach its base tensor. Every
 other handle to the tensor sees the new values.
@@ -164,7 +164,7 @@ def _new_methods() -> None:
     _attach("is_same_size", is_same_size)
 
     def is_nonzero(self) -> bool:
-        """The truth value of a one-element tensor (an error for any other size, like PyTorch)."""
+        """The truth value of a one-element tensor (an error for any other size)."""
         if self.numel() != 1:
             raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous" if self.numel() else
                                "Boolean value of Tensor with no values is ambiguous")
@@ -239,7 +239,7 @@ def _as_tensor(self: _Tensor, v: Any) -> Any:
     return v if isinstance(v, _Tensor) else _t(np.full(tuple(self.shape), v, dtype=_np(self).dtype))
 
 
-# unary functions whose result is floating point in PyTorch, so their in-place form is refused on integer tensors
+# unary functions whose result is floating point, so their in-place form is refused on integer tensors
 _FLOAT_VALUED = {"exp", "log", "log2", "log10", "log1p", "expm1", "sqrt", "rsqrt", "sigmoid", "tanh", "sin", "cos", "tan",
                  "asin", "acos", "atan", "sinh", "cosh", "erf", "erfinv", "digamma", "lgamma"}
 
@@ -310,7 +310,7 @@ def _is_scalar(v: Any) -> bool:
 
 
 def _scalar_operands() -> None:
-    """Native binary methods only take tensors; PyTorch also accepts a Python number (`x.add(2)`, `x.maximum(0.5)`)."""
+    """Native binary methods only take tensors; this wrapper also accepts a Python number (`x.add(2)`, `x.maximum(0.5)`)."""
     names = ("add", "sub", "mul", "div", "atan2", "hypot", "fmod", "remainder", "maximum", "minimum", "copysign", "xlogy",
              "fmax", "fmin", "heaviside", "logaddexp", "logaddexp2", "ldexp", "nextafter")
     for name in names:
@@ -321,7 +321,7 @@ def _scalar_operands() -> None:
         def make(_orig):
             def wrapped(self, other, *a, **k):
                 if _is_scalar(other):
-                    # a float scalar on an integer tensor promotes to float32 (like PyTorch); otherwise keep self's dtype
+                    # a float scalar on an integer tensor promotes to float32; otherwise keep self's dtype
                     dt = _np(self).dtype
                     if not _is_float(self) and isinstance(other, (float, np.floating)):
                         dt = np.float32
@@ -337,7 +337,7 @@ def _scalar_operands() -> None:
 
 
 def _operators() -> None:
-    """`//`, `%`, `<<`, `>>`, unary `+`, true division of integer tensors (float result, like PyTorch) and in-place
+    """`//`, `%`, `<<`, `>>`, unary `+`, true division of integer tensors (float result) and in-place
     operators (`x += 1` writes into x instead of rebinding the name)."""
     truediv, rtruediv = _Tensor.__truediv__, _Tensor.__rtruediv__
 
@@ -382,7 +382,7 @@ def _operators() -> None:
 
 
 def _torch_signatures() -> None:
-    """PyTorch call forms the native methods lack: varargs dims (`x.permute(2, 0, 1)`, `x.expand(3, 4)`, `x.flip(0, 1)`),
+    """Extended call forms on `Tensor`: varargs dims (`x.permute(2, 0, 1)`, `x.expand(3, 4)`, `x.flip(0, 1)`),
     `T` / `mT` / `H` / `mH`, `max` / `min` returning `(values, indices)` for a dim and the elementwise maximum for a
     tensor, named tuple results (`x.sort().values`), `scatter(dim, index, value)`, and `put`."""
     import collections
@@ -490,7 +490,7 @@ def _torch_signatures() -> None:
 
 def _reductions() -> None:
     """Reductions over several dims at once (`x.sum((0, 1))`), a differentiable `amax`/`amin` that shares the gradient
-    between ties like PyTorch, `var`/`std` with `correction=`, and 0-d results for full `prod`/`all`/`any`."""
+    between ties, `var`/`std` with `correction=`, and 0-d results for full `prod`/`all`/`any`."""
     import builtins
     from . import tensor_utils as tu
 

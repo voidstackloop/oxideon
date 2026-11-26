@@ -1,6 +1,6 @@
 """Parameter initialization schemes for Oxideon (nn.init).
 
-Provides PyTorch-compatible weight initialization routines:
+Provides standard weight initialization routines:
   - uniform_, normal_, constant_, zeros_, ones_, eye_, trunc_normal_
   - xavier_uniform_, xavier_normal_ (Glorot initialization)
   - kaiming_uniform_, kaiming_normal_ (He initialization)

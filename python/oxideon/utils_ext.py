@@ -547,6 +547,544 @@ def _build_timing_submodule() -> types.ModuleType:
 timing = _build_timing_submodule()
 
 
+# ---------------------------------------------------------------------------
+# Model Architecture Exporters (`model_to_dot`, `model_to_mermaid`) & Selective Freezing
+# ---------------------------------------------------------------------------
+
+def _iter_leaf_and_container_nodes(model: Any) -> List[Tuple[str, Any]]:
+    nodes: List[Tuple[str, Any]] = []
+    visited = set()
+
+    def _walk(prefix: str, mod: Any) -> None:
+        mid = id(mod)
+        if mid in visited:
+            return
+        visited.add(mid)
+        children = getattr(mod, "_modules", None)
+        if isinstance(children, dict) and children:
+            for cname, child in children.items():
+                if child is None:
+                    continue
+                sub_name = f"{prefix}.{cname}" if prefix else str(cname)
+                _walk(sub_name, child)
+        else:
+            nodes.append((prefix or type(mod).__name__, mod))
+
+    _walk("", model)
+    return nodes
+
+
+def _module_param_stats(mod: Any) -> Tuple[int, bool]:
+    total = 0
+    any_trainable = False
+    params_fn = getattr(mod, "parameters", None)
+    if callable(params_fn):
+        for p in params_fn():
+            n = int(np.prod(p.shape)) if getattr(p, "shape", None) else 1
+            total += n
+            if getattr(p, "requires_grad", False):
+                any_trainable = True
+    else:
+        for attr in ("weight", "bias"):
+            p = getattr(mod, attr, None)
+            if isinstance(p, _Tensor):
+                n = int(np.prod(p.shape)) if p.shape else 1
+                total += n
+                if getattr(p, "requires_grad", False):
+                    any_trainable = True
+    return total, any_trainable
+
+
+def _trace_layer_execution(model: Any, sample_input: Any) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+    from .primitives import no_grad
+
+    leaves = _iter_leaf_and_container_nodes(model)
+    records: List[Dict[str, Any]] = []
+    restorers: List[Callable[[], None]] = []
+
+    def _shape_str(val: Any) -> str:
+        if isinstance(val, _Tensor):
+            return str(tuple(val.shape))
+        if isinstance(val, (tuple, list)) and val:
+            return ", ".join(_shape_str(v) for v in val[:3])
+        return "?"
+
+    if sample_input is None:
+        for idx, (name, mod) in enumerate(leaves):
+            n_params, trainable = _module_param_stats(mod)
+            records.append(
+                {
+                    "id": idx,
+                    "name": name,
+                    "type": type(mod).__name__,
+                    "in_shape": None,
+                    "out_shape": None,
+                    "params": n_params,
+                    "trainable": trainable,
+                }
+            )
+        edges = [(i, i + 1) for i in range(max(len(records) - 1, 0))]
+        return records, edges
+
+    # Instrument parent `_modules` slots to capture dynamic execution order and tensor shapes
+    def _instrument(parent: Any, prefix: str = "") -> None:
+        children = getattr(parent, "_modules", None)
+        if not isinstance(children, dict):
+            return
+        for cname, child in list(children.items()):
+            if child is None:
+                continue
+            full = f"{prefix}.{cname}" if prefix else str(cname)
+            sub_children = getattr(child, "_modules", None)
+            if isinstance(sub_children, dict) and sub_children:
+                _instrument(child, full)
+            else:
+                orig_child = child
+                has_attr = cname in getattr(parent, "__dict__", {})
+
+                class _TraceProxy:
+                    def __init__(self, target: Any, mod_name: str) -> None:
+                        self._target = target
+                        self._mod_name = mod_name
+
+                    def __call__(self, *a: Any, **kw: Any) -> Any:
+                        out = self._target(*a, **kw)
+                        n_p, tr = _module_param_stats(self._target)
+                        in_s = _shape_str(a[0] if len(a) == 1 else a)
+                        out_s = _shape_str(out)
+                        records.append(
+                            {
+                                "id": len(records),
+                                "name": self._mod_name,
+                                "type": type(self._target).__name__,
+                                "in_shape": in_s,
+                                "out_shape": out_s,
+                                "params": n_p,
+                                "trainable": tr,
+                            }
+                        )
+                        return out
+
+                    def __getattr__(self, item: str) -> Any:
+                        return getattr(self._target, item)
+
+                proxy = _TraceProxy(orig_child, full)
+                children[cname] = proxy
+                if has_attr:
+                    object.__setattr__(parent, cname, proxy)
+
+                def _restore(p=parent, k=cname, orig=orig_child, ha=has_attr) -> None:
+                    p._modules[k] = orig
+                    if ha:
+                        object.__setattr__(p, k, orig)
+
+                restorers.append(_restore)
+
+    _instrument(model)
+    try:
+        with no_grad():
+            if isinstance(sample_input, tuple):
+                out = model(*sample_input)
+            elif isinstance(sample_input, dict):
+                out = model(**sample_input)
+            else:
+                out = model(sample_input)
+        if not records:
+            n_p, tr = _module_param_stats(model)
+            records.append(
+                {
+                    "id": 0,
+                    "name": type(model).__name__,
+                    "type": type(model).__name__,
+                    "in_shape": _shape_str(sample_input),
+                    "out_shape": _shape_str(out),
+                    "params": n_p,
+                    "trainable": tr,
+                }
+            )
+    finally:
+        for r in reversed(restorers):
+            r()
+
+    edges = [(i, i + 1) for i in range(max(len(records) - 1, 0))]
+    return records, edges
+
+
+def model_to_dot(
+    model: Any,
+    sample_input: Any = None,
+    show_shapes: bool = True,
+    show_trainable: bool = True,
+    rankdir: str = "TB",
+) -> str:
+    """Renders a model's layer topology (and optional tensor shapes) as a Graphviz DOT string."""
+    if rankdir not in ("TB", "LR", "BT", "RL"):
+        raise ValueError(f"rankdir must be one of TB, LR, BT, RL; got {rankdir!r}")
+    records, edges = _trace_layer_execution(model, sample_input)
+
+    lines = [
+        "digraph Model {",
+        f'  rankdir="{rankdir}";',
+        '  node [shape=record, fontname="Helvetica", fontsize=10];',
+    ]
+    for rec in records:
+        parts = [f"{rec['name']} ({rec['type']})"]
+        if show_shapes and rec["in_shape"] is not None:
+            parts.append(f"in: {rec['in_shape']} | out: {rec['out_shape']}")
+        if rec["params"] > 0:
+            parts.append(f"params: {rec['params']:,d}")
+        if show_trainable and rec["params"] > 0:
+            parts.append("trainable" if rec["trainable"] else "frozen")
+        escaped = " | ".join(p.replace('"', '\\"').replace("<", "\\<").replace(">", "\\>") for p in parts)
+        lines.append(f'  n{rec["id"]} [label="{{ {escaped} }}"];')
+
+    for src_id, dst_id in edges:
+        lines.append(f"  n{src_id} -> n{dst_id};")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def model_to_mermaid(
+    model: Any,
+    sample_input: Any = None,
+    show_shapes: bool = True,
+    direction: str = "TD",
+) -> str:
+    """Renders a model's layer topology (and optional tensor shapes) as a Mermaid flowchart string."""
+    if direction not in ("TD", "TB", "LR", "RL", "BT"):
+        raise ValueError(f"direction must be one of TD, TB, LR, RL, BT; got {direction!r}")
+    records, edges = _trace_layer_execution(model, sample_input)
+
+    lines = [f"flowchart {direction}"]
+    for rec in records:
+        label = f"{rec['name']}: {rec['type']}"
+        if show_shapes and rec["in_shape"] is not None:
+            label += f" ({rec['in_shape']} -> {rec['out_shape']})"
+        safe_label = label.replace('"', "'")
+        lines.append(f'    n{rec["id"]}["{safe_label}"]')
+    for src_id, dst_id in edges:
+        lines.append(f"    n{src_id} --> n{dst_id}")
+    return "\n".join(lines)
+
+
+def freeze_module_types(
+    model: Any,
+    module_types: Union[type, Tuple[type, ...]],
+    freeze: bool = True,
+) -> int:
+    """Sets `requires_grad_(not freeze)` on all parameters inside submodules matching `module_types`.
+
+    Returns the number of parameter tensors updated.
+    """
+    types_tuple = module_types if isinstance(module_types, tuple) else (module_types,)
+    req_grad = not bool(freeze)
+    updated = 0
+    seen_params = set()
+
+    def _apply_mod(mod: Any) -> None:
+        nonlocal updated
+        if isinstance(mod, types_tuple):
+            params_fn = getattr(mod, "parameters", None)
+            if callable(params_fn):
+                for p in params_fn():
+                    if id(p) not in seen_params:
+                        seen_params.add(id(p))
+                        p.requires_grad_(req_grad)
+                        updated += 1
+            else:
+                for attr in ("weight", "bias"):
+                    p = getattr(mod, attr, None)
+                    if isinstance(p, _Tensor) and id(p) not in seen_params:
+                        seen_params.add(id(p))
+                        p.requires_grad_(req_grad)
+                        updated += 1
+        children = getattr(mod, "_modules", None)
+        if isinstance(children, dict):
+            for child in children.values():
+                if child is not None:
+                    _apply_mod(child)
+
+    _apply_mod(model)
+    return updated
+
+
+def freeze_by_prefix(
+    model: Any,
+    prefixes: Union[str, Sequence[str]],
+    freeze: bool = True,
+) -> int:
+    """Sets `requires_grad_(not freeze)` on named parameters matching one or more name prefixes.
+
+    Returns the number of parameter tensors updated.
+    """
+    pref_tuple = (prefixes,) if isinstance(prefixes, str) else tuple(prefixes)
+    req_grad = not bool(freeze)
+    updated = 0
+    named_params_fn = getattr(model, "named_parameters", None)
+    if not callable(named_params_fn):
+        raise TypeError(f"Model of type {type(model).__name__} does not implement named_parameters()")
+    for name, param in named_params_fn():
+        if any(name == pf or name.startswith(pf) for pf in pref_tuple):
+            param.requires_grad_(req_grad)
+            updated += 1
+    return updated
+
+
+graph_viz = types.ModuleType("oxideon.utils.graph_viz")
+graph_viz.model_to_dot = model_to_dot  # type: ignore[attr-defined]
+graph_viz.model_to_mermaid = model_to_mermaid  # type: ignore[attr-defined]
+graph_viz.__all__ = ["model_to_dot", "model_to_mermaid"]  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Model Memory Footprint Estimator (`MemoryFootprint`, `estimate_memory_footprint`)
+# ---------------------------------------------------------------------------
+
+_MEM_DTYPE_BYTES = {
+    "bool": 1,
+    "u8": 1,
+    "uint8": 1,
+    "i8": 1,
+    "int8": 1,
+    "f16": 2,
+    "float16": 2,
+    "bf16": 2,
+    "bfloat16": 2,
+    "i16": 2,
+    "int16": 2,
+    "f32": 4,
+    "float32": 4,
+    "i32": 4,
+    "int32": 4,
+    "f64": 8,
+    "float64": 8,
+    "i64": 8,
+    "int64": 8,
+}
+
+
+def _tensor_tree_bytes(obj: Any) -> int:
+    from .treemap import tree_leaves
+
+    total = 0
+    seen = set()
+    for leaf in tree_leaves(obj):
+        if isinstance(leaf, _Tensor) and id(leaf) not in seen:
+            seen.add(id(leaf))
+            numel = 1
+            for d in getattr(leaf, "shape", ()):
+                numel *= int(d)
+            dt = str(getattr(leaf, "dtype", "f32")).lower()
+            total += numel * _MEM_DTYPE_BYTES.get(dt, 4)
+    return total
+
+
+def _format_byte_count(n: int) -> str:
+    val = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(val) < 1024.0 or unit == "TiB":
+            return f"{int(val)} B" if unit == "B" else f"{val:.2f} {unit}"
+        val /= 1024.0
+    return f"{val:.2f} TiB"
+
+
+class MemoryFootprint:
+    """Breakdown of parameter, buffer, gradient, optimizer-state, and activation memory usage."""
+
+    def __init__(
+        self,
+        parameter_bytes: int,
+        trainable_parameter_bytes: int,
+        buffer_bytes: int,
+        gradient_bytes: int,
+        optimizer_state_bytes: int,
+        activation_bytes: int,
+        peak_layer_activation_bytes: int,
+        per_layer_activation_bytes: Dict[str, int],
+    ) -> None:
+        self.parameter_bytes = int(parameter_bytes)
+        self.trainable_parameter_bytes = int(trainable_parameter_bytes)
+        self.buffer_bytes = int(buffer_bytes)
+        self.gradient_bytes = int(gradient_bytes)
+        self.optimizer_state_bytes = int(optimizer_state_bytes)
+        self.activation_bytes = int(activation_bytes)
+        self.peak_layer_activation_bytes = int(peak_layer_activation_bytes)
+        self.per_layer_activation_bytes = dict(per_layer_activation_bytes)
+        self.total_inference_bytes = (
+            self.parameter_bytes + self.buffer_bytes + self.peak_layer_activation_bytes
+        )
+        self.total_training_bytes = (
+            self.parameter_bytes
+            + self.buffer_bytes
+            + self.gradient_bytes
+            + self.optimizer_state_bytes
+            + self.activation_bytes
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "parameter_bytes": self.parameter_bytes,
+            "trainable_parameter_bytes": self.trainable_parameter_bytes,
+            "buffer_bytes": self.buffer_bytes,
+            "gradient_bytes": self.gradient_bytes,
+            "optimizer_state_bytes": self.optimizer_state_bytes,
+            "activation_bytes": self.activation_bytes,
+            "peak_layer_activation_bytes": self.peak_layer_activation_bytes,
+            "total_inference_bytes": self.total_inference_bytes,
+            "total_training_bytes": self.total_training_bytes,
+            "per_layer_activation_bytes": dict(self.per_layer_activation_bytes),
+        }
+
+    def summary(self) -> str:
+        rows = [
+            ("Parameters (total)", self.parameter_bytes),
+            ("Parameters (trainable)", self.trainable_parameter_bytes),
+            ("Buffers", self.buffer_bytes),
+            ("Gradients", self.gradient_bytes),
+            ("Optimizer states", self.optimizer_state_bytes),
+            ("Activations (cumulative)", self.activation_bytes),
+            ("Total inference estimate", self.total_inference_bytes),
+            ("Total training estimate", self.total_training_bytes),
+        ]
+        sep = "-" * 52
+        lines = [sep, f"{'Category':<28} | {'Memory':>21}", sep]
+        for label, b in rows:
+            lines.append(f"{label:<28} | {_format_byte_count(b):>21}")
+        lines.append(sep)
+        return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        return (
+            f"MemoryFootprint(params={_format_byte_count(self.parameter_bytes)}, "
+            f"inference={_format_byte_count(self.total_inference_bytes)}, "
+            f"training={_format_byte_count(self.total_training_bytes)})"
+        )
+
+
+def estimate_memory_footprint(
+    model: Any,
+    sample_input: Any = None,
+    optimizer_states: int = 2,
+    backward: bool = True,
+) -> MemoryFootprint:
+    """Estimates model RAM/VRAM usage across parameters, buffers, gradients, optimizer states, and activations."""
+    if optimizer_states < 0:
+        raise ValueError(f"optimizer_states must be >= 0, got {optimizer_states}")
+    from .primitives import no_grad
+
+    param_bytes = 0
+    trainable_bytes = 0
+    seen_ids = set()
+
+    params_fn = getattr(model, "parameters", None)
+    if callable(params_fn):
+        for p in params_fn():
+            if id(p) in seen_ids:
+                continue
+            seen_ids.add(id(p))
+            nb = _tensor_tree_bytes(p)
+            param_bytes += nb
+            if getattr(p, "requires_grad", False):
+                trainable_bytes += nb
+    else:
+        for attr in ("weight", "bias"):
+            p = getattr(model, attr, None)
+            if isinstance(p, _Tensor) and id(p) not in seen_ids:
+                seen_ids.add(id(p))
+                nb = _tensor_tree_bytes(p)
+                param_bytes += nb
+                if getattr(p, "requires_grad", False):
+                    trainable_bytes += nb
+
+    buf_bytes = 0
+    buffers_fn = getattr(model, "buffers", None)
+    if callable(buffers_fn):
+        for b in buffers_fn():
+            if isinstance(b, _Tensor) and id(b) not in seen_ids:
+                seen_ids.add(id(b))
+                buf_bytes += _tensor_tree_bytes(b)
+
+    per_layer_act: Dict[str, int] = {}
+    act_total = 0
+    peak_act = 0
+
+    if sample_input is not None:
+        inp_bytes = _tensor_tree_bytes(sample_input)
+        restorers: List[Callable[[], None]] = []
+
+        def _instrument(parent: Any, prefix: str = "") -> None:
+            children = getattr(parent, "_modules", None)
+            if not isinstance(children, dict):
+                return
+            for cname, child in list(children.items()):
+                if child is None:
+                    continue
+                full = f"{prefix}.{cname}" if prefix else str(cname)
+                sub = getattr(child, "_modules", None)
+                if isinstance(sub, dict) and sub:
+                    _instrument(child, full)
+                else:
+                    orig = child
+                    has_attr = cname in getattr(parent, "__dict__", {})
+
+                    class _MemProxy:
+                        def __init__(self, target: Any, name: str) -> None:
+                            self._target = target
+                            self._name = name
+
+                        def __call__(self, *a: Any, **kw: Any) -> Any:
+                            out = self._target(*a, **kw)
+                            per_layer_act[self._name] = per_layer_act.get(self._name, 0) + _tensor_tree_bytes(out)
+                            return out
+
+                        def __getattr__(self, item: str) -> Any:
+                            return getattr(self._target, item)
+
+                    proxy = _MemProxy(orig, full)
+                    children[cname] = proxy
+                    if has_attr:
+                        object.__setattr__(parent, cname, proxy)
+
+                    def _restore(p=parent, k=cname, o=orig, ha=has_attr) -> None:
+                        p._modules[k] = o
+                        if ha:
+                            object.__setattr__(p, k, o)
+
+                    restorers.append(_restore)
+
+        _instrument(model)
+        try:
+            with no_grad():
+                if isinstance(sample_input, tuple):
+                    out = model(*sample_input)
+                elif isinstance(sample_input, dict):
+                    out = model(**sample_input)
+                else:
+                    out = model(sample_input)
+            if not per_layer_act:
+                per_layer_act[type(model).__name__] = _tensor_tree_bytes(out)
+        finally:
+            for r in reversed(restorers):
+                r()
+
+        act_total = inp_bytes + sum(per_layer_act.values())
+        peak_act = inp_bytes + max(per_layer_act.values(), default=0)
+
+    grad_bytes = trainable_bytes if backward else 0
+    opt_bytes = trainable_bytes * int(optimizer_states) if backward else 0
+
+    return MemoryFootprint(
+        parameter_bytes=param_bytes,
+        trainable_parameter_bytes=trainable_bytes,
+        buffer_bytes=buf_bytes,
+        gradient_bytes=grad_bytes,
+        optimizer_state_bytes=opt_bytes,
+        activation_bytes=act_total,
+        peak_layer_activation_bytes=peak_act,
+        per_layer_activation_bytes=per_layer_act,
+    )
+
+
 __all__ = [
     "HookHandle",
     "ephemeral_hook",
@@ -559,10 +1097,17 @@ __all__ = [
     "TimingReport",
     "MicroTimer",
     "TimingComparison",
+    "model_to_dot",
+    "model_to_mermaid",
+    "freeze_module_types",
+    "freeze_by_prefix",
+    "MemoryFootprint",
+    "estimate_memory_footprint",
     "hooks",
     "sysinfo",
     "flops",
     "dlpack",
     "weights_cache",
     "timing",
+    "graph_viz",
 ]

@@ -17,7 +17,9 @@ Provides Oxideon-native implementations of:
 - `ExponentialMovingAverage`: Shadow-weight EMA tracker with `average_parameters()` context manager
 """
 
+from collections import Counter
 from contextlib import contextmanager
+import csv
 import hashlib
 import json
 import math
@@ -1372,6 +1374,814 @@ class ShadowWeightEMA:
             self.shadow_params = [s.detach().clone() for s in state_dict["shadow_params"]]
 
 
+# ---------------------------------------------------------------------------
+# Pure-Python WAV Tensor I/O & `audio_folder_dataset`
+# ---------------------------------------------------------------------------
+
+def read_wav_tensor(
+    path: Union[str, os.PathLike],
+    normalize: bool = True,
+    mono: bool = False,
+) -> Tuple[_Tensor, int]:
+    """Reads a RIFF WAVE (`.wav`) file into a `(waveform, sample_rate)` pair.
+
+    `waveform` has shape `(channels, num_frames)` and dtype `f32`. Supports 8/16/24/32-bit PCM
+    and 32/64-bit IEEE float encodings without external audio libraries.
+    """
+    fpath = Path(path).expanduser().resolve()
+    raw = fpath.read_bytes()
+    if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise ValueError(f"'{fpath}' is not a valid RIFF WAVE file")
+
+    fmt_tag: Optional[int] = None
+    channels = 0
+    sample_rate = 0
+    bits_per_sample = 0
+    pcm_bytes: Optional[bytes] = None
+
+    offset = 12
+    total_len = len(raw)
+    while offset + 8 <= total_len:
+        chunk_id = raw[offset : offset + 4]
+        chunk_size = struct.unpack_from("<I", raw, offset + 4)[0]
+        body_start = offset + 8
+        body_end = min(body_start + chunk_size, total_len)
+        body = raw[body_start:body_end]
+
+        if chunk_id == b"fmt ":
+            if len(body) < 16:
+                raise ValueError("Truncated WAV fmt chunk")
+            fmt_tag, channels, sample_rate, _byte_rate, _block_align, bits_per_sample = struct.unpack_from(
+                "<HHIIHH", body, 0
+            )
+            if fmt_tag == 0xFFFE and len(body) >= 26:
+                # WAVE_FORMAT_EXTENSIBLE: subformat GUID starts at byte 24, first uint16 is base format tag
+                fmt_tag = struct.unpack_from("<H", body, 24)[0]
+        elif chunk_id == b"data":
+            pcm_bytes = body
+            break
+
+        offset = body_start + chunk_size + (chunk_size & 1)
+
+    if fmt_tag is None or pcm_bytes is None or channels <= 0 or sample_rate <= 0:
+        raise ValueError(f"Incomplete WAV header or missing data chunk in '{fpath}'")
+
+    if fmt_tag == 1:  # Linear PCM
+        if bits_per_sample == 8:
+            arr = np.frombuffer(pcm_bytes, dtype=np.uint8)
+            frames = len(arr) // channels
+            arr = arr[: frames * channels].reshape(frames, channels)
+            out = (arr.astype(np.float32) - 128.0) / 128.0 if normalize else arr.astype(np.float32)
+        elif bits_per_sample == 16:
+            arr = np.frombuffer(pcm_bytes, dtype="<i2")
+            frames = len(arr) // channels
+            arr = arr[: frames * channels].reshape(frames, channels)
+            out = arr.astype(np.float32) / 32768.0 if normalize else arr.astype(np.float32)
+        elif bits_per_sample == 24:
+            n_samples = len(pcm_bytes) // 3
+            frames = n_samples // channels
+            n_samples = frames * channels
+            b = np.frombuffer(pcm_bytes[: n_samples * 3], dtype=np.uint8).reshape(n_samples, 3)
+            signed = (
+                b[:, 0].astype(np.int32)
+                | (b[:, 1].astype(np.int32) << 8)
+                | (b[:, 2].astype(np.int32) << 16)
+            )
+            signed = np.where(signed & 0x800000, signed - 0x1000000, signed).reshape(frames, channels)
+            out = signed.astype(np.float32) / 8388608.0 if normalize else signed.astype(np.float32)
+        elif bits_per_sample == 32:
+            arr = np.frombuffer(pcm_bytes, dtype="<i4")
+            frames = len(arr) // channels
+            arr = arr[: frames * channels].reshape(frames, channels)
+            out = arr.astype(np.float32) / 2147483648.0 if normalize else arr.astype(np.float32)
+        else:
+            raise ValueError(f"Unsupported PCM bit depth: {bits_per_sample}")
+    elif fmt_tag == 3:  # IEEE Float
+        if bits_per_sample == 32:
+            arr = np.frombuffer(pcm_bytes, dtype="<f4")
+        elif bits_per_sample == 64:
+            arr = np.frombuffer(pcm_bytes, dtype="<f8")
+        else:
+            raise ValueError(f"Unsupported float WAV bit depth: {bits_per_sample}")
+        frames = len(arr) // channels
+        out = arr[: frames * channels].reshape(frames, channels).astype(np.float32)
+    else:
+        raise ValueError(f"Unsupported WAV format tag: {fmt_tag}")
+
+    cf = np.ascontiguousarray(out.T, dtype=np.float32)  # (channels, frames)
+    if mono and cf.shape[0] > 1:
+        cf = np.ascontiguousarray(cf.mean(axis=0, keepdims=True), dtype=np.float32)
+    return _from_numpy(cf), int(sample_rate)
+
+
+def save_wav_tensor(
+    waveform: Union[_Tensor, np.ndarray],
+    path: Union[str, os.PathLike],
+    sample_rate: int = 16000,
+    bits_per_sample: int = 16,
+    encoding: str = "pcm",
+) -> str:
+    """Writes a 1D `(frames,)` or 2D `(channels, frames)` waveform tensor to a `.wav` file."""
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be > 0, got {sample_rate}")
+    arr = waveform.to_numpy() if isinstance(waveform, _Tensor) else np.asarray(waveform)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    elif arr.ndim != 2:
+        raise ValueError(f"save_wav_tensor expects a 1D or 2D waveform, got shape {arr.shape}")
+
+    channels, frames = int(arr.shape[0]), int(arr.shape[1])
+    interleaved = np.ascontiguousarray(arr.T, dtype=np.float32)
+
+    enc = encoding.lower()
+    if enc == "float":
+        if bits_per_sample != 32:
+            raise ValueError("encoding='float' requires bits_per_sample=32")
+        fmt_tag = 3
+        data_bytes = interleaved.astype("<f4").tobytes()
+        bytes_per_sample = 4
+    elif enc == "pcm":
+        fmt_tag = 1
+        clipped = np.clip(interleaved, -1.0, 1.0)
+        if bits_per_sample == 8:
+            u8 = np.round(clipped * 127.0 + 128.0).clip(0, 255).astype(np.uint8)
+            data_bytes = u8.tobytes()
+            bytes_per_sample = 1
+        elif bits_per_sample == 16:
+            i16 = np.round(clipped * 32767.0).clip(-32768, 32767).astype("<i2")
+            data_bytes = i16.tobytes()
+            bytes_per_sample = 2
+        elif bits_per_sample == 32:
+            i32 = np.round(clipped.astype(np.float64) * 2147483647.0).clip(-2147483648, 2147483647).astype("<i4")
+            data_bytes = i32.tobytes()
+            bytes_per_sample = 4
+        else:
+            raise ValueError(f"Unsupported PCM bits_per_sample={bits_per_sample}; choose 8, 16, or 32")
+    else:
+        raise ValueError(f"Unsupported encoding={encoding!r}; choose 'pcm' or 'float'")
+
+    block_align = channels * bytes_per_sample
+    byte_rate = int(sample_rate) * block_align
+    fmt_chunk = struct.pack(
+        "<4sIHHIIHH",
+        b"fmt ",
+        16,
+        fmt_tag,
+        channels,
+        int(sample_rate),
+        byte_rate,
+        block_align,
+        bits_per_sample,
+    )
+    data_size = len(data_bytes)
+    pad_byte = b"\x00" if (data_size & 1) else b""
+    riff_size = 4 + len(fmt_chunk) + 8 + data_size + len(pad_byte)
+    header = struct.pack("<4sI4s", b"RIFF", riff_size, b"WAVE")
+
+    dest = Path(path).expanduser().resolve()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as f:
+        f.write(header)
+        f.write(fmt_chunk)
+        f.write(struct.pack("<4sI", b"data", data_size))
+        f.write(data_bytes)
+        if pad_byte:
+            f.write(pad_byte)
+    return str(dest)
+
+
+def _resample_linear_cf(cf: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    if orig_sr == target_sr or cf.shape[1] == 0:
+        return cf
+    channels, frames = cf.shape
+    new_frames = max(1, int(round(frames * float(target_sr) / float(orig_sr))))
+    if frames == 1:
+        return np.repeat(cf, new_frames, axis=1)
+    pos = np.linspace(0.0, frames - 1, new_frames, dtype=np.float32)
+    i0 = np.floor(pos).astype(np.int64)
+    i1 = np.minimum(i0 + 1, frames - 1)
+    w = (pos - i0)[None, :]
+    out = cf[:, i0] * (1.0 - w) + cf[:, i1] * w
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+class _FolderAudioDataset(Dataset):
+    def __init__(
+        self,
+        file_paths: List[str],
+        labels: Optional[List[int]],
+        class_names: List[str],
+        label_mode: Optional[str],
+        output_sequence_length: Optional[int],
+        target_sample_rate: Optional[int],
+        mono: bool,
+        squeeze_channels: bool,
+    ) -> None:
+        self.file_paths = file_paths
+        self.labels = labels
+        self.class_names = class_names
+        self.label_mode = label_mode
+        self.output_sequence_length = output_sequence_length
+        self.target_sample_rate = target_sample_rate
+        self.mono = mono
+        self.squeeze_channels = squeeze_channels
+
+    def __len__(self) -> int:
+        return len(self.file_paths)
+
+    def __getitem__(self, idx: int) -> Any:
+        wav_t, sr = read_wav_tensor(self.file_paths[idx], normalize=True, mono=self.mono)
+        cf = wav_t.to_numpy()
+        if self.target_sample_rate is not None and sr != self.target_sample_rate:
+            cf = _resample_linear_cf(cf, sr, int(self.target_sample_rate))
+        if self.output_sequence_length is not None:
+            target_len = int(self.output_sequence_length)
+            cur_len = cf.shape[1]
+            if cur_len > target_len:
+                cf = cf[:, :target_len]
+            elif cur_len < target_len:
+                padded = np.zeros((cf.shape[0], target_len), dtype=np.float32)
+                padded[:, :cur_len] = cf
+                cf = padded
+        if self.squeeze_channels and cf.shape[0] == 1:
+            cf = cf[0]
+        wav_out = _from_numpy(np.ascontiguousarray(cf, dtype=np.float32))
+        if self.labels is None or self.label_mode is None:
+            return wav_out
+
+        lbl = self.labels[idx]
+        if self.label_mode == "int":
+            lbl_t = _from_numpy(np.asarray(lbl, dtype=np.int64))
+        elif self.label_mode == "binary":
+            lbl_t = _from_numpy(np.asarray([float(lbl)], dtype=np.float32))
+        elif self.label_mode == "categorical":
+            one = np.zeros(max(len(self.class_names), lbl + 1), dtype=np.float32)
+            one[lbl] = 1.0
+            lbl_t = _from_numpy(one)
+        else:
+            raise ValueError(f"Unsupported label_mode {self.label_mode!r}")
+        return wav_out, lbl_t
+
+
+def _pad_audio_collate(batch: List[Any]) -> Any:
+    if not batch:
+        return batch
+    has_labels = isinstance(batch[0], tuple)
+    waves = [b[0] if has_labels else b for b in batch]
+    np_waves = [w.to_numpy() for w in waves]
+    max_t = max(a.shape[-1] for a in np_waves)
+    lead = np_waves[0].shape[:-1]
+    padded = np.zeros((len(np_waves),) + lead + (max_t,), dtype=np.float32)
+    for i, a in enumerate(np_waves):
+        padded[i, ..., : a.shape[-1]] = a
+    wav_batch = _from_numpy(padded)
+    if not has_labels:
+        return wav_batch
+    from .data import default_collate
+    lbl_batch = default_collate([b[1] for b in batch])
+    return wav_batch, lbl_batch
+
+
+def audio_folder_dataset(
+    directory: Union[str, os.PathLike],
+    labels: Union[Optional[str], Sequence[int]] = "inferred",
+    label_mode: Optional[str] = "int",
+    class_names: Optional[Sequence[str]] = None,
+    batch_size: Optional[int] = 32,
+    output_sequence_length: Optional[int] = None,
+    target_sample_rate: Optional[int] = None,
+    mono: bool = False,
+    squeeze_channels: bool = False,
+    shuffle: bool = True,
+    seed: Optional[int] = None,
+    validation_split: Optional[float] = None,
+    subset: Optional[str] = None,
+) -> Any:
+    """Builds an audio `DataLoader` (or `Dataset` when `batch_size=None`) from `.wav` files in class subdirectories."""
+    if label_mode not in ("int", "categorical", "binary", None):
+        raise ValueError(f"Invalid label_mode {label_mode!r}")
+    if labels is None:
+        label_mode = None
+
+    paths, y_list, cls_names = _discover_directory_samples(
+        directory, (".wav",), labels=labels, class_names=class_names
+    )
+    if not paths:
+        raise ValueError(f"No .wav files found in '{directory}'")
+    if label_mode == "binary" and len(cls_names) != 2:
+        raise ValueError(f"label_mode='binary' requires exactly 2 classes, found {len(cls_names)}")
+
+    splits = _apply_validation_split(paths, y_list, validation_split, subset, shuffle, seed)
+    outputs = []
+    for sp_paths, sp_labels in splits:
+        ds = _FolderAudioDataset(
+            sp_paths,
+            sp_labels,
+            cls_names,
+            label_mode=label_mode,
+            output_sequence_length=output_sequence_length,
+            target_sample_rate=target_sample_rate,
+            mono=mono,
+            squeeze_channels=squeeze_channels,
+        )
+        if batch_size is None:
+            outputs.append(ds)
+        else:
+            collate = None if output_sequence_length is not None else _pad_audio_collate
+            loader = DataLoader(ds, batch_size=int(batch_size), shuffle=False, collate_fn=collate)
+            loader.class_names = cls_names  # type: ignore[attr-defined]
+            loader.file_paths = sp_paths  # type: ignore[attr-defined]
+            outputs.append(loader)
+    return outputs if len(outputs) > 1 else outputs[0]
+
+
+# ---------------------------------------------------------------------------
+# `VocabularyIndex` & `build_vocabulary`
+# ---------------------------------------------------------------------------
+
+class VocabularyIndex:
+    """Bidirectional token-to-integer lookup table with padding, unknown-token handling, and tensor encoding."""
+
+    def __init__(
+        self,
+        tokens: Sequence[str],
+        unk_token: Optional[str] = "<unk>",
+        pad_token: Optional[str] = "<pad>",
+        tokenizer: Optional[Callable[[str], List[str]]] = None,
+    ) -> None:
+        seen: Dict[str, int] = {}
+        ordered: List[str] = []
+        for tok in tokens:
+            s = str(tok)
+            if s not in seen:
+                seen[s] = len(ordered)
+                ordered.append(s)
+        self._itos = ordered
+        self._stoi = seen
+        self.unk_token = unk_token
+        self.pad_token = pad_token
+        self.unk_index: Optional[int] = seen.get(unk_token) if unk_token is not None else None
+        self.pad_index: int = seen.get(pad_token, 0) if pad_token is not None else 0
+        self._tokenizer = tokenizer if tokenizer is not None else (lambda text: text.strip().split())
+
+    def __len__(self) -> int:
+        return len(self._itos)
+
+    def __contains__(self, token: str) -> bool:
+        return token in self._stoi
+
+    def __getitem__(self, token: str) -> int:
+        if token in self._stoi:
+            return self._stoi[token]
+        if self.unk_index is not None:
+            return self.unk_index
+        raise KeyError(f"Token {token!r} not in vocabulary and unk_token is disabled")
+
+    def get_itos(self) -> List[str]:
+        """Returns the index-to-token list."""
+        return list(self._itos)
+
+    def get_stoi(self) -> Dict[str, int]:
+        """Returns the token-to-index dictionary."""
+        return dict(self._stoi)
+
+    def lookup_indices(self, tokens: Sequence[str]) -> List[int]:
+        """Maps a sequence of tokens to integer IDs."""
+        return [self[t] for t in tokens]
+
+    def lookup_tokens(self, indices: Union[_Tensor, Sequence[int]]) -> List[str]:
+        """Maps a sequence or tensor of integer IDs back to token strings."""
+        idx_list = indices.to_numpy().reshape(-1).tolist() if isinstance(indices, _Tensor) else [int(i) for i in indices]
+        out: List[str] = []
+        n = len(self._itos)
+        for i in idx_list:
+            if 0 <= i < n:
+                out.append(self._itos[i])
+            elif self.unk_token is not None:
+                out.append(self.unk_token)
+            else:
+                raise IndexError(f"Vocabulary index {i} out of range [0, {n})")
+        return out
+
+    def encode(
+        self,
+        text_or_tokens: Union[str, Sequence[str]],
+        max_length: Optional[int] = None,
+    ) -> _Tensor:
+        """Tokenizes (if string) and encodes into a 1D `i64` `Tensor`."""
+        toks = self._tokenizer(text_or_tokens) if isinstance(text_or_tokens, str) else list(text_or_tokens)
+        ids = self.lookup_indices(toks)
+        if max_length is not None:
+            ids = ids[: int(max_length)]
+        return _from_numpy(np.asarray(ids, dtype=np.int64))
+
+    def encode_batch(
+        self,
+        batch: Sequence[Union[str, Sequence[str]]],
+        max_length: Optional[int] = None,
+        padding_side: str = "right",
+    ) -> _Tensor:
+        """Encodes and pads a batch of strings or token lists into a 2D `(batch, seq_len)` `i64` `Tensor`."""
+        if padding_side not in ("right", "left"):
+            raise ValueError(f"padding_side must be 'right' or 'left', got {padding_side!r}")
+        encoded = [
+            self.lookup_indices(self._tokenizer(item) if isinstance(item, str) else list(item))
+            for item in batch
+        ]
+        if max_length is not None:
+            target_len = int(max_length)
+            encoded = [seq[:target_len] for seq in encoded]
+        else:
+            target_len = max((len(seq) for seq in encoded), default=0)
+
+        arr = np.full((len(encoded), target_len), self.pad_index, dtype=np.int64)
+        for i, seq in enumerate(encoded):
+            m = len(seq)
+            if m == 0:
+                continue
+            if padding_side == "right":
+                arr[i, :m] = seq
+            else:
+                arr[i, target_len - m :] = seq
+        return _from_numpy(arr)
+
+    def decode(
+        self,
+        indices: Union[_Tensor, Sequence[int]],
+        skip_specials: bool = True,
+        join_with: str = " ",
+    ) -> str:
+        """Decodes integer IDs back into a string."""
+        toks = self.lookup_tokens(indices)
+        if skip_specials:
+            specials = {t for t in (self.pad_token, self.unk_token) if t is not None}
+            toks = [t for t in toks if t not in specials]
+        return join_with.join(toks)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tokens": list(self._itos),
+            "unk_token": self.unk_token,
+            "pad_token": self.pad_token,
+        }
+
+    @classmethod
+    def from_dict(cls, config: Dict[str, Any]) -> "VocabularyIndex":
+        return cls(
+            tokens=config["tokens"],
+            unk_token=config.get("unk_token", "<unk>"),
+            pad_token=config.get("pad_token", "<pad>"),
+        )
+
+
+def build_vocabulary(
+    corpus: Iterable[Union[str, Sequence[str]]],
+    max_tokens: Optional[int] = None,
+    min_freq: int = 1,
+    specials: Sequence[str] = ("<pad>", "<unk>"),
+    unk_token: Optional[str] = "<unk>",
+    pad_token: Optional[str] = "<pad>",
+    tokenizer: Optional[Callable[[str], List[str]]] = None,
+) -> VocabularyIndex:
+    """Builds a frequency-ordered `VocabularyIndex` from an iterable of raw strings or token sequences."""
+    tok_fn = tokenizer if tokenizer is not None else (lambda text: text.strip().split())
+    counts: Counter = Counter()
+    for entry in corpus:
+        toks = tok_fn(entry) if isinstance(entry, str) else list(entry)
+        counts.update(str(t) for t in toks)
+
+    ordered: List[str] = []
+    seen = set()
+    for sp in specials:
+        if sp not in seen:
+            ordered.append(sp)
+            seen.add(sp)
+
+    # Sort descending by frequency, ties broken lexicographically for determinism
+    sorted_items = sorted(
+        ((tok, freq) for tok, freq in counts.items() if freq >= min_freq and tok not in seen),
+        key=lambda kv: (-kv[1], kv[0]),
+    )
+    for tok, _ in sorted_items:
+        if max_tokens is not None and len(ordered) >= int(max_tokens):
+            break
+        ordered.append(tok)
+
+    return VocabularyIndex(
+        tokens=ordered,
+        unk_token=unk_token,
+        pad_token=pad_token,
+        tokenizer=tok_fn,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tabular & Structured Record Loaders (`csv_dataset`, `jsonl_dataset`)
+# ---------------------------------------------------------------------------
+
+def _infer_cell_kind(values: Sequence[str], na_value: str) -> str:
+    non_empty = [v.strip() for v in values if v != na_value and v.strip() != ""]
+    if not non_empty:
+        return "float"
+    is_int = True
+    is_float = True
+    for s in non_empty:
+        try:
+            int(s)
+        except ValueError:
+            is_int = False
+            try:
+                float(s)
+            except ValueError:
+                is_float = False
+                break
+    if is_int:
+        return "int"
+    if is_float:
+        return "float"
+    return "str"
+
+
+def _parse_typed_column(
+    cells: Sequence[str],
+    kind: str,
+    default_val: Any,
+    na_value: str,
+) -> Any:
+    if kind == "int":
+        d_int = 0 if default_val is None else int(default_val)
+        arr = np.asarray(
+            [d_int if (c == na_value or c.strip() == "") else int(c.strip()) for c in cells],
+            dtype=np.int64,
+        )
+        return _from_numpy(arr)
+    if kind == "float":
+        d_flt = 0.0 if default_val is None else float(default_val)
+        arr = np.asarray(
+            [d_flt if (c == na_value or c.strip() == "") else float(c.strip()) for c in cells],
+            dtype=np.float32,
+        )
+        return _from_numpy(arr)
+    d_str = "" if default_val is None else str(default_val)
+    return [d_str if c == na_value else c for c in cells]
+
+
+class _TabularCSVDataset(Dataset):
+    def __init__(
+        self,
+        columns: Dict[str, Any],
+        feature_names: List[str],
+        label_name: Optional[str],
+        pack_features: bool,
+        num_rows: int,
+    ) -> None:
+        self.columns = columns
+        self.feature_names = feature_names
+        self.label_name = label_name
+        self._num_rows = num_rows
+        self._all_numeric = all(isinstance(columns[c], _Tensor) for c in feature_names)
+        self._packed_x: Optional[_Tensor] = None
+        if pack_features and self._all_numeric and feature_names:
+            mats = [columns[c].to_numpy().astype(np.float32) for c in feature_names]
+            stacked = np.ascontiguousarray(np.column_stack(mats), dtype=np.float32)
+            self._packed_x = _from_numpy(stacked)
+
+    def __len__(self) -> int:
+        return self._num_rows
+
+    def __getitem__(self, idx: int) -> Any:
+        if idx < 0:
+            idx += self._num_rows
+        if idx < 0 or idx >= self._num_rows:
+            raise IndexError(f"CSV dataset index {idx} out of range for {self._num_rows} rows")
+
+        if self._packed_x is not None:
+            feat: Any = self._packed_x[idx]
+        else:
+            feat = {c: self.columns[c][idx] for c in self.feature_names}
+
+        if self.label_name is None:
+            return feat
+        lbl_col = self.columns[self.label_name]
+        return feat, lbl_col[idx]
+
+
+def csv_dataset(
+    file_path: Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]],
+    batch_size: Optional[int] = 32,
+    select_columns: Optional[Sequence[Union[str, int]]] = None,
+    label_name: Optional[str] = None,
+    column_defaults: Optional[Union[Sequence[Any], Dict[str, Any]]] = None,
+    header: bool = True,
+    field_delim: str = ",",
+    na_value: str = "",
+    shuffle: bool = False,
+    seed: Optional[int] = None,
+    num_epochs: int = 1,
+    drop_last: bool = False,
+    pack_features: bool = True,
+) -> Any:
+    """Loads one or more delimited text files (CSV/TSV) into a `DataLoader` (or `Dataset` when `batch_size=None`)."""
+    if isinstance(file_path, (str, os.PathLike)):
+        paths = [Path(file_path).expanduser().resolve()]
+    else:
+        paths = [Path(p).expanduser().resolve() for p in file_path]
+    if not paths:
+        raise ValueError("csv_dataset requires at least one file path")
+
+    col_names: Optional[List[str]] = None
+    raw_rows: List[List[str]] = []
+    for p in paths:
+        if not p.is_file():
+            raise FileNotFoundError(f"CSV file not found: '{p}'")
+        with open(p, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f, delimiter=field_delim)
+            first_row = next(reader, None)
+            if first_row is None:
+                continue
+            if header:
+                if col_names is None:
+                    col_names = [c.strip() for c in first_row]
+                elif [c.strip() for c in first_row] != col_names:
+                    raise ValueError(f"CSV header mismatch in '{p}'")
+            else:
+                if col_names is None:
+                    col_names = [f"col_{i}" for i in range(len(first_row))]
+                raw_rows.append(first_row)
+            for row in reader:
+                if row:
+                    raw_rows.append(row)
+
+    if col_names is None:
+        raise ValueError("CSV input contained no rows")
+
+    if select_columns is not None:
+        chosen_indices: List[int] = []
+        chosen_names: List[str] = []
+        for sc in select_columns:
+            if isinstance(sc, int):
+                chosen_indices.append(sc)
+                chosen_names.append(col_names[sc])
+            else:
+                if sc not in col_names:
+                    raise ValueError(f"Column {sc!r} not found in CSV header {col_names}")
+                idx = col_names.index(sc)
+                chosen_indices.append(idx)
+                chosen_names.append(sc)
+    else:
+        chosen_indices = list(range(len(col_names)))
+        chosen_names = list(col_names)
+
+    if label_name is not None and label_name not in chosen_names:
+        raise ValueError(f"label_name {label_name!r} is not among selected columns {chosen_names}")
+
+    defaults_by_name: Dict[str, Any] = {}
+    if isinstance(column_defaults, dict):
+        defaults_by_name.update(column_defaults)
+    elif isinstance(column_defaults, (list, tuple)):
+        if len(column_defaults) != len(chosen_names):
+            raise ValueError(
+                f"column_defaults length ({len(column_defaults)}) must match selected columns ({len(chosen_names)})"
+            )
+        for cname, dval in zip(chosen_names, column_defaults):
+            defaults_by_name[cname] = dval
+
+    parsed_cols: Dict[str, Any] = {}
+    for col_pos, cname in zip(chosen_indices, chosen_names):
+        cells = [row[col_pos] if col_pos < len(row) else na_value for row in raw_rows]
+        if cname in defaults_by_name and defaults_by_name[cname] is not None:
+            dv = defaults_by_name[cname]
+            if isinstance(dv, bool):
+                kind = "int"
+            elif isinstance(dv, int):
+                kind = "int"
+            elif isinstance(dv, float):
+                kind = "float"
+            else:
+                kind = "str"
+        else:
+            dv = None
+            kind = _infer_cell_kind(cells, na_value)
+        parsed_cols[cname] = _parse_typed_column(cells, kind, dv, na_value)
+
+    feat_names = [c for c in chosen_names if c != label_name]
+    ds: Dataset = _TabularCSVDataset(
+        columns=parsed_cols,
+        feature_names=feat_names,
+        label_name=label_name,
+        pack_features=pack_features,
+        num_rows=len(raw_rows),
+    )
+    if num_epochs != 1:
+        ds = ds.repeat(num_epochs)
+    if batch_size is None:
+        return ds
+    return DataLoader(ds, batch_size=int(batch_size), shuffle=shuffle, drop_last=drop_last, seed=seed)
+
+
+class _JSONLDataset(Dataset):
+    def __init__(
+        self,
+        records: List[Dict[str, Any]],
+        fields: Optional[List[str]],
+        label_field: Optional[str],
+        field_defaults: Dict[str, Any],
+        transform_fn: Optional[Callable[[Any], Any]],
+    ) -> None:
+        self.records = records
+        self.fields = fields
+        self.label_field = label_field
+        self.field_defaults = field_defaults
+        self.transform_fn = transform_fn
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    @staticmethod
+    def _to_item_tensor(val: Any) -> Any:
+        if isinstance(val, _Tensor):
+            return val
+        if isinstance(val, bool):
+            return _from_numpy(np.asarray(val, dtype=np.bool_))
+        if isinstance(val, int):
+            return _from_numpy(np.asarray(val, dtype=np.int64))
+        if isinstance(val, float):
+            return _from_numpy(np.asarray(val, dtype=np.float32))
+        if isinstance(val, list) and val and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in val):
+            dt = np.int64 if all(isinstance(x, int) for x in val) else np.float32
+            return _from_numpy(np.asarray(val, dtype=dt))
+        return val
+
+    def __getitem__(self, idx: int) -> Any:
+        n = len(self.records)
+        if idx < 0:
+            idx += n
+        if idx < 0 or idx >= n:
+            raise IndexError(f"JSONL dataset index {idx} out of range for {n} records")
+        raw = self.records[idx]
+        keys = self.fields if self.fields is not None else list(raw.keys())
+        item: Dict[str, Any] = {}
+        for k in keys:
+            val = raw.get(k, self.field_defaults.get(k))
+            item[k] = self._to_item_tensor(val)
+
+        if self.label_field is not None:
+            raw_lbl = item.pop(self.label_field, raw.get(self.label_field, self.field_defaults.get(self.label_field)))
+            lbl = self._to_item_tensor(raw_lbl)
+            out: Any = (item, lbl)
+        else:
+            out = item
+
+        if self.transform_fn is not None:
+            out = self.transform_fn(out)
+        return out
+
+
+def jsonl_dataset(
+    file_path: Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]],
+    batch_size: Optional[int] = 32,
+    fields: Optional[Sequence[str]] = None,
+    label_field: Optional[str] = None,
+    field_defaults: Optional[Dict[str, Any]] = None,
+    transform_fn: Optional[Callable[[Any], Any]] = None,
+    shuffle: bool = False,
+    seed: Optional[int] = None,
+    drop_last: bool = False,
+) -> Any:
+    """Loads one or more JSON Lines (`.jsonl` / `.ndjson`) files into a `DataLoader` (or `Dataset` when `batch_size=None`)."""
+    if isinstance(file_path, (str, os.PathLike)):
+        paths = [Path(file_path).expanduser().resolve()]
+    else:
+        paths = [Path(p).expanduser().resolve() for p in file_path]
+    if not paths:
+        raise ValueError("jsonl_dataset requires at least one file path")
+
+    records: List[Dict[str, Any]] = []
+    for p in paths:
+        if not p.is_file():
+            raise FileNotFoundError(f"JSONL file not found: '{p}'")
+        with open(p, "r", encoding="utf-8") as f:
+            for lineno, line in enumerate(f, 1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                obj = json.loads(stripped)
+                if not isinstance(obj, dict):
+                    raise ValueError(f"Expected JSON object on '{p}' line {lineno}, got {type(obj).__name__}")
+                records.append(obj)
+
+    ds = _JSONLDataset(
+        records=records,
+        fields=list(fields) if fields is not None else None,
+        label_field=label_field,
+        field_defaults=dict(field_defaults or {}),
+        transform_fn=transform_fn,
+    )
+    if batch_size is None:
+        return ds
+    return DataLoader(ds, batch_size=int(batch_size), shuffle=shuffle, drop_last=drop_last, seed=seed)
+
+
 __all__ = [
     "one_hot_encode",
     "axis_normalize",
@@ -1384,6 +2194,13 @@ __all__ = [
     "split_dataset",
     "image_folder_dataset",
     "text_folder_dataset",
+    "read_wav_tensor",
+    "save_wav_tensor",
+    "audio_folder_dataset",
+    "csv_dataset",
+    "jsonl_dataset",
+    "VocabularyIndex",
+    "build_vocabulary",
     "ProgressBar",
     "fetch_artifact",
     "verify_checksum",

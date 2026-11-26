@@ -1,7 +1,4 @@
-"""Stochastic Weight Averaging (SWA) utilities.
-
-Mirrors torch.optim.swa_utils (AveragedModel, update_bn, SWALR).
-"""
+"""Stochastic Weight Averaging (SWA) utilities (`AveragedModel`, `update_bn`, `SWALR`)."""
 
 from typing import Any, Callable, Optional
 import numpy as np
@@ -46,7 +43,7 @@ def update_bn(loader: Any, model: nn.Module, device: Optional[str] = None):
     Args:
         loader: Dataset loader producing input batches.
         model: Model containing BatchNorm layers to be updated.
-        device: Unused (maintained for PyTorch API parity).
+        device: Optional target device name.
     """
     was_training = model.training
     model.train()

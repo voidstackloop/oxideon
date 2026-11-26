@@ -1,6 +1,6 @@
 """Complete Probability & Distributions Library for Oxideon.
 
-Provides PyTorch-compatible `torch.distributions` implementations supporting
+Provides probability distribution implementations supporting
 variational inference, policy gradients, generative modeling, and closed-form KL divergences:
 - `Distribution` (base)
 - `Normal`, `Bernoulli`, `Categorical`, `Uniform`, `Exponential`
@@ -33,7 +33,7 @@ def _to_np(x: Any) -> np.ndarray:
 
 
 def _wrap(arr: np.ndarray) -> _Tensor:
-    # np.ascontiguousarray would turn a 0-d result into shape (1,); keep scalars scalar, like PyTorch
+    # np.ascontiguousarray would turn a 0-d result into shape (1,); keep 0-d scalars 0-d
     a = np.asarray(arr, dtype=np.float32)
     return _from_numpy(a if a.flags.c_contiguous else np.ascontiguousarray(a))
 

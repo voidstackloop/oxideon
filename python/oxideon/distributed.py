@@ -57,7 +57,7 @@ def _normalize_collective_op(op: Union[ReduceOp, str], name: str) -> str:
 
 
 def _require_op_dtype(op_str: str, arrays: Sequence[np.ndarray], name: str) -> None:
-    """Enforces op/dtype domains (torch parity): bitwise needs integers, avg needs floats."""
+    """Enforces collective reduction op and dtype domains: bitwise needs integers, avg needs floats."""
     if op_str in ("band", "bor", "bxor"):
         for a in arrays:
             if a.dtype.kind not in "iub":

@@ -180,10 +180,185 @@ def make_tensor(
     return res
 
 
+def gradgradcheck(
+    func: Callable[..., Any],
+    inputs: Union[_Tensor, Sequence[_Tensor]],
+    grad_outputs: Optional[Union[_Tensor, Sequence[_Tensor]]] = None,
+    eps: float = 1e-4,
+    atol: float = 1e-3,
+    rtol: float = 1e-2,
+) -> bool:
+    """Numerically verifies second-order autograd derivatives against central finite differences of first-order gradients."""
+    from .oxideon import grad as _native_grad
+
+    tensors = [inputs] if isinstance(inputs, _Tensor) else list(inputs)
+    clean_inputs = [_from_numpy(np.ascontiguousarray(t.to_numpy())).requires_grad_(True) for t in tensors]
+
+    def _first_grad_directional(args_list: List[_Tensor], create_graph: bool) -> List[_Tensor]:
+        out = func(*args_list)
+        out_list = [out] if isinstance(out, _Tensor) else list(out)
+        if grad_outputs is None:
+            scalar = sum((o.sum() for o in out_list[1:]), out_list[0].sum())
+        else:
+            gos = [grad_outputs] if isinstance(grad_outputs, _Tensor) else list(grad_outputs)
+            terms = [(o * go).sum() for o, go in zip(out_list, gos)]
+            scalar = sum(terms[1:], terms[0])
+        return list(_native_grad([scalar], args_list, create_graph=create_graph))
+
+    first_grads = _first_grad_directional(clean_inputs, create_graph=True)
+    # Sum of first-order gradients forms scalar objective whose gradient w.r.t. inputs is sum_i H_{i,j}
+    second_obj = sum((g.sum() for g in first_grads[1:]), first_grads[0].sum())
+    anal_second = list(_native_grad([second_obj], clean_inputs, create_graph=False))
+
+    for inp_idx, (t_in, g2_anal_t) in enumerate(zip(clean_inputs, anal_second)):
+        g2_anal = g2_anal_t.to_numpy()
+        x0 = t_in.to_numpy().copy()
+        g2_num = np.zeros_like(x0)
+        it = np.nditer(x0, flags=["multi_index"])
+
+        while not it.finished:
+            idx = it.multi_index
+            val = float(x0[idx])
+
+            x_plus = x0.copy()
+            x_plus[idx] = val + eps
+            args_plus = [
+                _from_numpy(x_plus if j == inp_idx else clean_inputs[j].to_numpy().copy()).requires_grad_(True)
+                for j in range(len(clean_inputs))
+            ]
+            fg_plus = _first_grad_directional(args_plus, create_graph=False)
+            s_plus = sum(float(g.to_numpy().sum()) for g in fg_plus)
+
+            x_minus = x0.copy()
+            x_minus[idx] = val - eps
+            args_minus = [
+                _from_numpy(x_minus if j == inp_idx else clean_inputs[j].to_numpy().copy()).requires_grad_(True)
+                for j in range(len(clean_inputs))
+            ]
+            fg_minus = _first_grad_directional(args_minus, create_graph=False)
+            s_minus = sum(float(g.to_numpy().sum()) for g in fg_minus)
+
+            dx = float(x_plus[idx]) - float(x_minus[idx])
+            step = dx if abs(dx) > 1e-12 else (2.0 * eps)
+            g2_num[idx] = (s_plus - s_minus) / step
+            it.iternext()
+
+        if not np.allclose(g2_anal, g2_num, rtol=rtol, atol=atol):
+            max_diff = float(np.max(np.abs(g2_anal - g2_num)))
+            raise AssertionError(
+                f"gradgradcheck failed on input {inp_idx}: max abs difference {max_diff:.6e} > atol={atol}\n"
+                f"Analytical 2nd derivative:\n{g2_anal}\nNumerical 2nd derivative:\n{g2_num}"
+            )
+
+    return True
+
+
+def assert_finite(tensor_or_tree: Any, msg: Optional[str] = None) -> None:
+    """Asserts that every `Tensor` or NumPy array inside `tensor_or_tree` contains only finite values (no NaN or Inf)."""
+    from .treemap import tree_leaves
+
+    prefix = f"{msg}: " if msg else ""
+    for idx, leaf in enumerate(tree_leaves(tensor_or_tree)):
+        if isinstance(leaf, _Tensor):
+            arr = leaf.to_numpy()
+        elif isinstance(leaf, np.ndarray):
+            arr = leaf
+        elif isinstance(leaf, (int, float)):
+            if not math.isfinite(leaf):
+                raise AssertionError(f"{prefix}Non-finite scalar value at leaf {idx}: {leaf}")
+            continue
+        else:
+            continue
+
+        if arr.dtype.kind in ("f", "c") and not np.all(np.isfinite(arr)):
+            nan_cnt = int(np.isnan(arr).sum())
+            inf_cnt = int(np.isinf(arr).sum())
+            raise AssertionError(
+                f"{prefix}Non-finite tensor values at leaf {idx} with shape {tuple(arr.shape)}: "
+                f"{nan_cnt} NaN(s), {inf_cnt} Inf(s)"
+            )
+
+
+def assert_shapes(
+    specs: Sequence[Any],
+    msg: Optional[str] = None,
+) -> Dict[str, int]:
+    """Verifies tensor ranks, literal dimensions, and symbolic dimension bindings across multiple `(tensor, pattern)` pairs.
+
+    Each element of `specs` is `(tensor, expected_dims)` where `expected_dims` is a sequence of:
+    - `int`: exact dimension size required
+    - `str`: symbolic dimension name (e.g. `'B'`, `'T'`, `'D'`) bound on first occurrence and checked across all occurrences
+      (`'*'` or `'_'` acts as a single-axis wildcard)
+    - `None`: single-axis wildcard
+    - `...` (`Ellipsis`): variable-length prefix/infix wildcard (at most one per pattern)
+
+    Returns a dictionary mapping bound symbolic names to their resolved integer sizes.
+    """
+    prefix = f"{msg}: " if msg else ""
+    bindings: Dict[str, int] = {}
+
+    for item_idx, pair in enumerate(specs):
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError(f"assert_shapes expects (tensor, pattern) pairs, got {pair!r} at index {item_idx}")
+        t, pat_raw = pair
+        actual_shape = tuple(t.shape) if hasattr(t, "shape") else tuple(np.asarray(t).shape)
+        pattern = list(pat_raw)
+
+        ellipsis_positions = [i for i, tok in enumerate(pattern) if tok is Ellipsis]
+        if len(ellipsis_positions) > 1:
+            raise ValueError(f"Pattern at index {item_idx} may contain at most one Ellipsis (...)")
+
+        if ellipsis_positions:
+            ep = ellipsis_positions[0]
+            head = pattern[:ep]
+            tail = pattern[ep + 1 :]
+            if len(actual_shape) < len(head) + len(tail):
+                raise AssertionError(
+                    f"{prefix}Tensor {item_idx} rank mismatch: shape {actual_shape} has fewer than "
+                    f"{len(head) + len(tail)} dims required by pattern {tuple(pattern)}"
+                )
+            aligned_pairs = list(zip(actual_shape[: len(head)], head))
+            if tail:
+                aligned_pairs.extend(zip(actual_shape[-len(tail) :], tail))
+        else:
+            if len(actual_shape) != len(pattern):
+                raise AssertionError(
+                    f"{prefix}Tensor {item_idx} rank mismatch: actual shape {actual_shape} != pattern {tuple(pattern)}"
+                )
+            aligned_pairs = list(zip(actual_shape, pattern))
+
+        for dim_val, tok in aligned_pairs:
+            dim_int = int(dim_val)
+            if tok is None or tok in ("*", "_"):
+                continue
+            if isinstance(tok, int) and not isinstance(tok, bool):
+                if dim_int != tok:
+                    raise AssertionError(
+                        f"{prefix}Tensor {item_idx} shape {actual_shape} failed literal dimension check: "
+                        f"expected {tok}, got {dim_int} (pattern {tuple(pattern)})"
+                    )
+            elif isinstance(tok, str):
+                if tok in bindings:
+                    if bindings[tok] != dim_int:
+                        raise AssertionError(
+                            f"{prefix}Symbolic dimension '{tok}' mismatch at tensor {item_idx} (shape {actual_shape}): "
+                            f"previously bound to {bindings[tok]}, got {dim_int}"
+                        )
+                else:
+                    bindings[tok] = dim_int
+            else:
+                raise TypeError(f"Unsupported dimension token {tok!r} in assert_shapes pattern")
+
+    return bindings
+
+
 __all__ = [
     "assert_close",
     "assert_allclose",
     "assert_equal",
+    "assert_finite",
+    "assert_shapes",
     "gradcheck",
+    "gradgradcheck",
     "make_tensor",
 ]

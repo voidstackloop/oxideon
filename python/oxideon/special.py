@@ -1,7 +1,7 @@
 """Comprehensive Special Mathematical Functions for Oxideon.
 
-Provides tensor-friendly, broadcasting special mathematical functions matching
-the PyTorch `torch.special` specification, including error functions, gamma family,
+Provides tensor-friendly, broadcasting special mathematical functions,
+including error functions, gamma family,
 modified Bessel functions, normal distribution CDFs, and information-theoretic operators.
 """
 
@@ -102,7 +102,7 @@ def erfinv(input: _Tensor) -> _Tensor:
         x[interior] = _erfinv_core(y[interior])
     x[y == 1.0] = np.inf
     x[y == -1.0] = -np.inf
-    # |y| > 1 stays NaN like torch; NaN input flows through as NaN.
+    # |y| > 1 stays NaN; NaN input flows through as NaN.
     return _wrap(x, input)
 
 
@@ -155,7 +155,7 @@ def logit(input: _Tensor, eps: Optional[float] = None) -> _Tensor:
 def _gammaln_np(arr: np.ndarray) -> np.ndarray:
     """Full-domain ln|Gamma| ourselves: +inf at poles, reflection left of 0."""
     res = np.full_like(arr, np.nan, dtype=np.float64)
-    # Poles at 0 and the negative integers read +inf like torch.
+    # Poles at 0 and the negative integers read +inf.
     res[(arr == 0.0) | ((arr < 0.0) & (arr == np.floor(arr)))] = np.inf
     pos = arr > 0.0
     if np.any(pos):
@@ -214,7 +214,7 @@ def digamma(input: _Tensor) -> _Tensor:
     res[pos] = _digamma_pos(x[pos])
     res[x == 0.0] = -np.inf
     # Negative non-integers via reflection psi(x) = psi(1-x) - pi/tan(pi x);
-    # negative integers are poles (NaN like torch).
+    # negative integers are poles (NaN).
     neg = (x < 0.0) & (x != np.floor(x))
     if np.any(neg):
         xn = x[neg]
@@ -347,7 +347,7 @@ def ndtri(input: _Tensor) -> _Tensor:
         res[interior] = math.sqrt(2.0) * _erfinv_core(2.0 * p[interior] - 1.0)
     res[p == 0.0] = -np.inf
     res[p == 1.0] = np.inf
-    # p outside [0, 1] stays NaN like torch; NaN input flows through as NaN.
+    # p outside [0, 1] stays NaN; NaN input flows through as NaN.
     return _wrap(res, input)
 
 
@@ -426,7 +426,7 @@ def entr(input: _Tensor) -> _Tensor:
 def rel_entr(input: _Tensor, other: _Tensor) -> _Tensor:
     """Computes the relative entropy elementwise: x * ln(x / y).
 
-    Matches the torch convention ``xlogy(x, x) - xlogy(x, y)``: 0 when
+    Matches the convention ``xlogy(x, x) - xlogy(x, y)``: 0 when
     x == 0, +inf when x > 0 and y == 0, NaN for negative arguments.
     """
     x = _to_np(input).astype(np.float64)
@@ -1013,7 +1013,7 @@ __all__ = [
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Orthogonal polynomials (degree n an int or a tensor, broadcast against x), all evaluated by one Rust kernel
-# (numeric_kernels.rs, three-term recurrences); shifted Chebyshev polynomials; modified Bessel I0 / I1 (PyTorch names)
+# (numeric_kernels.rs, three-term recurrences); shifted Chebyshev polynomials; modified Bessel I0 / I1
 # ---------------------------------------------------------------------------------------------------------------------
 
 def _poly(kind: str, input: Any, n: Any) -> _Tensor:

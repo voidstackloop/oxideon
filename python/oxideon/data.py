@@ -13,13 +13,68 @@ from . import Tensor, stack
 
 
 class Dataset:
-    """An abstract class representing a Dataset."""
+    """An abstract class representing an indexable or iterable dataset."""
 
     def __getitem__(self, index: int) -> Any:
         raise NotImplementedError
 
     def __len__(self) -> int:
         raise NotImplementedError
+
+    def __iter__(self) -> Iterator[Any]:
+        for idx in range(len(self)):
+            yield self[idx]
+
+    def map(self, fn: Callable[[Any], Any]) -> "Dataset":
+        """Applies `fn` lazily to each element of this dataset."""
+        if isinstance(self, IterableDataset):
+            return _MappedIterableDataset(self, fn)
+        return MappedDataset(self, fn)
+
+    def filter(self, predicate: Callable[[Any], bool]) -> "FilteredDataset":
+        """Lazily retains only elements where `predicate(item)` evaluates to True."""
+        return FilteredDataset(self, predicate)
+
+    def cache(self) -> "Dataset":
+        """Caches dataset elements in memory after their first access."""
+        if isinstance(self, IterableDataset):
+            return _CachedIterableDataset(self)
+        return CachedDataset(self)
+
+    def repeat(self, count: Optional[int] = None) -> "Dataset":
+        """Repeats this dataset `count` times (or indefinitely as an `IterableDataset` if `count is None`)."""
+        if isinstance(self, IterableDataset) or count is None:
+            return _RepeatedIterableDataset(self, count)
+        return RepeatedDataset(self, count)
+
+    def take(self, count: int) -> "Dataset":
+        """Limits this dataset to at most the first `count` elements."""
+        if isinstance(self, IterableDataset):
+            return _TakenIterableDataset(self, count)
+        return TakenDataset(self, count)
+
+    def skip(self, count: int) -> "Dataset":
+        """Skips the first `count` elements of this dataset."""
+        if isinstance(self, IterableDataset):
+            return _SkippedIterableDataset(self, count)
+        return SkippedDataset(self, count)
+
+    def window(
+        self,
+        size: int,
+        shift: Optional[int] = None,
+        stride: int = 1,
+        drop_remainder: bool = True,
+        collate_fn: Optional[Callable[[List[Any]], Any]] = None,
+    ) -> "Dataset":
+        """Groups consecutive dataset elements into sliding windows of length `size`."""
+        if isinstance(self, IterableDataset):
+            return _WindowedIterableDataset(
+                self, size=size, shift=shift, stride=stride, drop_remainder=drop_remainder, collate_fn=collate_fn
+            )
+        return WindowedDataset(
+            self, size=size, shift=shift, stride=stride, drop_remainder=drop_remainder, collate_fn=collate_fn
+        )
 
 
 class TensorDataset(Dataset):
@@ -112,7 +167,7 @@ class IterableDataset(Dataset):
         raise NotImplementedError("IterableDataset does not support __getitem__")
 
     def __len__(self) -> int:
-        raise NotImplementedError("IterableDataset may not have a defined __len__")
+        raise TypeError(f"object of type '{type(self).__name__}' has no len()")
 
 
 class ConcatDataset(Dataset):
@@ -359,22 +414,51 @@ class DataLoader:
         self._rng = random.Random(seed) if seed is not None else random.Random()
         self.pin_memory = pin_memory
         self.num_workers = num_workers
+        self._is_iterable = isinstance(dataset, IterableDataset)
 
-        if batch_sampler is None:
-            if sampler is None:
-                if shuffle:
-                    sampler = RandomSampler(dataset, seed=seed)
-                else:
-                    sampler = SequentialSampler(dataset)
-            batch_sampler = BatchSampler(sampler, batch_size if batch_size is not None else 1, drop_last)
+        if self._is_iterable:
+            if shuffle:
+                raise ValueError("DataLoader with IterableDataset does not support shuffle=True")
+            if sampler is not None or batch_sampler is not None:
+                raise ValueError("DataLoader with IterableDataset does not support sampler or batch_sampler")
+            self.sampler = None
+            self.batch_sampler = None
+        else:
+            if batch_sampler is None:
+                if sampler is None:
+                    if shuffle:
+                        sampler = RandomSampler(dataset, seed=seed)
+                    else:
+                        sampler = SequentialSampler(dataset)
+                batch_sampler = BatchSampler(sampler, batch_size if batch_size is not None else 1, drop_last)
 
-        self.sampler = sampler
-        self.batch_sampler = batch_sampler
+            self.sampler = sampler
+            self.batch_sampler = batch_sampler
 
     def __len__(self) -> int:
+        if self._is_iterable:
+            n = len(self.dataset)
+            b = self.batch_size if self.batch_size is not None else 1
+            return (n // b) if self.drop_last else math.ceil(n / b)
         return len(self.batch_sampler)
 
     def __iter__(self) -> Iterator[Any]:
+        if self._is_iterable:
+            b = self.batch_size
+            if b is None:
+                for item in self.dataset:
+                    yield item
+                return
+            buf: List[Any] = []
+            for item in self.dataset:
+                buf.append(item)
+                if len(buf) == b:
+                    yield self.collate_fn(buf)
+                    buf = []
+            if buf and not self.drop_last:
+                yield self.collate_fn(buf)
+            return
+
         if (
             isinstance(self.dataset, TensorDataset)
             and self.collate_fn is default_collate
@@ -614,4 +698,555 @@ class StackDataset(Dataset):
         return self._length
 
 
-__all__ += ["DistributedSampler", "StackDataset", "to_tensors"]
+__all__ += [
+    "DistributedSampler",
+    "StackDataset",
+    "to_tensors",
+    "MappedDataset",
+    "FilteredDataset",
+    "CachedDataset",
+    "RepeatedDataset",
+    "TakenDataset",
+    "SkippedDataset",
+    "WindowedDataset",
+    "padded_collate",
+    "stratified_split",
+    "BalancedClassSampler",
+    "LengthBucketSampler",
+    "InfiniteDataLoader",
+    "cycle_batches",
+]
+
+
+# ---------------------------------------------------------------------------
+# Functional Dataset Pipeline Combinators & Advanced Samplers
+# ---------------------------------------------------------------------------
+
+def _normalize_index(idx: int, length: int, cls_name: str) -> int:
+    if idx < 0:
+        idx += length
+    if idx < 0 or idx >= length:
+        raise IndexError(f"{cls_name} index {idx} out of range for length {length}")
+    return idx
+
+
+class MappedDataset(Dataset):
+    """Lazily transforms elements of an indexable `Dataset` with `fn`."""
+
+    def __init__(self, dataset: Dataset, fn: Callable[[Any], Any]) -> None:
+        self.dataset = dataset
+        self.fn = fn
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Any:
+        idx = _normalize_index(index, len(self.dataset), "MappedDataset")
+        return self.fn(self.dataset[idx])
+
+
+class _MappedIterableDataset(IterableDataset):
+    def __init__(self, dataset: IterableDataset, fn: Callable[[Any], Any]) -> None:
+        self.dataset = dataset
+        self.fn = fn
+
+    def __iter__(self) -> Iterator[Any]:
+        for item in self.dataset:
+            yield self.fn(item)
+
+
+class FilteredDataset(IterableDataset):
+    """Lazily yields elements from `dataset` for which `predicate(element)` is truthy."""
+
+    def __init__(self, dataset: Dataset, predicate: Callable[[Any], bool]) -> None:
+        self.dataset = dataset
+        self.predicate = predicate
+
+    def __iter__(self) -> Iterator[Any]:
+        for item in self.dataset:
+            if self.predicate(item):
+                yield item
+
+    def collect(self) -> List[Any]:
+        """Materializes all filtered elements into a Python list."""
+        return list(self)
+
+
+class CachedDataset(Dataset):
+    """Memoizes elements of an indexable `Dataset` in memory upon first access."""
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+        self._cache: dict = {}
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> Any:
+        idx = _normalize_index(index, len(self.dataset), "CachedDataset")
+        if idx not in self._cache:
+            self._cache[idx] = self.dataset[idx]
+        return self._cache[idx]
+
+    def clear_cache(self) -> None:
+        """Clears all cached items."""
+        self._cache.clear()
+
+
+class _CachedIterableDataset(IterableDataset):
+    def __init__(self, dataset: IterableDataset) -> None:
+        self.dataset = dataset
+        self._items: Optional[List[Any]] = None
+
+    def __iter__(self) -> Iterator[Any]:
+        if self._items is None:
+            buf: List[Any] = []
+            for item in self.dataset:
+                buf.append(item)
+                yield item
+            self._items = buf
+        else:
+            for item in self._items:
+                yield item
+
+
+class RepeatedDataset(Dataset):
+    """Repeats an indexable `Dataset` `count` times sequentially."""
+
+    def __init__(self, dataset: Dataset, count: int = 1) -> None:
+        if count < 0:
+            raise ValueError(f"RepeatedDataset requires count >= 0, got {count}")
+        self.dataset = dataset
+        self.count = int(count)
+
+    def __len__(self) -> int:
+        return len(self.dataset) * self.count
+
+    def __getitem__(self, index: int) -> Any:
+        total = len(self)
+        idx = _normalize_index(index, total, "RepeatedDataset")
+        base_len = len(self.dataset)
+        return self.dataset[idx % base_len]
+
+
+class _RepeatedIterableDataset(IterableDataset):
+    def __init__(self, dataset: Dataset, count: Optional[int] = None) -> None:
+        if count is not None and count < 0:
+            raise ValueError(f"repeat count must be >= 0 or None, got {count}")
+        self.dataset = dataset
+        self.count = count
+
+    def __iter__(self) -> Iterator[Any]:
+        if self.count is None:
+            while True:
+                yielded = False
+                for item in self.dataset:
+                    yielded = True
+                    yield item
+                if not yielded:
+                    return
+        else:
+            for _ in range(self.count):
+                for item in self.dataset:
+                    yield item
+
+
+class TakenDataset(Dataset):
+    """Exposes at most the first `count` items of an indexable `Dataset`."""
+
+    def __init__(self, dataset: Dataset, count: int) -> None:
+        if count < 0:
+            raise ValueError(f"take count must be >= 0, got {count}")
+        self.dataset = dataset
+        self.count = int(count)
+
+    def __len__(self) -> int:
+        return min(self.count, len(self.dataset))
+
+    def __getitem__(self, index: int) -> Any:
+        idx = _normalize_index(index, len(self), "TakenDataset")
+        return self.dataset[idx]
+
+
+class _TakenIterableDataset(IterableDataset):
+    def __init__(self, dataset: IterableDataset, count: int) -> None:
+        if count < 0:
+            raise ValueError(f"take count must be >= 0, got {count}")
+        self.dataset = dataset
+        self.count = int(count)
+
+    def __iter__(self) -> Iterator[Any]:
+        taken = 0
+        if self.count == 0:
+            return
+        for item in self.dataset:
+            yield item
+            taken += 1
+            if taken >= self.count:
+                return
+
+
+class SkippedDataset(Dataset):
+    """Skips the first `count` items of an indexable `Dataset`."""
+
+    def __init__(self, dataset: Dataset, count: int) -> None:
+        if count < 0:
+            raise ValueError(f"skip count must be >= 0, got {count}")
+        self.dataset = dataset
+        self.count = int(count)
+
+    def __len__(self) -> int:
+        return max(0, len(self.dataset) - self.count)
+
+    def __getitem__(self, index: int) -> Any:
+        idx = _normalize_index(index, len(self), "SkippedDataset")
+        return self.dataset[self.count + idx]
+
+
+class _SkippedIterableDataset(IterableDataset):
+    def __init__(self, dataset: IterableDataset, count: int) -> None:
+        if count < 0:
+            raise ValueError(f"skip count must be >= 0, got {count}")
+        self.dataset = dataset
+        self.count = int(count)
+
+    def __iter__(self) -> Iterator[Any]:
+        skipped = 0
+        for item in self.dataset:
+            if skipped < self.count:
+                skipped += 1
+                continue
+            yield item
+
+
+class WindowedDataset(Dataset):
+    """Groups elements of an indexable `Dataset` into sliding windows of `size` elements."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        size: int,
+        shift: Optional[int] = None,
+        stride: int = 1,
+        drop_remainder: bool = True,
+        collate_fn: Optional[Callable[[List[Any]], Any]] = None,
+    ) -> None:
+        if size <= 0:
+            raise ValueError(f"window size must be > 0, got {size}")
+        if stride <= 0:
+            raise ValueError(f"window stride must be > 0, got {stride}")
+        step = size if shift is None else int(shift)
+        if step <= 0:
+            raise ValueError(f"window shift must be > 0, got {step}")
+        self.dataset = dataset
+        self.size = int(size)
+        self.shift = step
+        self.stride = int(stride)
+        self.drop_remainder = bool(drop_remainder)
+        self.collate_fn = default_collate if collate_fn is None else collate_fn
+
+        n = len(dataset)
+        span = (self.size - 1) * self.stride + 1
+        starts: List[int] = []
+        pos = 0
+        while pos < n:
+            if pos + span <= n:
+                starts.append(pos)
+            elif not self.drop_remainder:
+                starts.append(pos)
+            else:
+                break
+            pos += self.shift
+        self._starts = starts
+
+    def __len__(self) -> int:
+        return len(self._starts)
+
+    def __getitem__(self, index: int) -> Any:
+        idx = _normalize_index(index, len(self._starts), "WindowedDataset")
+        start = self._starts[idx]
+        n = len(self.dataset)
+        items = [
+            self.dataset[pos]
+            for pos in range(start, min(n, start + self.size * self.stride), self.stride)
+        ]
+        return self.collate_fn(items)
+
+
+class _WindowedIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        size: int,
+        shift: Optional[int] = None,
+        stride: int = 1,
+        drop_remainder: bool = True,
+        collate_fn: Optional[Callable[[List[Any]], Any]] = None,
+    ) -> None:
+        if size <= 0 or stride <= 0:
+            raise ValueError("window size and stride must be > 0")
+        step = size if shift is None else int(shift)
+        if step <= 0:
+            raise ValueError("window shift must be > 0")
+        self.dataset = dataset
+        self.size = int(size)
+        self.shift = step
+        self.stride = int(stride)
+        self.drop_remainder = bool(drop_remainder)
+        self.collate_fn = default_collate if collate_fn is None else collate_fn
+
+    def __iter__(self) -> Iterator[Any]:
+        span = (self.size - 1) * self.stride + 1
+        buf: List[Any] = []
+        skip_to_next = 0
+        for item in self.dataset:
+            if skip_to_next > 0:
+                skip_to_next -= 1
+                continue
+            buf.append(item)
+            if len(buf) == span:
+                win = buf[:: self.stride][: self.size]
+                yield self.collate_fn(win)
+                if self.shift >= span:
+                    skip_to_next = self.shift - span
+                    buf.clear()
+                else:
+                    buf = buf[self.shift :]
+        while buf and not self.drop_remainder:
+            win = buf[:: self.stride][: self.size]
+            if win:
+                yield self.collate_fn(win)
+            if self.shift >= len(buf):
+                break
+            buf = buf[self.shift :]
+
+
+def padded_collate(
+    pad_value: float = 0.0,
+    padding_side: str = "right",
+) -> Callable[[List[Any]], Any]:
+    """Returns a `collate_fn` that pads variable-length 1D+ tensors along axis 0 while collating nested structures."""
+    if padding_side not in ("right", "left"):
+        raise ValueError(f"padding_side must be 'right' or 'left', got {padding_side!r}")
+
+    def _collate(batch: List[Any]) -> Any:
+        if not batch:
+            return batch
+        elem = batch[0]
+        if isinstance(elem, Tensor):
+            shapes = [tuple(t.shape) for t in batch]
+            if all(s == shapes[0] for s in shapes):
+                return stack(batch, dim=0)
+            if any(len(s) == 0 for s in shapes):
+                raise ValueError("padded_collate cannot mix scalar (0-D) and sequence tensors")
+            tail = shapes[0][1:]
+            if any(s[1:] != tail for s in shapes):
+                raise ValueError(f"padded_collate requires matching trailing dimensions, got {shapes}")
+            from .rnn_utils import pad_sequence
+            return pad_sequence(batch, batch_first=True, padding_value=pad_value, padding_side=padding_side)
+        if isinstance(elem, tuple) and hasattr(elem, "_fields"):
+            return type(elem)(*(_collate(list(samples)) for samples in zip(*batch)))
+        if isinstance(elem, (tuple, list)):
+            return type(elem)(_collate(list(samples)) for samples in zip(*batch))
+        if isinstance(elem, dict):
+            return {k: _collate([d[k] for d in batch]) for k in elem}
+        return default_collate(batch)
+
+    return _collate
+
+
+def stratified_split(
+    dataset: Dataset,
+    labels: Union[Tensor, Sequence[Any]],
+    lengths: Sequence[Union[int, float]],
+    seed: Optional[int] = None,
+) -> List[Subset]:
+    """Splits `dataset` into non-overlapping `Subset`s preserving per-class proportions across splits."""
+    total_len = len(dataset)
+    if isinstance(labels, Tensor):
+        y_list = labels.to_numpy().reshape(-1).tolist()
+    else:
+        y_list = np.asarray(labels).reshape(-1).tolist()
+
+    if len(y_list) != total_len:
+        raise ValueError(f"labels length ({len(y_list)}) must match dataset length ({total_len})")
+    if len(lengths) == 0:
+        raise ValueError("lengths must be non-empty")
+
+    if all(isinstance(x, float) for x in lengths) and math.isclose(sum(lengths), 1.0, rel_tol=1e-5, abs_tol=1e-5):
+        proportions = [float(x) for x in lengths]
+        target_totals = [int(round(p * total_len)) for p in proportions]
+        target_totals[-1] = total_len - sum(target_totals[:-1])
+    else:
+        target_totals = [int(x) for x in lengths]
+        if sum(target_totals) != total_len:
+            raise ValueError(
+                f"Sum of split lengths ({sum(target_totals)}) does not equal dataset length ({total_len})"
+            )
+        proportions = [t / max(total_len, 1) for t in target_totals]
+
+    rng = random.Random(seed) if seed is not None else random.Random()
+    by_class: dict = {}
+    for idx, cls in enumerate(y_list):
+        by_class.setdefault(cls, []).append(idx)
+    for cls_indices in by_class.values():
+        rng.shuffle(cls_indices)
+
+    k = len(target_totals)
+    split_buckets: List[List[int]] = [[] for _ in range(k)]
+
+    # Allocate integer floors per class first, then distribute remainders by largest fractional part
+    # while respecting exact `target_totals` capacities.
+    remainders: List[Tuple[int, List[Tuple[float, int]]]] = []
+    for cls, cls_indices in by_class.items():
+        m = len(cls_indices)
+        exact = [p * m for p in proportions]
+        floors = [int(math.floor(v)) for v in exact]
+        offset = 0
+        for s_idx, cnt in enumerate(floors):
+            split_buckets[s_idx].extend(cls_indices[offset : offset + cnt])
+            offset += cnt
+        leftover = cls_indices[offset:]
+        frac_order = sorted(((exact[i] - floors[i], i) for i in range(k)), reverse=True)
+        for rem_idx in leftover:
+            remainders.append((rem_idx, frac_order))
+
+    rng.shuffle(remainders)
+    for sample_idx, pref_splits in remainders:
+        placed = False
+        for _, s_idx in pref_splits:
+            if len(split_buckets[s_idx]) < target_totals[s_idx]:
+                split_buckets[s_idx].append(sample_idx)
+                placed = True
+                break
+        if not placed:
+            for s_idx in range(k):
+                if len(split_buckets[s_idx]) < target_totals[s_idx]:
+                    split_buckets[s_idx].append(sample_idx)
+                    break
+
+    for bucket in split_buckets:
+        rng.shuffle(bucket)
+
+    return [Subset(dataset, bucket) for bucket in split_buckets]
+
+
+class BalancedClassSampler(Sampler):
+    """Samples an equal number of indices from every class per epoch (oversampling minority classes by default)."""
+
+    def __init__(
+        self,
+        labels: Union[Tensor, Sequence[Any]],
+        samples_per_class: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> None:
+        super().__init__(None)
+        if isinstance(labels, Tensor):
+            y_list = labels.to_numpy().reshape(-1).tolist()
+        else:
+            y_list = np.asarray(labels).reshape(-1).tolist()
+        if not y_list:
+            raise ValueError("BalancedClassSampler requires at least one label")
+
+        groups: dict = {}
+        for idx, cls in enumerate(y_list):
+            groups.setdefault(cls, []).append(idx)
+        self._class_groups: List[List[int]] = [groups[c] for c in sorted(groups.keys(), key=str)]
+        max_cnt = max(len(g) for g in self._class_groups)
+        spc = max_cnt if samples_per_class is None else int(samples_per_class)
+        if spc <= 0:
+            raise ValueError(f"samples_per_class must be > 0, got {spc}")
+        self.samples_per_class = spc
+        self.seed = seed
+        self._rng = random.Random(seed) if seed is not None else random.Random()
+
+    def __len__(self) -> int:
+        return self.samples_per_class * len(self._class_groups)
+
+    def __iter__(self) -> Iterator[int]:
+        chosen: List[int] = []
+        for grp in self._class_groups:
+            if len(grp) >= self.samples_per_class:
+                picked = self._rng.sample(grp, self.samples_per_class)
+            else:
+                picked = list(grp) + [self._rng.choice(grp) for _ in range(self.samples_per_class - len(grp))]
+            chosen.extend(picked)
+        self._rng.shuffle(chosen)
+        return iter(chosen)
+
+
+class LengthBucketSampler(Sampler):
+    """Batch sampler grouping sequences of similar length into mini-batches to minimize padding overhead."""
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        batch_size: int,
+        drop_last: bool = False,
+        bucket_pool_multiplier: int = 25,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+    ) -> None:
+        super().__init__(None)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}")
+        if bucket_pool_multiplier <= 0:
+            raise ValueError(f"bucket_pool_multiplier must be > 0, got {bucket_pool_multiplier}")
+        self.lengths = [int(x) for x in lengths]
+        self.batch_size = int(batch_size)
+        self.drop_last = bool(drop_last)
+        self.bucket_pool_multiplier = int(bucket_pool_multiplier)
+        self.shuffle = bool(shuffle)
+        self.seed = seed
+        self._rng = random.Random(seed) if seed is not None else random.Random()
+
+    def __len__(self) -> int:
+        n = len(self.lengths)
+        return (n // self.batch_size) if self.drop_last else math.ceil(n / self.batch_size)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        n = len(self.lengths)
+        indices = list(range(n))
+        if self.shuffle:
+            self._rng.shuffle(indices)
+
+        pool_size = self.batch_size * self.bucket_pool_multiplier
+        batches: List[List[int]] = []
+        for p_start in range(0, n, pool_size):
+            pool = indices[p_start : p_start + pool_size]
+            pool.sort(key=lambda i: self.lengths[i])
+            for b_start in range(0, len(pool), self.batch_size):
+                batch = pool[b_start : b_start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+
+        if self.shuffle:
+            self._rng.shuffle(batches)
+        return iter(batches)
+
+
+class InfiniteDataLoader:
+    """Wraps a `DataLoader` (or any non-empty iterable) as a repeatable endless stream of batches."""
+
+    def __init__(self, loader: Any) -> None:
+        self.loader = loader
+        self.epoch = 0
+
+    def __iter__(self) -> Iterator[Any]:
+        while True:
+            sampler = getattr(self.loader, "sampler", None)
+            if hasattr(sampler, "set_epoch") and callable(sampler.set_epoch):
+                sampler.set_epoch(self.epoch)
+            yielded = False
+            for batch in self.loader:
+                yielded = True
+                yield batch
+            if not yielded:
+                return
+            self.epoch += 1
+
+
+def cycle_batches(loader: Any) -> Iterator[Any]:
+    """Yields batches endlessly from `loader`, automatically restarting epochs when exhausted."""
+    return iter(InfiniteDataLoader(loader))

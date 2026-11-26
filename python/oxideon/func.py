@@ -1,7 +1,4 @@
-"""High-level functional programming transforms for Oxideon (vmap, grad, value_and_grad, jacrev, jacfwd, hessian).
-
-Compatible with standard functorch and PyTorch 2.0 functional transforms.
-"""
+"""High-level functional programming transforms for Oxideon (vmap, grad, value_and_grad, jacrev, jacfwd, hessian, functional_call)."""
 
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import functools
