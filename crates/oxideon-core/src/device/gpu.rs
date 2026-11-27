@@ -93,7 +93,6 @@ impl GpuDescriptor {
                 #[cfg(not(feature = "wgpu"))]
                 {
                     // No wgpu runtime: memory lives on the host, so report Cpu
-                    // rather than a CUDA device that does not exist.
                     Device::Cpu
                 }
             }

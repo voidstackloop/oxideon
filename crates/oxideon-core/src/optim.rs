@@ -202,6 +202,16 @@ impl Sgd {
         self.weight_decay = weight_decay;
         self
     }
+
+    /// Changes the hyper-parameters of a running optimizer (what `param_groups[i][key] = value` does in PyTorch);
+    /// momentum buffers are kept.
+    pub fn set_hyper(&mut self, momentum: f64, dampening: f64, weight_decay: f64, nesterov: bool, maximize: bool) {
+        self.momentum = momentum;
+        self.dampening = dampening;
+        self.weight_decay = weight_decay;
+        self.nesterov = nesterov;
+        self.maximize = maximize;
+    }
 }
 
 impl Optimizer for Sgd {
@@ -337,6 +347,17 @@ impl Adam {
     pub fn weight_decay(mut self, wd: f64) -> Self {
         self.weight_decay = wd;
         self
+    }
+
+    /// Changes the hyper-parameters of a running optimizer (what `param_groups[i][key] = value` does in PyTorch);
+    /// the moment estimates and step counters are kept.
+    pub fn set_hyper(&mut self, betas: (f64, f64), eps: f64, weight_decay: f64, amsgrad: bool, maximize: bool) {
+        self.beta1 = betas.0;
+        self.beta2 = betas.1;
+        self.eps = eps;
+        self.weight_decay = weight_decay;
+        self.amsgrad = amsgrad;
+        self.maximize = maximize;
     }
 }
 

@@ -119,6 +119,7 @@ pub mod special_ext;
 pub mod serialize;
 pub mod serving;
 pub mod signal;
+pub mod voice;
 pub mod sparse;
 pub mod structured;
 pub mod checkpoint;

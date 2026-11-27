@@ -1827,11 +1827,12 @@ def where(
         if isinstance(v, _Tensor):
             return v
         if ref is None:
-            return tensor(v)
+            return tensor(v).to(cond.device) if str(cond.device) != "cpu" else tensor(v)
         # a Python number takes the other operand's dtype (a float on an integer tensor gives float32, like PyTorch)
         floaty = ref.dtype in ("f16", "bf16", "f32", "f64")
         dt = ref.dtype if (floaty or not isinstance(v, float)) else "f32"
-        return tensor(v, dtype=dt)
+        t = tensor(v, dtype=dt)
+        return t.to(ref.device) if str(ref.device) != "cpu" else t
     return _native_where(cond, operand(x), operand(y))
 
 def roll(input: _Tensor, shifts: Union[int, Sequence[int]], dims: Optional[Union[int, Sequence[int]]] = None) -> _Tensor:
@@ -3256,6 +3257,7 @@ def _patch_tensor():
     def _to(self, *args, **kwargs):
         target_dev = None
         target_dt = None
+        exact = None  # a native Device handle (or another tensor's device) is used as is: "cuda:0" must not become wgpu
         if len(args) == 1:
             a = args[0]
             if isinstance(a, dtype) or (isinstance(a, str) and a in _DTYPE_TO_STR):
@@ -3264,10 +3266,13 @@ def _patch_tensor():
                 target_dt = _normalize_dtype(np.dtype(a).name)
             elif isinstance(a, _Tensor):
                 target_dev = _normalize_device(a.device)
+                exact = a.device
                 target_dt = a.dtype
             elif isinstance(a, (device, str)) or isinstance(getattr(a, "type", None), str):
                 # str, python device, or native Device handle (Tensor.device).
                 target_dev = _normalize_device(a)
+                if not isinstance(a, (device, str)):
+                    exact = a
             else:
                 raise TypeError(
                     f"to() received an invalid argument of type {type(a).__name__}; "
@@ -3285,7 +3290,10 @@ def _patch_tensor():
         res = self
         if target_dt is not None and target_dt != self.dtype:
             res = res.to_dtype(target_dt)
-        if target_dev is not None and target_dev != _normalize_device(self.device):
+        if exact is not None and "device" not in kwargs:
+            if str(exact) != str(self.device):
+                res = res.to_device(exact)
+        elif target_dev is not None and target_dev != _normalize_device(self.device):
             res = res.to_device(target_dev)
         return res
     _Tensor.to = _to
@@ -3613,6 +3621,9 @@ def _patch_tensor():
         retain_graph: Optional[bool] = None,
         create_graph: bool = False,
     ) -> None:
+        # retain_graph=False (explicitly) frees the graph as backward walks it, as in PyTorch; left unset, the graph is kept
+        # (oxideon's historical behaviour, which code that runs backward twice relies on)
+        release = retain_graph is False and not create_graph
         if gradient is None:
             gradient = ones_like(self) if self.numel() > 1 else ones([1], dtype=self.dtype, device=self.device)
 
@@ -3630,12 +3641,12 @@ def _patch_tensor():
             if create_graph and hasattr(vjp_target, "backward_create_graph"):
                 vjp_target.backward_create_graph()
             else:
-                orig_backward(vjp_target)
+                orig_backward(vjp_target, release=True) if release else orig_backward(vjp_target)
         else:
             if create_graph and hasattr(self, "backward_create_graph"):
                 self.backward_create_graph()
             else:
-                orig_backward(self)
+                orig_backward(self, release=True) if release else orig_backward(self)
 
         # 3. Fire registered backward hooks on self
         if id(self) in _TENSOR_HOOKS_MAP:

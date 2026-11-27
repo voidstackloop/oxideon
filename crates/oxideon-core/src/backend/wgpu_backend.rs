@@ -817,6 +817,34 @@ impl WgpuStorage {
         Ok(Some(Self::from_buffer(out, numel, &t.device)))
     }
 
+    /// Softmax or log-softmax over the last axis of an `F32` tensor, one workgroup per row, without leaving the device
+    /// (the composed max / exp / sum / div path needs a host readback per call). Rows whose maximum is not finite follow the
+    /// IEEE result (NaN), as PyTorch. `None` for other dtypes and shapes the grid does not cover.
+    pub fn softmax_last_axis(&self, layout: &Layout, log: bool) -> Result<Option<Self>> {
+        let shape = layout.shape();
+        let (Some(&n), true) = (shape.last(), self.dtype == DType::F32) else {
+            return Ok(None);
+        };
+        let total = layout.numel();
+        if n == 0 || total == 0 || !self.device.fits_grid(total / n, 1) {
+            return Ok(None);
+        }
+        let rows = total / n;
+        let src = self.to_contiguous(layout)?;
+        self.device.check_bytes("GPU tensor", total as u64 * 4)?;
+        let out = self.device.out_buffer(total);
+        let params = [rows as u32, n as u32, log as u32, 0u32];
+        let groups = self.device.grid_1d(rows, 1);
+        self.device
+            .dispatch_wgsl(SOFTMAX_WGSL, &[&src.buffer, &out], Some(bytemuck::bytes_of(&params)), groups)?;
+        Ok(Some(Self {
+            buffer: Arc::new(out),
+            len: total,
+            dtype: DType::F32,
+            device: self.device.clone(),
+        }))
+    }
+
     pub fn reduce_op(&self, layout: &Layout, axes: &[usize], op: ReduceOp) -> Result<Self> {
         if self.dtype == DType::F32 {
             if let Some(out) = self.reduce_on_device(layout, axes, op)? {
@@ -1233,6 +1261,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// One pass of a row reduction: workgroup `w` reduces chunk `w % splits` of row `w / splits` of an `[outer, inner]` buffer
 /// and writes one value to `dst[w]`. Each thread folds a strided share of the chunk, then a shared-memory tree combines them.
 /// op: 0 sum, 1 max, 2 min, 3 prod; `scale` multiplies the result (the mean's 1/n on the last pass).
+const SOFTMAX_WGSL: &str = r#"
+struct P { rows: u32, n: u32, log: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<uniform> p: P;
+var<workgroup> sh: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let row = wg.y * nw.x + wg.x;
+    let base = row * p.n;
+    var m = -3.0e38;
+    for (var i = li; i < p.n; i += 256u) {
+        m = max(m, x[base + i]);
+    }
+    sh[li] = m;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (li < s) {
+            sh[li] = max(sh[li], sh[li + s]);
+        }
+        workgroupBarrier();
+    }
+    let mx = sh[0];
+    workgroupBarrier();
+    var acc = 0.0;
+    for (var i = li; i < p.n; i += 256u) {
+        acc += exp(x[base + i] - mx);
+    }
+    sh[li] = acc;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (li < s) {
+            sh[li] = sh[li] + sh[li + s];
+        }
+        workgroupBarrier();
+    }
+    let total = sh[0];
+    let lse = log(total);
+    for (var i = li; i < p.n; i += 256u) {
+        let v = x[base + i] - mx;
+        if (p.log == 1u) {
+            y[base + i] = v - lse;
+        } else {
+            y[base + i] = exp(v) / total;
+        }
+    }
+}
+"#;
+
 const REDUCE_WGSL: &str = r#"
 struct Params {
     outer: u32,

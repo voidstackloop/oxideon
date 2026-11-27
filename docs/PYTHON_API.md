@@ -1,7 +1,7 @@
 # Oxideon Python API Reference Manual
 
 **Package:** `oxideon`  
-**Version:** `0.1.0`  
+**Version:** `0.1.1`  
 **Python Compatibility:** Python $\ge 3.9$ (`abi3`)  
 **Public Symbols:** 2,996 public symbols (5,946 typed signatures)
 
@@ -31,7 +31,8 @@
 21. [Tensor Utilities (`ox.tensor_utils`)](#21-tensor-utilities-oxtensor_utils)
 22. [Model & Training Diagnostics (`ox.diagnostics`)](#22-model--training-diagnostics-oxdiagnostics)
 23. [Extended Operators & Modules (functional, linalg, special, fft, nn, optim, data)](#23-extended-operators--modules)
-24. [Workflow, Tree-Mapping, Parameterization & Vision Utilities (`ox.utils`, `ox.treemap`, `ox.vision.utils`)](#24-workflow-tree-mapping-parameterization--vision-utilities)
+24. [Reasoning toolkit (`ox.reasoning`)](#24-reasoning-toolkit-oxreasoning)
+25. [Workflow, Tree-Mapping, Parameterization & Vision Utilities (`ox.utils`, `ox.treemap`, `ox.vision.utils`)](#25-workflow-tree-mapping-parameterization--vision-utilities)
 
 ---
 
@@ -776,9 +777,44 @@ Extended operators, factorizations, special functions, layers, optimizers, and s
 - **`ox.optim.SparseAdam`:** lazy Adam for embedding tables (only rows with a non-zero gradient are updated).
 - **`ox.data`:** `DistributedSampler` (with `set_epoch`) and `StackDataset`.
 
+
+## 24. Reasoning toolkit (`ox.reasoning`)
+
+Model-agnostic: a model is a function `step_fn(token_ids) -> next-token logits` (tensor or array). `causal_lm_step(model)` adapts an
+`ox.CausalLM`. Every sampling decision is seedable; the engine gives sample `i` the seed `seed + i`.
+
+```python
+from oxideon import reasoning as R
+step = R.causal_lm_step(model)
+cfg = R.GenerationConfig(max_new_tokens=64, stop_token_ids=(eos,),
+                         sampler=R.SamplerConfig(temperature=0.7, top_p=0.95, min_p=0.02, repetition_penalty=1.1, seed=0))
+out = R.generate_tokens(step, prompt_ids, cfg)          # out.token_ids, out.logprobs, out.entropies, out.finish_reason
+```
+
+- **Sampling** - `SamplerConfig(temperature, top_k, top_p, min_p, repetition_penalty, presence_penalty, frequency_penalty, logit_bias,
+  seed, greedy)` and `TokenSampler(config, engine="native")`. `.sample()` runs on the Rust sampler (`Tensor.sample_token`);
+  `.process()` / `.probs()` return the filtered logits / distribution (all controls applied; `engine="python"` draws from it).
+- **Generation engine** - `generate_tokens`, `stream_generate` (yields `(token, logprob)`), `generate_batch`: stop tokens and stop strings,
+  `min_new_tokens` / `max_new_tokens`, per-token log-probabilities and entropies, `finish_reason` (`stop` / `stop_string` / `length`).
+- **Reasoning decoding** - `generate_with_reasoning(...)` decodes `<think> ... </think> answer`: `max_think_tokens` closes a runaway
+  thought by force, `min_think_tokens` + `wait_ids` + `max_extensions` re-open one that closes too early (budget forcing), and
+  `think_sampler` lets thinking use different sampling than the answer. Returns a `ReasoningTrace`.
+- **Search and test-time compute** - `beam_search` (length penalty, EOS, `num_return`), `mcts` (PUCT; `MCTSChild(state, prior)` for
+  guided expansion), `tree_of_thoughts`, `best_of_n`, `self_consistency`, `adaptive_self_consistency` (Bayesian early stopping:
+  easy questions use `min_samples`, hard ones `max_samples`), `self_refine`.
+- **Answers and rewards** - `extract_boxed`, `extract_final_answer`, `normalize_final_answer`, `answers_match` (numeric-aware: fractions,
+  percents, thousands separators), `split_reasoning`, `reasoning_reward`, `combine_rewards`, `overlong_penalty`.
+- **RL (GRPO)** - `sequence_logprobs`, `group_advantages`, `grpo_policy_loss` (clipped surrogate + k3 KL; `normalize="sequence" | "token" |
+  "constant"`), `collect_group` (rollouts + rewards + advantages). `tests/test_reasoning_engine.py` trains a policy with these and
+  checks that the reward rises.
+- **`ReasoningEngine`** - `solve(prompt)` thinks under a budget, votes over up to `max_samples` samples with early stopping and an
+  optional `max_total_tokens` budget, and returns a `ReasoningResult` (answer, confidence, votes, traces, token count).
+
+A `TokenSampler` owns a random stream: use one per thread / sample.
+
 ---
 
-## 24. Workflow, Tree-Mapping, Parameterization & Vision Utilities
+## 25. Workflow, Tree-Mapping, Parameterization & Vision Utilities
 
 Oxideon provides a comprehensive, zero-external-dependency suite of training, nested-tree, parameterization, data-pipeline, checkpointing, profiling, testing, and computer-vision utilities across `ox.utils`, `ox.nn.utils`, `ox.treemap`, `ox.data`, `ox.serialization`, `ox.testing`, and `ox.vision.utils`.
 
@@ -804,3 +840,4 @@ flops = ox.count_flops(layer, scaled["inputs"])
 - **Checkpointing, Config Registry & EMA (`ox.utils`, `ox.serialization`)** - `save_sharded` and `load_sharded` (multi-file `.safetensors` sharding with `.safetensors.index.json` manifests), `CheckpointVault` (rotating directory checkpoints with `max_to_keep`), `ShadowWeightEMA` (`average_parameters()` evaluation swap), `fetch_artifact` and `verify_checksum` (SHA-256/MD5 verification and path-safe archive extraction), `SerializationScope` / `serialization_scope`, `register_serializable`, `serialize_config`, and `deserialize_config`.
 - **Profiling, Memory Footprint, Architecture Graphs, Hooks & Numerical Checks (`ox.utils`, `ox.testing`, `ox.profiler`)** - `FlopProfiler` and `count_flops` (`ox.utils.flops`), `MemoryFootprint` and `estimate_memory_footprint`, `MicroTimer` / `TimingReport` / `TimingComparison` (`ox.utils.timing`), `collect_runtime_info` / `format_runtime_info` (`ox.utils.sysinfo`), `HookHandle` and `ephemeral_hook` (`ox.utils.hooks`), `model_to_dot` and `model_to_mermaid` (`ox.utils.graph_viz`), `chrome_trace_handler`, `ProgressBar`, `SummaryWriter` (`add_scalar`, `add_scalars`, `add_histogram`, `add_image`, `add_images`, `add_hparams`, `add_graph`), `gradcheck`, `gradgradcheck`, `assert_finite`, and `assert_shapes`.
 - **Vision Annotation & Image Grids (`ox.vision.utils`)** - `image_grid`, `save_image` (pure-Python PNG encoder writing to paths or binary streams), `draw_bounding_boxes` (with built-in bitmap font labels), `draw_segmentation_masks`, and `draw_keypoints` (with visibility flags and skeleton `connectivity`).
+

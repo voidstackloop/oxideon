@@ -23,13 +23,13 @@ from . import (
     Tensor as _Tensor,
     Linear,
     SpectralNormLinear,
-    Conv2d,
-    Conv3d,
+    Conv2d as _NativeConv2d,
+    Conv3d as _NativeConv3d,
     ConvLstmCell,
     Dropout,
     DropPath,
     Embedding,
-    LayerNorm,
+    LayerNorm as _NativeLayerNorm,
     Maxout,
     Snake,
     Swish,
@@ -414,6 +414,55 @@ class Module:
     def eval(self):
         """Sets the module in evaluation mode."""
         return self.train(False)
+
+    def requires_grad_(self, requires_grad: bool = True):
+        """Changes whether autograd records operations on this module's parameters; returns self."""
+        for p in self.parameters():
+            p.requires_grad_(requires_grad)
+        return self
+
+    def _cast(self, dtype: str):
+        for m in self.modules():
+            if isinstance(m, Module):
+                for name, p in list(m._parameters.items()):
+                    if p is not None and p.dtype != dtype:
+                        q = Parameter(p.detach().to_dtype(dtype))
+                        q.requires_grad_(p.requires_grad)
+                        m._parameters[name] = q
+                        if name in m.__dict__:
+                            m.__dict__[name] = q
+                for name, b in list(m._buffers.items()):
+                    if isinstance(b, _Tensor) and b.dtype in ("f16", "bf16", "f32", "f64") and b.dtype != dtype:
+                        m._buffers[name] = b.to_dtype(dtype)
+        return self
+
+    def float(self):
+        """Casts the floating-point parameters and buffers of Python modules to float32 (native layers stay float32)."""
+        return self._cast("f32")
+
+    def double(self):
+        """Casts the floating-point parameters and buffers of Python modules to float64 (native layers stay float32)."""
+        return self._cast("f64")
+
+    def half(self):
+        """Casts the floating-point parameters and buffers of Python modules to float16 (native layers stay float32)."""
+        return self._cast("f16")
+
+    def get_submodule(self, target: str):
+        """Returns the submodule at the dotted path `target` ('' is the module itself)."""
+        mod = self
+        for part in [t for t in target.split(".") if t]:
+            mod = dict(mod.named_children()).get(part) if not hasattr(mod, part) else getattr(mod, part)
+            if mod is None:
+                raise AttributeError(f"no submodule {target!r}")
+        return mod
+
+    def get_parameter(self, target: str):
+        """Returns the parameter at the dotted path `target`."""
+        for name, p in self.named_parameters():
+            if name == target:
+                return p
+        raise AttributeError(f"no parameter {target!r}")
 
     def zero_grad(self, set_to_none=False):
         """Sets gradients of all model parameters to zero (or None with `set_to_none`)."""
@@ -1265,6 +1314,25 @@ class Unflatten(Module):
         return F.unflatten(input, self.dim, self.unflattened_size)
 
 
+class LayerNorm(Module):
+    """Layer normalisation over the last `len(normalized_shape)` dimensions."""
+    def __init__(self, normalized_shape, eps: float = 1e-5, elementwise_affine: bool = True, bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.normalized_shape = (int(normalized_shape),) if isinstance(normalized_shape, (int, np.integer)) else tuple(int(v) for v in normalized_shape)
+        if not self.normalized_shape or any(d <= 0 for d in self.normalized_shape):
+            raise ValueError(f"LayerNorm: normalized_shape must be positive integers, got {normalized_shape!r}")
+        self.eps, self.elementwise_affine = eps, elementwise_affine
+        if elementwise_affine:
+            self.weight = Parameter(_Tensor.ones(list(self.normalized_shape)))
+            self.bias = Parameter(_Tensor.zeros(list(self.normalized_shape))) if bias else None
+        else:
+            self.weight = None
+            self.bias = None
+
+    def forward(self, input):
+        return functional.layer_norm(input, self.normalized_shape, self.weight, self.bias, self.eps)
+
+
 class GELU(Module):
     """Gaussian Error Linear Units activation function."""
     def __init__(self, approximate: str = "none"):
@@ -1348,10 +1416,39 @@ class Softmax2d(Module):
 
 
 class Softplus(Module):
-    """Applies element-wise Softplus: ln(1 + exp(x))."""
-    def forward(self, input):
-        return input.softplus()
+    """Applies element-wise Softplus: `1/beta * log(1 + exp(beta * x))` (linear above `threshold`)."""
+    def __init__(self, beta: float = 1.0, threshold: float = 20.0):
+        super().__init__()
+        self.beta, self.threshold = beta, threshold
 
+    def forward(self, input):
+        return functional.softplus(input, self.beta, self.threshold)
+
+
+class Hardshrink(Module):
+    """Hard shrinkage: x where |x| > lambd, else 0."""
+    def __init__(self, lambd: float = 0.5):
+        super().__init__()
+        self.lambd = lambd
+
+    def forward(self, input):
+        return functional.hardshrink(input, self.lambd)
+
+
+class Softshrink(Module):
+    """Soft shrinkage: x - sign(x) * lambd where |x| > lambd, else 0."""
+    def __init__(self, lambd: float = 0.5):
+        super().__init__()
+        self.lambd = lambd
+
+    def forward(self, input):
+        return functional.softshrink(input, self.lambd)
+
+
+class LogSigmoid(Module):
+    """Applies element-wise `log(sigmoid(x))`."""
+    def forward(self, input):
+        return functional.logsigmoid(input)
 
 class Softsign(Module):
     """Applies element-wise Softsign: x / (1 + |x|)."""
@@ -1823,166 +1920,84 @@ def _batch_norm_train_stats(x, num_features):
     return mean.reshape(bshape), var.reshape(bshape), mean_c, var_c
 
 
-class BatchNorm1d(Module):
+class _BatchNormNd(Module):
+    """Batch normalisation with PyTorch's state: `running_mean`, `running_var` and `num_batches_tracked` are buffers (they are in
+    `state_dict()` and move with the module); `momentum=None` uses a cumulative moving average."""
+    _ndims = (2, 3)
+
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: Optional[float] = 0.1, affine: bool = True,
+                 track_running_stats: bool = True, device=None, dtype=None):
+        super().__init__()
+        self.num_features, self.eps, self.momentum = num_features, eps, momentum
+        self.affine, self.track_running_stats = affine, track_running_stats
+        self._init_state(num_features)
+
+    def _init_state(self, n: int) -> None:
+        self.num_features = n
+        if self.affine:
+            self.weight = Parameter(_Tensor.ones([n]))
+            self.bias = Parameter(_Tensor.zeros([n]))
+        else:
+            self.weight = None
+            self.bias = None
+        if self.track_running_stats:
+            self.register_buffer("running_mean", _Tensor.zeros([n]))
+            self.register_buffer("running_var", _Tensor.ones([n]))
+            self.register_buffer("num_batches_tracked", _from_numpy(np.array(0, dtype=np.int64)))
+        else:
+            self.register_buffer("running_mean", None)
+            self.register_buffer("running_var", None)
+            self.register_buffer("num_batches_tracked", None)
+
+    def forward(self, x):
+        if len(x.shape) not in self._ndims:
+            dims = " or ".join(f"{d}D" for d in self._ndims)
+            raise ValueError(f"{type(self).__name__}: expected {dims} input (got {len(x.shape)}D input)")
+        if int(x.shape[1]) != self.num_features:
+            raise RuntimeError(f"{type(self).__name__}: expected {self.num_features} channels, got {int(x.shape[1])}")
+        momentum = self.momentum
+        if self.training and self.track_running_stats:
+            self.num_batches_tracked.assign(self.num_batches_tracked + 1)
+            if momentum is None:
+                momentum = 1.0 / float(self.num_batches_tracked.item())
+        use_batch_stats = self.training or not self.track_running_stats
+        return functional.batch_norm(x, self.running_mean, self.running_var, self.weight, self.bias, use_batch_stats,
+                                     0.1 if momentum is None else momentum, self.eps)
+
+    def extra_repr(self):
+        return f"{self.num_features}, eps={self.eps}, momentum={self.momentum}, affine={self.affine}"
+
+
+class _LazyBatchNormMixin:
+    def __init__(self, eps: float = 1e-5, momentum: Optional[float] = 0.1, affine: bool = True, track_running_stats: bool = True):
+        Module.__init__(self)
+        self.num_features, self.eps, self.momentum = None, eps, momentum
+        self.affine, self.track_running_stats = affine, track_running_stats
+        self.weight = None
+        self.bias = None
+
+    def initialize_parameters(self, input):
+        self._init_state(int(input.shape[1]))
+
+    def forward(self, x):
+        if self.num_features is None:
+            self.initialize_parameters(x)
+        return super().forward(x)
+
+
+class BatchNorm1d(_BatchNormNd):
     """1D Batch Normalization over 2D or 3D input."""
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
-    ):
-        super().__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.momentum = momentum
-        self.affine = affine
-        self.track_running_stats = track_running_stats
+    _ndims = (2, 3)
 
-        if affine:
-            self.weight = Parameter(_Tensor.ones([num_features]))
-            self.bias = Parameter(_Tensor.zeros([num_features]))
-        else:
-            self.weight = None
-            self.bias = None
-
-        if track_running_stats:
-            self.running_mean = np.zeros(num_features, dtype=np.float32)
-            self.running_var = np.ones(num_features, dtype=np.float32)
-        else:
-            self.running_mean = None
-            self.running_var = None
-
-    def forward(self, x):
-        bshape = [1, self.num_features] + [1] * (len(x.shape) - 2)
-        if self.training or not self.track_running_stats:
-            mean_b, var_b, mean_c, uvar_c = _batch_norm_train_stats(x, self.num_features)
-            if self.training and self.track_running_stats:
-                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c
-                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c
-        else:
-            mean_b = _from_numpy(np.ascontiguousarray(self.running_mean.reshape(bshape), dtype=np.float32))
-            var_b = _from_numpy(np.ascontiguousarray(self.running_var.reshape(bshape), dtype=np.float32))
-
-        out = (x - mean_b) / (var_b + self.eps).sqrt()
-        if self.affine:
-            if len(x.shape) == 3:
-                w = self.weight.unsqueeze(-1)
-                b = self.bias.unsqueeze(-1)
-                out = out * w + b
-            else:
-                out = out * self.weight + self.bias
-        return out
-
-
-class BatchNorm2d(Module):
+class BatchNorm2d(_BatchNormNd):
     """2D Batch Normalization over 4D NCHW input."""
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
-    ):
-        super().__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.momentum = momentum
-        self.affine = affine
-        self.track_running_stats = track_running_stats
+    _ndims = (4,)
 
-        if affine:
-            self.weight = Parameter(_Tensor.ones([num_features]))
-            self.bias = Parameter(_Tensor.zeros([num_features]))
-        else:
-            self.weight = None
-            self.bias = None
-
-        if track_running_stats:
-            self.running_mean = np.zeros(num_features, dtype=np.float32)
-            self.running_var = np.ones(num_features, dtype=np.float32)
-        else:
-            self.running_mean = None
-            self.running_var = None
-
-    def forward(self, x):
-        bshape = (1, self.num_features, 1, 1)
-        if self.training or not self.track_running_stats:
-            mean_b, var_b, mean_c, uvar_c = _batch_norm_train_stats(x, self.num_features)
-            if self.training and self.track_running_stats:
-                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(self.num_features)
-                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(self.num_features)
-        else:
-            mean_b = _from_numpy(np.ascontiguousarray(self.running_mean.reshape(bshape), dtype=np.float32))
-            var_b = _from_numpy(np.ascontiguousarray(self.running_var.reshape(bshape), dtype=np.float32))
-
-        out = (x - mean_b) / (var_b + self.eps).sqrt()
-        if self.affine:
-            out = out * self.weight.reshape(list(bshape)) + self.bias.reshape(list(bshape))
-        return out
-
-
-class LazyBatchNorm1d(BatchNorm1d):
+class LazyBatchNorm1d(_LazyBatchNormMixin, BatchNorm1d):
     """1D Batch Normalization with lazy initialization of num_features."""
-    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True, track_running_stats: bool = True):
-        Module.__init__(self)
-        self.num_features = None
-        self.eps = eps
-        self.momentum = momentum
-        self.affine = affine
-        self.track_running_stats = track_running_stats
-        self.weight = None
-        self.bias = None
-        self.running_mean = None
-        self.running_var = None
 
-    def initialize_parameters(self, input):
-        num_features = input.shape[1]
-        self.num_features = num_features
-        if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
-        if self.track_running_stats:
-            self.running_mean = np.zeros(num_features, dtype=np.float32)
-            self.running_var = np.ones(num_features, dtype=np.float32)
-
-    def forward(self, x):
-        if self.num_features is None:
-            self.initialize_parameters(x)
-        return super().forward(x)
-
-
-class LazyBatchNorm2d(BatchNorm2d):
+class LazyBatchNorm2d(_LazyBatchNormMixin, BatchNorm2d):
     """2D Batch Normalization with lazy initialization of num_features."""
-    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True, track_running_stats: bool = True):
-        Module.__init__(self)
-        self.num_features = None
-        self.eps = eps
-        self.momentum = momentum
-        self.affine = affine
-        self.track_running_stats = track_running_stats
-        self.weight = None
-        self.bias = None
-        self.running_mean = None
-        self.running_var = None
-
-    def initialize_parameters(self, input):
-        num_features = input.shape[1]
-        self.num_features = num_features
-        if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
-        if self.track_running_stats:
-            self.running_mean = np.zeros(num_features, dtype=np.float32)
-            self.running_var = np.ones(num_features, dtype=np.float32)
-
-    def forward(self, x):
-        if self.num_features is None:
-            self.initialize_parameters(x)
-        return super().forward(x)
-
 
 class SyncBatchNorm(BatchNorm2d):
     """Applies Batch Normalization synchronized across multiple processes."""
@@ -2163,18 +2178,17 @@ class AdaptiveAvgPool2d(Module):
 
 
 class Upsample(Module):
-    """Upsamples multi-channel 2D data."""
-    def __init__(self, scale_factor: Union[int, float] = 2.0, mode: str = "nearest"):
+    """Upsamples 1-D, 2-D or 3-D data (`mode`: nearest, nearest-exact, linear, bilinear, bicubic, trilinear, area)."""
+    def __init__(self, size=None, scale_factor=None, mode: str = "nearest", align_corners=None, recompute_scale_factor=None):
         super().__init__()
-        self.scale_factor = scale_factor
-        self.mode = mode
+        if size is None and scale_factor is None:
+            raise ValueError("either size or scale_factor should be defined")
+        self.size, self.scale_factor, self.mode = size, scale_factor, mode
+        self.align_corners, self.recompute_scale_factor = align_corners, recompute_scale_factor
 
     def forward(self, x):
-        arr = x.to_numpy()
-        sf = int(self.scale_factor)
-        out = np.repeat(np.repeat(arr, sf, axis=2), sf, axis=3)
-        return _from_numpy(np.ascontiguousarray(out, dtype=np.float32))
-
+        return functional.interpolate(x, size=self.size, scale_factor=self.scale_factor, mode=self.mode,
+                                      align_corners=self.align_corners)
 
 class UpsamplingNearest2d(Module):
     """Applies a 2D nearest neighbor upsampling to an input signal composed of several input channels."""
@@ -2351,81 +2365,12 @@ class EmbeddingBag(Module):
         )
 
 
-class BatchNorm3d(Module):
+class BatchNorm3d(_BatchNormNd):
     """3D Batch Normalization over 5D NCDHW input."""
-    def __init__(
-        self,
-        num_features: int,
-        eps: float = 1e-5,
-        momentum: float = 0.1,
-        affine: bool = True,
-        track_running_stats: bool = True,
-    ):
-        super().__init__()
-        self.num_features = num_features
-        self.eps = eps
-        self.momentum = momentum
-        self.affine = affine
-        self.track_running_stats = track_running_stats
-        if affine:
-            self.weight = Parameter(_Tensor.ones([num_features]))
-            self.bias = Parameter(_Tensor.zeros([num_features]))
-        else:
-            self.weight = None
-            self.bias = None
-        if track_running_stats:
-            self.running_mean = np.zeros(num_features, dtype=np.float32)
-            self.running_var = np.ones(num_features, dtype=np.float32)
-        else:
-            self.running_mean = None
-            self.running_var = None
+    _ndims = (5,)
 
-    def forward(self, x):
-        bshape = (1, self.num_features, 1, 1, 1)
-        if self.training or not self.track_running_stats:
-            mean_b, var_b, mean_c, uvar_c = _batch_norm_train_stats(x, self.num_features)
-            if self.training and self.track_running_stats:
-                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean_c.reshape(self.num_features)
-                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * uvar_c.reshape(self.num_features)
-        else:
-            mean_b = _from_numpy(np.ascontiguousarray(self.running_mean.reshape(bshape), dtype=np.float32))
-            var_b = _from_numpy(np.ascontiguousarray(self.running_var.reshape(bshape), dtype=np.float32))
-
-        out = (x - mean_b) / (var_b + self.eps).sqrt()
-        if self.affine:
-            out = out * self.weight.reshape(list(bshape)) + self.bias.reshape(list(bshape))
-        return out
-
-
-class LazyBatchNorm3d(BatchNorm3d):
+class LazyBatchNorm3d(_LazyBatchNormMixin, BatchNorm3d):
     """3D Batch Normalization with lazy initialization of num_features."""
-    def __init__(self, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True, track_running_stats: bool = True):
-        Module.__init__(self)
-        self.num_features = None
-        self.eps = eps
-        self.momentum = momentum
-        self.affine = affine
-        self.track_running_stats = track_running_stats
-        self.weight = None
-        self.bias = None
-        self.running_mean = None
-        self.running_var = None
-
-    def initialize_parameters(self, input):
-        num_features = input.shape[1]
-        self.num_features = num_features
-        if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
-        if self.track_running_stats:
-            self.running_mean = np.zeros(num_features, dtype=np.float32)
-            self.running_var = np.ones(num_features, dtype=np.float32)
-
-    def forward(self, x):
-        if self.num_features is None:
-            self.initialize_parameters(x)
-        return super().forward(x)
-
 
 class InstanceNorm1d(Module):
     """Applies 1D Instance Normalization."""
@@ -2437,8 +2382,8 @@ class InstanceNorm1d(Module):
         self.affine = affine
         self.track_running_stats = track_running_stats
         if affine:
-            self.weight = Parameter(_Tensor.ones([1, num_features, 1]))
-            self.bias = Parameter(_Tensor.zeros([1, num_features, 1]))
+            self.weight = Parameter(_Tensor.ones([num_features]))
+            self.bias = Parameter(_Tensor.zeros([num_features]))
         else:
             self.weight = None
             self.bias = None
@@ -2464,8 +2409,8 @@ class InstanceNorm2d(Module):
         self.affine = affine
         self.track_running_stats = track_running_stats
         if affine:
-            self.weight = Parameter(_Tensor.ones([1, num_features, 1, 1]))
-            self.bias = Parameter(_Tensor.zeros([1, num_features, 1, 1]))
+            self.weight = Parameter(_Tensor.ones([num_features]))
+            self.bias = Parameter(_Tensor.zeros([num_features]))
         else:
             self.weight = None
             self.bias = None
@@ -2491,8 +2436,8 @@ class InstanceNorm3d(Module):
         self.affine = affine
         self.track_running_stats = track_running_stats
         if affine:
-            self.weight = Parameter(_Tensor.ones([1, num_features, 1, 1, 1]))
-            self.bias = Parameter(_Tensor.zeros([1, num_features, 1, 1, 1]))
+            self.weight = Parameter(_Tensor.ones([num_features]))
+            self.bias = Parameter(_Tensor.zeros([num_features]))
         else:
             self.weight = None
             self.bias = None
@@ -2523,8 +2468,8 @@ class LazyInstanceNorm1d(InstanceNorm1d):
         num_features = input.shape[1]
         self.num_features = num_features
         if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([1, num_features, 1])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([1, num_features, 1])))
+            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
+            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
 
     def forward(self, x):
         if self.num_features is None:
@@ -2547,8 +2492,8 @@ class LazyInstanceNorm2d(InstanceNorm2d):
         num_features = input.shape[1]
         self.num_features = num_features
         if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([1, num_features, 1, 1])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([1, num_features, 1, 1])))
+            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
+            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
 
     def forward(self, x):
         if self.num_features is None:
@@ -2571,8 +2516,8 @@ class LazyInstanceNorm3d(InstanceNorm3d):
         num_features = input.shape[1]
         self.num_features = num_features
         if self.affine:
-            self.register_parameter("weight", Parameter(_Tensor.ones([1, num_features, 1, 1, 1])))
-            self.register_parameter("bias", Parameter(_Tensor.zeros([1, num_features, 1, 1, 1])))
+            self.register_parameter("weight", Parameter(_Tensor.ones([num_features])))
+            self.register_parameter("bias", Parameter(_Tensor.zeros([num_features])))
 
     def forward(self, x):
         if self.num_features is None:
@@ -2594,41 +2539,66 @@ class LocalResponseNorm(Module):
         return F.local_response_norm(input, self.size, alpha=self.alpha, beta=self.beta, k=self.k)
 
 
-class Conv1d(Module):
-    """Applies a 1D convolution over an input signal composed of several input planes."""
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int = 1,
-        padding: int = 0,
-        dilation: int = 1,
-        groups: int = 1,
-        bias: bool = True,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
+class _ConvNd(Module):
+    """Shared implementation of Conv1d / Conv2d / Conv3d: tuple kernel sizes, stride, dilation, groups, 'same' / 'valid' padding,
+    `padding_mode` ('zeros', 'reflect', 'replicate', 'circular'), PyTorch's default initialisation."""
+    _n = 1
 
-        k = 1.0 / math.sqrt(in_channels * kernel_size)
-        w = np.random.uniform(-k, k, (out_channels, in_channels // groups, kernel_size)).astype(np.float32)
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True,
+                 padding_mode="zeros", device=None, dtype=None):
+        super().__init__()
+        n = self._n
+        if in_channels % groups or out_channels % groups:
+            raise ValueError("in_channels and out_channels must be divisible by groups")
+        if padding_mode not in ("zeros", "reflect", "replicate", "circular"):
+            raise ValueError(f"padding_mode must be 'zeros', 'reflect', 'replicate' or 'circular', got {padding_mode!r}")
+        if isinstance(padding, str) and padding not in ("same", "valid"):
+            raise ValueError(f"padding must be 'same', 'valid', an int or a tuple, got {padding!r}")
+        tup = lambda v: (int(v),) * n if isinstance(v, (int, np.integer)) else tuple(int(x) for x in v)
+        elems = (out_channels * in_channels // max(groups, 1)) * int(np.prod([int(k) for k in tup(kernel_size)], dtype=object))
+        if in_channels <= 0 or out_channels <= 0 or elems > 2 ** 31:
+            raise RuntimeError(f"Conv{n}d: the weight size overflows the supported tensor size ({in_channels}, {out_channels}, {kernel_size})")
+        self.in_channels, self.out_channels, self.groups, self.padding_mode = in_channels, out_channels, groups, padding_mode
+        self.kernel_size, self.stride, self.dilation = tup(kernel_size), tup(stride), tup(dilation)
+        self.padding = padding if isinstance(padding, str) else tup(padding)
+        fan_in = (in_channels // groups) * int(np.prod(self.kernel_size))
+        k = 1.0 / math.sqrt(fan_in)
+        w = np.random.uniform(-k, k, (out_channels, in_channels // groups) + self.kernel_size).astype(np.float32)
         self.weight = Parameter(_from_numpy(w))
-        if bias:
-            b = np.random.uniform(-k, k, (out_channels,)).astype(np.float32)
-            self.bias = Parameter(_from_numpy(b))
-        else:
-            self.bias = None
+        self.bias = Parameter(_from_numpy(np.random.uniform(-k, k, (out_channels,)).astype(np.float32))) if bias else None
 
     def forward(self, input):
         from . import functional as F
-        return F.conv1d(input, self.weight, self.bias, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
+        fn = (F.conv1d, F.conv2d, F.conv3d)[self._n - 1]
+        pad = self.padding
+        if self.padding_mode != "zeros" and not isinstance(pad, str):
+            spec = []
+            for p_ in reversed(pad):
+                spec += [p_, p_]
+            input = F.pad(input, spec, mode=self.padding_mode)
+            pad = (0,) * self._n
+        one = self._n == 1
+        pick = (lambda v: v[0]) if one else (lambda v: v)
+        return fn(input, self.weight, self.bias, stride=pick(self.stride), padding=pad if isinstance(pad, str) else pick(pad),
+                  dilation=pick(self.dilation), groups=self.groups)
 
+    def extra_repr(self):
+        return f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, stride={self.stride}"
+
+
+class Conv1d(_ConvNd):
+    """Applies a 1D convolution over an input signal composed of several input planes."""
+    _n = 1
+
+
+class Conv2d(_ConvNd):
+    """Applies a 2D convolution over an input image composed of several input planes."""
+    _n = 2
+
+
+class Conv3d(_ConvNd):
+    """Applies a 3D convolution over an input volume composed of several input planes."""
+    _n = 3
 
 class ConvTranspose1d(Module):
     """Applies a 1D transposed convolution operator over an input signal."""
@@ -3601,6 +3571,85 @@ from .losses_ext import TripletMarginWithDistanceLoss
 
 from .distributed import DataParallel, DistributedDataParallel, FullyShardedDataParallel
 
+
+# ---------------------------------------------------------------------------
+# Module API for the native layers (Linear, Embedding, Dropout, ReLU, ...): wrap in a one-child Sequential and strip the prefix
+# ---------------------------------------------------------------------------
+
+def _native_module_api() -> None:
+    def holder(self):
+        return Sequential(self)
+
+    def named_parameters(self, prefix="", recurse=True):
+        for n, p in holder(self).named_parameters():
+            n = n[2:]
+            yield (f"{prefix}.{n}" if prefix else n), p
+
+    def parameters_(self, recurse=True):
+        return list(self.parameters_native())
+
+    def state_dict(self, *args, **kwargs):
+        return OrderedDict((n[2:], v) for n, v in holder(self).state_dict(*args, **kwargs).items())
+
+    def load_state_dict(self, state, strict=True):
+        return holder(self).load_state_dict({f"0.{k}": v for k, v in state.items()}, strict=strict)
+
+    def zero_grad(self, set_to_none=False):
+        holder(self).zero_grad(set_to_none=set_to_none)
+
+    def requires_grad_(self, requires_grad=True):
+        for p in self.parameters():
+            p.requires_grad_(requires_grad)
+        return self
+
+    def to(self, *args, **kwargs):
+        return self  # native layers live on the CPU in float32
+
+    def apply(self, fn):
+        fn(self)
+        return self
+
+    def named_modules(self, prefix=""):
+        yield prefix, self
+
+    def modules(self):
+        yield self
+
+    def children(self):
+        return iter(())
+
+    def named_children(self):
+        return iter(())
+
+    def buffers(self, recurse=True):
+        return iter(())
+
+    def named_buffers(self, prefix="", recurse=True):
+        return iter(())
+
+    api = dict(named_parameters=named_parameters, state_dict=state_dict, load_state_dict=load_state_dict, zero_grad=zero_grad,
+               requires_grad_=requires_grad_, to=to, apply=apply, named_modules=named_modules, modules=modules, children=children,
+               named_children=named_children, buffers=buffers, named_buffers=named_buffers)
+    for cls in (Linear, SpectralNormLinear, ConvLstmCell, DropPath, Dropout, Embedding, Maxout, Snake, Swish, Upsample2d, ReLU, MLP,
+                _NativeConv2d, _NativeConv3d, _NativeLayerNorm):
+        for name, fn in api.items():
+            if not hasattr(cls, name):
+                setattr(cls, name, fn)
+        for name in ("train", "eval"):
+            orig = getattr(cls, name, None)
+            if orig is None:
+                setattr(cls, name, lambda self, mode=True: self)
+            else:  # the native method returns None; PyTorch returns the module so calls chain
+                def chained(self, *a, _o=orig, **k):
+                    _o(self, *a, **k)
+                    return self
+                setattr(cls, name, chained)
+        if not hasattr(cls, "training"):
+            cls.training = property(lambda self: False)
+
+
+_native_module_api()
+
 __all__ = [
     # Core Base Classes & Containers
     "Module",
@@ -3707,6 +3756,9 @@ __all__ = [
     "LogSoftmax",
     "Softmin",
     "Softplus",
+    "LogSigmoid",
+    "Softshrink",
+    "Hardshrink",
     "Softsign",
     "Hardswish",
     "Hardsigmoid",

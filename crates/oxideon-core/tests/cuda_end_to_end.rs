@@ -310,11 +310,14 @@ fn adamw_with_gradient_clipping_trains_identically_on_the_gpu() {
     close("AdamW weights", &wg, &wc, 1e-3);
 }
 
+static FUSED_FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn fused_attention_matches_the_composed_path() {
     if !ready() {
         return;
     }
+    let _serial = FUSED_FLAG.lock().unwrap_or_else(|p| p.into_inner()); // both tests flip the global force-fused flag
     use oxideon_core::nn::functional_ext::scaled_dot_product_attention as sdpa;
     oxideon_core::backend::cuda_ops::set_fused_attention_always(true);
     let before = oxideon_core::backend::cuda_rt::launch_count();
@@ -365,4 +368,61 @@ fn where_cond_result_stays_on_the_cuda_storage() {
         masked.softmax(-1).unwrap().matmul(&v).unwrap()
     };
     close("masked attention", &run(&cuda()), &run(&Device::Cpu), 2e-4);
+}
+
+#[test]
+fn fused_attention_gradients_match_the_cpu() {
+    if !ready() {
+        return;
+    }
+    let _serial = FUSED_FLAG.lock().unwrap_or_else(|p| p.into_inner()); // both tests flip the global force-fused flag
+    use oxideon_core::nn::functional_ext::scaled_dot_product_attention as sdpa;
+    oxideon_core::backend::cuda_ops::set_fused_attention_always(true);
+    // (leading dims, L, S, head dim, value dim); the last case has L != S and D != Dv
+    for (lead, l, s, d, dv) in [(&[2usize, 3][..], 37usize, 37usize, 32usize, 32usize), (&[1, 2][..], 70, 70, 48, 48), (&[3][..], 20, 45, 16, 24)] {
+        let shape = |last2: [usize; 2]| lead.iter().copied().chain(last2).collect::<Vec<_>>();
+        let bool_mask = Tensor::from_slice(&(0..l * s).map(|i| (i * 7 + 3) % 5 != 0 || i % s == 0).collect::<Vec<_>>(), &[l, s]).unwrap();
+        let add_mask = rnd(&[l, s], 9.0);
+        for (name, mask, causal) in [("plain", None, false), ("causal", None, true), ("bool mask", Some(&bool_mask), false), ("additive mask", Some(&add_mask), false)] {
+            if causal && l != s {
+                continue;
+            }
+            let run = |dev: &Device| {
+                let leaf = |t: Tensor| t.to_device(dev).unwrap().requires_grad_(true);
+                let (q, k, v) = (leaf(rnd(&shape([l, d]), 1.0)), leaf(rnd(&shape([s, d]), 2.0)), leaf(rnd(&shape([s, dv]), 3.0)));
+                let m = mask.map(|m| m.to_device(dev).unwrap());
+                let out = sdpa(&q, &k, &v, m.as_ref(), causal, None).unwrap();
+                let w = rnd(out.shape(), 4.0).to_device(dev).unwrap();
+                out.mul(&w).unwrap().sum().unwrap().backward().unwrap();
+                let cpu = |t: &Tensor| t.to_device(&Device::Cpu).unwrap();
+                (cpu(&out.detach()), cpu(&q.grad().unwrap()), cpu(&k.grad().unwrap()), cpu(&v.grad().unwrap()), out.op_name())
+            };
+            let want = run(&Device::Cpu);
+            let got = run(&cuda());
+            assert_eq!(got.4, Some("fused_attention"), "{name}: the fused training op must be recorded");
+            let what = format!("{name} lead {lead:?} L={l} S={s} D={d} Dv={dv}");
+            close(&format!("out {what}"), &got.0, &want.0, 2e-4);
+            close(&format!("dq {what}"), &got.1, &want.1, 5e-4);
+            close(&format!("dk {what}"), &got.2, &want.2, 5e-4);
+            close(&format!("dv {what}"), &got.3, &want.3, 5e-4);
+        }
+    }
+    // TinyTTS-style operands: permuted views of [B, T, H, d] and a key-padding mask [B, 1, 1, T], released backward
+    let (b, t, h, dh) = (3usize, 41usize, 4usize, 12usize);
+    let keep: Vec<bool> = (0..b * t).map(|i| i % t < [41, 30, 7][i / t]).collect();
+    let run = |dev: &Device| {
+        let x = rnd(&[b, t, h * dh], 5.0).to_device(dev).unwrap().requires_grad_(true);
+        let heads = |y: &Tensor| y.reshape(&[b, t, h, dh]).unwrap().permute(&[0, 2, 1, 3]).unwrap();
+        let (q, k, v) = (heads(&x.mul_scalar(0.7).unwrap()), heads(&x), heads(&x.mul_scalar(-1.3).unwrap()));
+        let m = Tensor::from_slice(&keep, &[b, 1, 1, t]).unwrap().to_device(dev).unwrap();
+        let out = sdpa(&q, &k, &v, Some(&m), false, None).unwrap();
+        let w = rnd(out.shape(), 6.0).to_device(dev).unwrap();
+        let loss = out.mul(&w).unwrap().sum().unwrap();
+        loss.backward_release(&loss.ones_like().unwrap()).unwrap();
+        (out.detach().to_device(&Device::Cpu).unwrap(), x.grad().unwrap().to_device(&Device::Cpu).unwrap())
+    };
+    let (want, got) = (run(&Device::Cpu), run(&cuda()));
+    close("tinytts attention out", &got.0, &want.0, 2e-4);
+    close("tinytts attention dx", &got.1, &want.1, 5e-4);
+    oxideon_core::backend::cuda_ops::set_fused_attention_always(false);
 }

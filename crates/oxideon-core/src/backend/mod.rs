@@ -66,6 +66,7 @@ pub mod simd_x86 {
         _x: &[f32], _g: &[f32], _w: &[f32], _dx: &mut [f32], _dw: &mut [f32], _db: &mut [f32], _eps: f32,
     ) -> bool { false }
 }
+pub mod cublas;
 pub mod cuda_driver;
 pub mod cuda_kernels;
 pub mod cuda_ops;
@@ -325,6 +326,10 @@ impl Storage {
                 _ => None,
             };
         }
+        #[cfg(feature = "wgpu")]
+        if let StorageInner::Wgpu(s) = &*self.0.read().unwrap_or_else(|p| p.into_inner()) {
+            return s.softmax_last_axis(layout, false).ok().flatten().map(Self::new_wgpu);
+        }
         let out_inner = {
             let guard = self.0.read().unwrap_or_else(|p| p.into_inner());
             match &*guard {
@@ -350,6 +355,10 @@ impl Storage {
                 Ok(Some((out, false))) => Some(Self::new_cuda(out)),
                 _ => None,
             };
+        }
+        #[cfg(feature = "wgpu")]
+        if let StorageInner::Wgpu(s) = &*self.0.read().unwrap_or_else(|p| p.into_inner()) {
+            return s.softmax_last_axis(layout, true).ok().flatten().map(Self::new_wgpu);
         }
         if let StorageInner::Cpu(s) = &*self.0.read().unwrap_or_else(|p| p.into_inner()) {
             return s.log_softmax_last_axis(layout).map(Self::new_cpu);

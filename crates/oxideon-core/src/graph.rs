@@ -58,7 +58,7 @@ pub fn analyze_graph(outputs: &[Tensor]) -> GraphStats {
             *op_counts.entry(op).or_insert(0) += 1;
             total_activation_bytes = total_activation_bytes.saturating_add(bytes);
             estimated_flops =
-                estimated_flops.saturating_add(estimate_node_flops(op, t, t.op_inputs()));
+                estimated_flops.saturating_add(estimate_node_flops(op, t, &t.op_inputs()));
         } else {
             leaf_nodes += 1;
             total_leaf_bytes = total_leaf_bytes.saturating_add(bytes);

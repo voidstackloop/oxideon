@@ -55,9 +55,11 @@ pub fn scaled_dot_product_attention(
     scores.softmax(-1)?.matmul(v)
 }
 
-/// The fused CUDA attention kernel for inference (no gradient needed, 2-4 dimensional inputs with equal leading dimensions,
-/// head dimension up to 128). `None` sends the call down the composed path, which also handles training.
-fn attention_fused_cuda(q: &Tensor, k: &Tensor, v: &Tensor, attn_mask: Option<&Tensor>, is_causal: bool, scale: f64) -> Result<Option<Tensor>> {
+/// The fused CUDA attention kernel (2-4 dimensional inputs with equal leading dimensions, head dimension up to 128). Without
+/// gradients: any float type. With gradients (F32, a mask that needs none): a recorded op whose backward runs the fused
+/// backward kernels, so neither direction stores the `[L, S]` scores (`create_graph` is not supported through it). `None`
+/// sends the call down the composed path.
+pub fn attention_fused_cuda(q: &Tensor, k: &Tensor, v: &Tensor, attn_mask: Option<&Tensor>, is_causal: bool, scale: f64) -> Result<Option<Tensor>> {
     use crate::backend::cuda_ops::AttnDims;
     use crate::dtype::DType;
     if !matches!(q.device(), crate::device::Device::Cuda(_)) || k.device() != q.device() || v.device() != q.device() {
@@ -65,7 +67,7 @@ fn attention_fused_cuda(q: &Tensor, k: &Tensor, v: &Tensor, attn_mask: Option<&T
     }
     let needs_grad = crate::tensor::is_grad_enabled() && (q.requires_grad() || k.requires_grad() || v.requires_grad());
     let nd = q.ndim();
-    if needs_grad || nd > 4 || k.ndim() != nd || v.ndim() != nd || k.dtype() != q.dtype() || v.dtype() != q.dtype() || !matches!(q.dtype(), DType::F32 | DType::F64 | DType::F16 | DType::BF16) {
+    if (needs_grad && (q.dtype() != DType::F32 || attn_mask.is_some_and(|m| m.requires_grad()))) || nd > 4 || k.ndim() != nd || v.ndim() != nd || k.dtype() != q.dtype() || v.dtype() != q.dtype() || !matches!(q.dtype(), DType::F32 | DType::F64 | DType::F16 | DType::BF16) {
         return Ok(None);
     }
     let lead = &q.shape()[..nd - 2];
@@ -82,7 +84,9 @@ fn attention_fused_cuda(q: &Tensor, k: &Tensor, v: &Tensor, attn_mask: Option<&T
     // instead of a matmul / softmax / matmul chain) or when the [L, S] scores per head would not fit in memory. A long
     // square attention is faster as the composed path, whose matrix products run on the matmul / tensor-core kernels.
     let score_bytes = bh.saturating_mul(l).saturating_mul(s).saturating_mul(q.dtype().size_in_bytes());
-    if !(l <= 64 || score_bytes > (1 << 28) || crate::backend::cuda_ops::fused_attention_always()) {
+    // training: the stored scores, softmax and its saved input are the memory cost, so the fused path wins from smaller sizes
+    let threshold = if needs_grad { 1usize << 24 } else { 1usize << 28 };
+    if !(l <= 64 || score_bytes > threshold || crate::backend::cuda_ops::fused_attention_always()) {
         return Ok(None);
     }
     // an additive mask in the query dtype (a boolean one becomes 0 / -inf), broadcast to [lead.., L, S]
@@ -105,10 +109,48 @@ fn attention_fused_cuda(q: &Tensor, k: &Tensor, v: &Tensor, attn_mask: Option<&T
     };
     let (qc, kc, vc) = (q.contiguous()?, k.contiguous()?, v.contiguous()?);
     let dims = AttnDims { bh, h, l, s, d, dv };
-    let storage = crate::backend::Storage::cuda_attention((qc.storage(), qc.layout()), (kc.storage(), kc.layout()), (vc.storage(), vc.layout()), mask.as_ref().map(|m| (m.storage(), m.layout())), is_causal, scale, dims)?;
     let mut out_shape = lead.to_vec();
     out_shape.extend([l, dv]);
-    Ok(storage.map(|st| Tensor::from_storage(st, crate::layout::Layout::contiguous(out_shape))))
+    let ml = mask.as_ref().map(|m| (m.storage(), m.layout()));
+    if !needs_grad {
+        let storage = crate::backend::Storage::cuda_attention((qc.storage(), qc.layout()), (kc.storage(), kc.layout()), (vc.storage(), vc.layout()), ml, is_causal, scale, dims, None)?;
+        return Ok(storage.map(|st| Tensor::from_storage(st, crate::layout::Layout::contiguous(out_shape))));
+    }
+    let lse = Tensor::zeros(&[bh * l], DType::F32, &q.device())?;
+    let Some(st) = crate::backend::Storage::cuda_attention((qc.storage(), qc.layout()), (kc.storage(), kc.layout()), (vc.storage(), vc.layout()), ml, is_causal, scale, dims, Some(lse.storage()))? else {
+        return Ok(None);
+    };
+    let out_layout = crate::layout::Layout::contiguous(out_shape.clone());
+    let o_saved = Tensor::from_parts(st.clone(), out_layout.clone(), false, None);
+    let (qs, ks, vs) = (qc.detach(), kc.detach(), vc.detach());
+    let (q_shape, k_shape, v_shape) = (q.shape().to_vec(), k.shape().to_vec(), v.shape().to_vec());
+    let backward: crate::tensor::BackwardFn = Box::new(move |g: &Tensor| {
+        if crate::tensor::is_grad_enabled() {
+            return Err(Error::Autograd("fused attention: create_graph (higher-order gradients) is not supported; call it without".into()));
+        }
+        let gc = g.contiguous()?;
+        let r = crate::backend::Storage::cuda_attention_bwd(
+            (qs.storage(), qs.layout()),
+            (ks.storage(), ks.layout()),
+            (vs.storage(), vs.layout()),
+            (o_saved.storage(), o_saved.layout()),
+            (gc.storage(), gc.layout()),
+            lse.storage(),
+            mask.as_ref().map(|m| (m.storage(), m.layout())),
+            is_causal,
+            scale,
+            dims,
+        )?
+        .ok_or_else(|| Error::Msg("fused attention backward: operands left the CUDA device".into()))?;
+        let mk = |st, shape: &[usize]| Tensor::from_parts(st, crate::layout::Layout::contiguous(shape), false, None);
+        Ok(vec![Some(mk(r.0, &q_shape)), Some(mk(r.1, &k_shape)), Some(mk(r.2, &v_shape))])
+    });
+    Ok(Some(Tensor::from_parts(
+        st,
+        out_layout,
+        true,
+        Some(crate::tensor::Node { op: "fused_attention", inputs: vec![q.clone(), k.clone(), v.clone()], backward }),
+    )))
 }
 
 // ---------------------------------------------------------------------------------------------------------------

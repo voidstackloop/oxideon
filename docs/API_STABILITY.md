@@ -1,6 +1,6 @@
 # Oxideon API Stability Statement
 
-**Version:** `0.1.0` (pre-1.0: no surface is frozen yet).
+**Version:** `0.1.1` (pre-1.0: no surface is frozen yet).
 **Last updated:** 2026-11-10.
 
 This document states which parts of the public Python API (`oxideon`

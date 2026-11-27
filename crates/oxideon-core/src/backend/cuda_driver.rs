@@ -352,9 +352,30 @@ fn pool_limit() -> usize {
     *L.get_or_init(|| std::env::var("OXIDEON_CUDA_POOL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024) << 20)
 }
 
-/// Size class of an allocation: 512-byte multiples, so tensors of the same shape reuse each other's memory.
+/// Size class of an allocation: 512-byte multiples up to 32 KiB, then four classes per power of two (at most 25% slack), so
+/// tensors whose shapes differ a little from batch to batch (variable sequence lengths) still reuse each other's memory instead
+/// of each missing the pool and paying `cuMemAlloc` plus a device-stalling `cuMemFree`.
 fn size_class(bytes: usize) -> usize {
-    bytes.next_multiple_of(512)
+    if bytes <= 32 << 10 {
+        return bytes.next_multiple_of(512);
+    }
+    let top = 1usize << (usize::BITS - 1 - bytes.leading_zeros());
+    bytes.next_multiple_of(top / 4)
+}
+
+#[cfg(test)]
+mod size_class_tests {
+    use super::size_class;
+    #[test]
+    fn classes_are_coarse_and_cover() {
+        assert_eq!(size_class(1), 512);
+        assert_eq!(size_class(32 << 10), 32 << 10);
+        for b in [(32 << 10) + 1, 1_300_000, 38_400, 7_372_800, (1 << 30) + 5] {
+            let c = size_class(b);
+            assert!(c >= b && c - b <= b / 4, "{b} -> {c}");
+        }
+        assert_eq!(size_class(1_100_000), size_class(1_200_000)); // nearby lengths share a class
+    }
 }
 
 /// Returns every pooled allocation of every device to the driver.
@@ -374,6 +395,20 @@ pub fn cuda_empty_pool() {
     pool.pooled_bytes = 0;
 }
 
+/// Bytes held by live device buffers (size classes, all devices) and their high-water mark since the last reset.
+static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PEAK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(live, peak, pooled)` bytes: held by tensors now, the most held at once since the last `reset_peak`, and freed but kept
+/// in the reuse pool. `reset_peak` restarts the high-water mark from the current live bytes.
+pub fn cuda_memory_stats(reset_peak: bool) -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let live = LIVE_BYTES.load(Relaxed);
+    let peak = if reset_peak { PEAK_BYTES.swap(live, Relaxed) } else { PEAK_BYTES.load(Relaxed) };
+    let pooled = device_pool().lock().unwrap_or_else(|p| p.into_inner()).pooled_bytes;
+    (live, peak.max(live), pooled)
+}
+
 /// RAII GPU VRAM allocation on a real CUDA device.
 #[derive(Debug)]
 pub struct CudaBuffer {
@@ -389,19 +424,30 @@ impl CudaBuffer {
         ensure_context(device_index)?;
         let a = api()?;
         let mut ptr: CUdeviceptr = 0;
-        let cap = if bytes > 0 { size_class(bytes) } else { 0 };
+        let mut cap = if bytes > 0 { size_class(bytes) } else { 0 };
         if bytes > 0 {
             let pooled = {
+                // the exact class first, then free blocks up to about twice the size (a sequence a little longer than last
+                // batch's reuses its buffer instead of allocating a new one)
                 let mut pool = device_pool().lock().unwrap_or_else(|p| p.into_inner());
-                let got = pool.free.get_mut(&(device_index, cap)).and_then(Vec::pop);
-                if got.is_some() {
-                    pool.pooled_bytes -= cap;
+                let mut c = cap;
+                let mut got = None;
+                for _ in 0..5 {
+                    if let Some(p) = pool.free.get_mut(&(device_index, c)).and_then(Vec::pop) {
+                        got = Some((p, c));
+                        break;
+                    }
+                    c = size_class(c + 1);
+                }
+                if let Some((_, c)) = got {
+                    pool.pooled_bytes -= c;
                 }
                 got
             };
             match pooled {
-                Some(p) => ptr = p,
+                Some((p, c)) => (ptr, cap) = (p, c),
                 None => {
+                    let t0 = kernel_profiling().then(std::time::Instant::now);
                     let mut rc = unsafe { (a.cu_mem_alloc)(&mut ptr, cap) };
                     if rc != CUDA_SUCCESS {
                         // out of memory: give the pooled allocations back and try once more
@@ -410,8 +456,16 @@ impl CudaBuffer {
                         rc = unsafe { (a.cu_mem_alloc)(&mut ptr, cap) };
                     }
                     check(rc, "cuMemAlloc_v2")?;
+                    if let Some(t0) = t0 {
+                        record_kernel_time("(cuMemAlloc)", t0.elapsed().as_secs_f64());
+                    }
                 }
             }
+        }
+        if cap > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let live = LIVE_BYTES.fetch_add(cap, Relaxed) + cap;
+            PEAK_BYTES.fetch_max(live, Relaxed);
         }
         Ok(Self {
             ptr,
@@ -465,6 +519,7 @@ impl Drop for CudaBuffer {
         if self.ptr == 0 {
             return;
         }
+        LIVE_BYTES.fetch_sub(self.cap, std::sync::atomic::Ordering::Relaxed);
         {
             let mut pool = device_pool().lock().unwrap_or_else(|p| p.into_inner());
             if pool.pooled_bytes + self.cap <= pool_limit() {
@@ -476,8 +531,12 @@ impl Drop for CudaBuffer {
         if let Ok(a) = api()
             && ensure_context(self.device_index).is_ok()
         {
+            let t0 = kernel_profiling().then(std::time::Instant::now);
             unsafe {
                 let _ = (a.cu_mem_free)(self.ptr);
+            }
+            if let Some(t0) = t0 {
+                record_kernel_time("(cuMemFree)", t0.elapsed().as_secs_f64());
             }
         }
     }
@@ -570,7 +629,12 @@ impl CudaPtxModule {
             "cuModuleGetFunction",
         )?;
         let raw_stream = stream.map_or(std::ptr::null_mut(), |s| s.stream);
-        check(
+        let timed = stream.is_none() && kernel_profiling();
+        if timed {
+            check(unsafe { (a.cu_stream_synchronize)(std::ptr::null_mut()) }, "cuStreamSynchronize(profile)")?;
+        }
+        let t0 = std::time::Instant::now();
+        let rc = check(
             unsafe {
                 (a.cu_launch_kernel)(
                     func,
@@ -587,8 +651,40 @@ impl CudaPtxModule {
                 )
             },
             "cuLaunchKernel",
-        )
+        );
+        if timed && rc.is_ok() {
+            check(unsafe { (a.cu_stream_synchronize)(std::ptr::null_mut()) }, "cuStreamSynchronize(profile)")?;
+            record_kernel_time(func_name, t0.elapsed().as_secs_f64());
+        }
+        rc
     }
+}
+
+/// `OXIDEON_CUDA_PROFILE=1`: every kernel on the default stream is timed (synchronising before and after the launch, so the
+/// run gets slower but each kernel's GPU time is exact) and summed by kernel name. Read with [`cuda_kernel_profile_take`].
+fn kernel_profiling() -> bool {
+    static P: OnceLock<bool> = OnceLock::new();
+    *P.get_or_init(|| std::env::var("OXIDEON_CUDA_PROFILE").is_ok_and(|v| v == "1"))
+}
+
+fn record_kernel_time(name: &str, secs: f64) {
+    let mut p = kernel_profile().lock().unwrap_or_else(|e| e.into_inner());
+    let e = p.entry(name.to_string()).or_insert((0, 0.0));
+    e.0 += 1;
+    e.1 += secs;
+}
+
+fn kernel_profile() -> &'static Mutex<std::collections::HashMap<String, (u64, f64)>> {
+    static P: OnceLock<Mutex<std::collections::HashMap<String, (u64, f64)>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The kernel timings gathered since the last call, `(kernel, launches, seconds)` slowest first, and resets them.
+pub fn cuda_kernel_profile_take() -> Vec<(String, u64, f64)> {
+    let mut p = kernel_profile().lock().unwrap_or_else(|e| e.into_inner());
+    let mut v: Vec<_> = p.drain().map(|(k, (n, s))| (k, n, s)).collect();
+    v.sort_by(|a, b| b.2.total_cmp(&a.2));
+    v
 }
 
 /// Non-blocking CUDA stream for asynchronous kernel launches and CUDA Graph capture.
@@ -788,6 +884,7 @@ impl CudaBuffer {
 pub struct CudaFunction {
     raw: usize,
     device_index: usize,
+    name: Arc<str>,
     // keeps the module (and with it the function) alive
     _module: Arc<CudaPtxModule>,
 }
@@ -797,6 +894,11 @@ impl CudaFunction {
     pub fn launch(&self, grid: [u32; 3], block: [u32; 3], shared_mem_bytes: u32, args: &mut [*mut c_void]) -> Result<()> {
         ensure_context(self.device_index)?;
         let a = api()?;
+        let timed = kernel_profiling();
+        if timed {
+            check(unsafe { (a.cu_stream_synchronize)(std::ptr::null_mut()) }, "cuStreamSynchronize(profile)")?;
+        }
+        let t0 = std::time::Instant::now();
         check(
             unsafe {
                 (a.cu_launch_kernel)(
@@ -817,6 +919,10 @@ impl CudaFunction {
         )?;
         if sync_each_launch() {
             check(unsafe { (a.cu_ctx_synchronize)() }, "cuCtxSynchronize (OXIDEON_CUDA_SYNC)")?;
+        }
+        if timed {
+            check(unsafe { (a.cu_stream_synchronize)(std::ptr::null_mut()) }, "cuStreamSynchronize(profile)")?;
+            record_kernel_time(&self.name, t0.elapsed().as_secs_f64());
         }
         Ok(())
     }
@@ -859,7 +965,7 @@ impl CudaPtxModule {
         let c_name = CString::new(name).map_err(|e| Error::Backend(e.to_string()))?;
         let mut func: CUfunction = std::ptr::null_mut();
         check(unsafe { (a.cu_module_get_function)(&mut func, self.module, c_name.as_ptr()) }, &format!("cuModuleGetFunction({name})"))?;
-        Ok(CudaFunction { raw: func as usize, device_index: self.device_index, _module: self.clone() })
+        Ok(CudaFunction { raw: func as usize, device_index: self.device_index, name: Arc::from(name), _module: self.clone() })
     }
 }
 

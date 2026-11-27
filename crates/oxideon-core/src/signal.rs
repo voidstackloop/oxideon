@@ -331,6 +331,44 @@ pub fn istft(spec: &Complex, o: &StftOptions, length: Option<usize>) -> Result<T
     if unbatched { out.squeeze_axis(0) } else { Ok(out) }
 }
 
+/// Fast Griffin-Lim phase reconstruction (Perraudin et al., 2013): the waveform whose STFT magnitude best matches `mag`
+/// (`[freq, frames]` or `[B, freq, frames]`, one-sided, made with the same `o`). Starts from a random phase (`seed`) and
+/// alternates the projection onto consistent spectrograms (`stft(istft(c))`, accelerated with `momentum`) with re-imposing the
+/// magnitude. Returns `[(frames - 1) * hop_length]` samples (`[B, ..]` when batched).
+pub fn griffin_lim(mag: &Tensor, o: &StftOptions, n_iter: usize, momentum: f64, seed: u64) -> Result<Tensor> {
+    let unbatched = mag.ndim() == 2;
+    let mag = if unbatched { mag.unsqueeze(0)? } else if mag.ndim() == 3 { mag.clone() } else { return Err(Error::Msg("griffin_lim: expects [freq, frames] or [B, freq, frames]".into())) };
+    let (n, frames) = (mag.shape()[0] * mag.shape()[1] * mag.shape()[2], mag.shape()[2]);
+    if frames == 0 || n == 0 {
+        return Err(Error::Msg("griffin_lim: empty spectrogram".into()));
+    }
+    let length = (frames - 1) * o.hop_length;
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        // splitmix64 -> uniform [0, 1)
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let (cos, sin): (Vec<f64>, Vec<f64>) = (0..n).map(|_| { let a = next() * TAU; (a.cos(), a.sin()) }).unzip();
+    let dev = mag.device();
+    let shape = mag.shape().to_vec();
+    let mk = |v: Vec<f64>| -> Result<Tensor> { Tensor::from_slice_on(&v, &shape, &dev)?.to_dtype(mag.dtype()) };
+    let mut c = Complex::new(mag.mul(&mk(cos)?)?, mag.mul(&mk(sin)?)?)?;
+    let mut prev = c.clone();
+    for _ in 0..n_iter {
+        let t = stft(&istft(&c, o, Some(length))?, o)?;
+        let extrapolated = t.add(&t.sub(&prev)?.scale(momentum)?)?;
+        let inv = extrapolated.abs()?.clamp(1e-12, f64::INFINITY)?.recip()?;
+        c = extrapolated.mul_real(&inv.mul(&mag)?)?;
+        prev = t;
+    }
+    let out = istft(&c, o, Some(length))?;
+    if unbatched { out.squeeze_axis(0) } else { Ok(out) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +381,22 @@ mod tests {
         for (x, y) in a.iter().zip(b) {
             assert!((x - y).abs() < tol, "{a:?} vs {b:?}");
         }
+    }
+
+    #[test]
+    fn griffin_lim_recovers_a_consistent_spectrogram() {
+        let n = 2048usize;
+        let x: Vec<f64> = (0..n).map(|i| (i as f64 * 0.21).sin() + 0.5 * (i as f64 * 0.047).sin()).collect();
+        let x = Tensor::from_slice_on(&x, &[n], &crate::backend::Device::Cpu).unwrap();
+        let mut o = StftOptions::new(256, 64);
+        o.window = Some(hann_window(256, true, DType::F64).unwrap());
+        let mag = stft(&x, &o).unwrap().abs().unwrap();
+        let y = griffin_lim(&mag, &o, 60, 0.99, 7).unwrap();
+        let again = stft(&y, &o).unwrap().abs().unwrap();
+        let (a, b) = (v(&mag), v(&again));
+        let err: f64 = a.iter().zip(&b).map(|(p, q)| (p - q) * (p - q)).sum::<f64>().sqrt() / a.iter().map(|p| p * p).sum::<f64>().sqrt();
+        assert!(err < 0.2, "spectral convergence {err}");
+        assert_eq!(y.shape(), &[(mag.shape()[1] - 1) * 64]);
     }
 
     #[test]

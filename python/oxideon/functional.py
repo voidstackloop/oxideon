@@ -149,6 +149,8 @@ def tanh(input: _Tensor) -> _Tensor:
 
 def leaky_relu(input: _Tensor, negative_slope: float = 0.01) -> _Tensor:
     """Applies element-wise LeakyReLU function: max(0, x) + negative_slope * min(0, x)."""
+    if hasattr(input, "leaky_relu"):  # one fused op (and one backward) instead of five
+        return input.leaky_relu(float(negative_slope))
     return input.relu() - ((-input).relu() * float(negative_slope))
 
 
@@ -309,6 +311,9 @@ _SDPA_NEG_FILL = {
 }
 
 
+_SDPA_CAUSAL_CACHE: dict = {}
+
+
 def _apply_sdpa_keep_mask(scores: _Tensor, keep: _Tensor) -> _Tensor:
     """Applies a 0/1 keep mask to attention scores on the scores' device/dtype."""
     neg = _SDPA_NEG_FILL.get(str(scores.dtype), -1e9)
@@ -322,7 +327,9 @@ def _apply_sdpa_keep_mask(scores: _Tensor, keep: _Tensor) -> _Tensor:
             k = k.to_dtype(scores.dtype)
     except Exception:
         pass
-    return scores * k + (1.0 - k) * neg
+    # one full-size op: the additive mask is built on the (broadcast) mask's own shape. A masked score becomes score + neg
+    # (not exactly neg); after the softmax it is zero either way.
+    return scores + (1.0 - k) * neg
 
 
 def scaled_dot_product_attention(
@@ -339,17 +346,29 @@ def scaled_dot_product_attention(
     Mathematically: Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k) + mask) V.
     Supports (..., L, d_k) queries, (..., S, d_k) keys, and (..., S, d_v) values.
     """
+    # CUDA: the fused kernel (forward and backward never store the L x S scores); None when it does not apply
+    from . import oxideon as _ext
+    _fused_attention = getattr(_ext, "_fused_attention", None)  # absent in an older compiled extension
+    if _fused_attention is not None and dropout_p == 0.0 and (attn_mask is None or isinstance(attn_mask, _Tensor)):
+        out = _fused_attention(query, key, value, attn_mask, bool(is_causal), None if scale is None else float(scale))
+        if out is not None:
+            return out
     # Differentiable native path (stays in the autograd graph).
     scale_factor = (1.0 / math.sqrt(query.shape[-1])) if scale is None else float(scale)
-    scores = query.matmul(key.transpose(-2, -1)) * scale_factor
+    scores = (query * scale_factor).matmul(key.transpose(-2, -1))  # scale the small operand, not the L x S scores
 
     if is_causal:
         L = query.shape[-2]
         S = key.shape[-2]
-        keep = _from_numpy((1.0 - np.triu(np.ones((L, S), dtype=np.float32), k=1)))
+        keep = _SDPA_CAUSAL_CACHE.get((L, S))
+        if keep is None:
+            keep = _SDPA_CAUSAL_CACHE[(L, S)] = _from_numpy((1.0 - np.triu(np.ones((L, S), dtype=np.float32), k=1)))
         scores = _apply_sdpa_keep_mask(scores, keep)
 
-    if attn_mask is not None:
+    if isinstance(attn_mask, _Tensor):
+        # tensor masks stay on their device (no host round trip): boolean = keep, float = added to the scores
+        scores = _apply_sdpa_keep_mask(scores, attn_mask) if str(attn_mask.dtype) == "bool" else scores + attn_mask
+    elif attn_mask is not None:
         m_np = _to_np(attn_mask)
         if m_np.dtype == bool or m_np.dtype == np.bool_:
             keep = _from_numpy(_contig(m_np, dtype=np.float32))
@@ -535,6 +554,49 @@ def _resolve_conv_padding(
     return p_tuple, None
 
 
+def _ctup(v: Any, n: int) -> Tuple[int, ...]:
+    return (int(v),) * n if isinstance(v, (int, np.integer)) else tuple(int(x) for x in v)
+
+
+def _conv_padding(input: _Tensor, weight: _Tensor, padding: Any, dilation: Any, n: int) -> Tuple[_Tensor, Tuple[int, ...]]:
+    """Resolves `padding` ('same', 'valid', an int or a tuple) into symmetric per-dim padding, pre-padding the input at the end
+    when 'same' needs an extra element (even kernels)."""
+    if not isinstance(padding, str):
+        return input, _ctup(padding, n)
+    if padding == "valid":
+        return input, (0,) * n
+    if padding != "same":
+        raise ValueError(f"padding must be 'same', 'valid', an int or a tuple, got {padding!r}")
+    sym, extra = [], []
+    for k, d in zip((int(weight.shape[2 + i]) for i in range(n)), _ctup(dilation, n)):
+        total = d * (k - 1)
+        sym.append(total // 2)
+        extra.append(total - 2 * (total // 2))
+    if any(extra):
+        spec: List[int] = []
+        for e in reversed(extra):
+            spec += [0, e]
+        input = pad(input, spec)
+    return input, tuple(sym)
+
+
+def _dilate_kernel(weight: _Tensor, dilation: Tuple[int, ...]) -> _Tensor:
+    """Inserts `d - 1` zeros between kernel taps along each spatial dim (so a dilated conv is an ordinary conv; differentiable)."""
+    for i, d in enumerate(dilation):
+        if d == 1:
+            continue
+        axis = 2 + i
+        k = int(weight.shape[axis])
+        w = weight.unsqueeze(axis + 1)
+        zshape = list(w.shape)
+        zshape[axis + 1] = d - 1
+        z = _Tensor.zeros([int(v) for v in zshape], dtype=weight.dtype)
+        shape = list(weight.shape)
+        shape[axis] = k * d
+        weight = _native_cat([w, z], axis + 1).reshape([int(v) for v in shape]).narrow(axis, 0, (k - 1) * d + 1)
+    return weight
+
+
 def conv1d(
     input: _Tensor,
     weight: _Tensor,
@@ -544,73 +606,49 @@ def conv1d(
     dilation: int = 1,
     groups: int = 1,
 ) -> _Tensor:
-    """Applies a 1D convolution over an input signal composed of several input planes."""
-    x = _as_tensor(input)
-    w = _as_tensor(weight)
-    p_sym, p_asym = _resolve_conv_padding(padding, (stride,), (w.shape[2],), (dilation,), "conv1d")
-    if p_asym is not None:
-        x = _diff_pad_nd(x, p_asym)
-    return _native_conv1d(x, w, bias, stride, p_sym[0], dilation, groups)
-
+    """Applies a 1D convolution over an input signal composed of several input planes (`padding` may be 'same' / 'valid')."""
+    input, p = _conv_padding(input, weight, padding, dilation, 1)
+    return _native_conv1d(input, weight, bias, _ctup(stride, 1)[0], p[0], _ctup(dilation, 1)[0], groups)
 
 def conv2d(
     input: _Tensor,
     weight: _Tensor,
     bias: Optional[_Tensor] = None,
     stride: Union[int, Tuple[int, int]] = 1,
-    padding: Union[int, Tuple[int, int], str] = 0,
+    padding: Union[int, str, Tuple[int, int]] = 0,
     dilation: Union[int, Tuple[int, int]] = 1,
     groups: int = 1,
 ) -> _Tensor:
-    """Applies a 2D convolution over an input image composed of several input planes."""
-    x = _as_tensor(input)
-    w = _as_tensor(weight)
-    s = (stride, stride) if isinstance(stride, int) else tuple(stride)
-    d = (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
-    p_sym, p_asym = _resolve_conv_padding(padding, s, (w.shape[2], w.shape[3]), d, "conv2d")
-    if p_asym is not None:
-        x = _diff_pad_nd(x, p_asym)
-    return _native_conv2d(x, w, bias, s, p_sym, d, groups)
-
+    """Applies a 2D convolution over an input image composed of several input planes (`padding` may be 'same' / 'valid')."""
+    input, p = _conv_padding(input, weight, padding, dilation, 2)
+    return _native_conv2d(input, weight, bias, _ctup(stride, 2), p, _ctup(dilation, 2), groups)
 
 def conv3d(
     input: _Tensor,
     weight: _Tensor,
     bias: Optional[_Tensor] = None,
     stride: Union[int, Tuple[int, int, int]] = 1,
-    padding: Union[int, Tuple[int, int, int]] = 0,
-    dilation: int = 1,
+    padding: Union[int, str, Tuple[int, int, int]] = 0,
+    dilation: Union[int, Tuple[int, int, int]] = 1,
     groups: int = 1,
 ) -> _Tensor:
-    """Applies a 3D convolution over an input volumetric image."""
-    s3 = (stride, stride, stride) if isinstance(stride, int) else tuple(stride)
-    p3 = (padding, padding, padding) if isinstance(padding, int) else tuple(padding)
-    if (
-        isinstance(input, _Tensor)
-        and isinstance(weight, _Tensor)
-        and hasattr(input, "conv3d")
-        and dilation == 1
-        and groups == 1
-    ):
+    """Applies a 3D convolution over an input volumetric image (native kernel; `groups` split the channels, `dilation` inflates
+    the kernel with zeros, both differentiable)."""
+    d = _ctup(dilation, 3)
+    s3 = _ctup(stride, 3)
+    input, p3 = _conv_padding(input, weight, padding, d, 3)
+    if any(v != 1 for v in d):
+        weight = _dilate_kernel(weight, d)
+    if groups == 1:
         return input.conv3d(weight, bias=bias, stride=s3, padding=p3)
-
-    x = _to_np(input)
-    w = _to_np(weight)
-    if p3 != (0, 0, 0):
-        x = np.pad(x, ((0, 0), (0, 0), (p3[0], p3[0]), (p3[1], p3[1]), (p3[2], p3[2])), mode="constant")
-    N, C_in, D_in, H_in, W_in = x.shape
-    C_out, _, kD, kH, kW = w.shape
-    eff_kd = (kD - 1) * dilation + 1
-    eff_kh = (kH - 1) * dilation + 1
-    eff_kw = (kW - 1) * dilation + 1
-
-    windows = np.lib.stride_tricks.sliding_window_view(x, (eff_kd, eff_kh, eff_kw), axis=(2, 3, 4))
-    windows = windows[:, :, ::s3[0], ::s3[1], ::s3[2], ::dilation, ::dilation, ::dilation]
-    res = np.einsum("ncdhwijk,ocijk->nodhw", windows, w)
-    if bias is not None:
-        res = res + _to_np(bias)[None, :, None, None, None]
-    return _wrap(res, like=input)
-
+    cg = int(input.shape[1]) // groups
+    og = int(weight.shape[0]) // groups
+    outs = [
+        input.narrow(1, g * cg, cg).conv3d(weight.narrow(0, g * og, og), bias=None if bias is None else bias.narrow(0, g * og, og),
+                                           stride=s3, padding=p3)
+        for g in range(groups)
+    ]
+    return _native_cat(outs, 1)
 
 def _grouped_conv_t_matmul(x_pt: _Tensor, w_pt: _Tensor, groups: int) -> _Tensor:
     """Grouped linear projection [N, C_in] @ [C_in, C_out_per_group] -> [N, C_out_per_group * groups]."""
@@ -624,130 +662,64 @@ def _grouped_conv_t_matmul(x_pt: _Tensor, w_pt: _Tensor, groups: int) -> _Tensor
     return xg.matmul(wg).transpose(0, 1).reshape([n, groups * c_out_g])
 
 
+def _conv_transpose_nd(n: int, input: _Tensor, weight: _Tensor, bias: Optional[_Tensor], stride: Any, padding: Any,
+                       output_padding: Any, groups: int, dilation: Any) -> _Tensor:
+    x, w = _as_tensor(input), _as_tensor(weight)
+    args = [_ctup(v, n) for v in (stride, padding, output_padding, dilation)]
+    if n == 1:
+        args = [a[0] for a in args]
+    stride_, padding_, output_padding_, dilation_ = args
+    method = f"conv_transpose{n}d"
+    if groups == 1:
+        return getattr(x, method)(w, bias, stride_, padding_, output_padding_, dilation_)
+    cg = int(w.shape[0]) // groups
+    og = int(w.shape[1])
+    outs = [
+        getattr(x.narrow(1, g * cg, cg), method)(w.narrow(0, g * cg, cg), None if bias is None else bias.narrow(0, g * og, og),
+                                                  stride_, padding_, output_padding_, dilation_)
+        for g in range(groups)
+    ]
+    return _native_cat(outs, 1)
+
+
 def conv_transpose1d(
     input: _Tensor,
     weight: _Tensor,
     bias: Optional[_Tensor] = None,
-    stride: int = 1,
-    padding: int = 0,
-    output_padding: int = 0,
+    stride: Any = 1,
+    padding: Any = 0,
+    output_padding: Any = 0,
     groups: int = 1,
-    dilation: int = 1,
+    dilation: Any = 1,
 ) -> _Tensor:
-    """Applies a 1D transposed convolution operator over an input signal."""
-    # Differentiable masked accumulation (stays in the autograd graph).
-    x = _as_tensor(input)
-    w = _as_tensor(weight)
-    N, C_in, L_in = (int(v) for v in x.shape)
-    _, C_out, K = (int(v) for v in w.shape)
-    L_out = (L_in - 1) * stride - 2 * padding + (K - 1) * dilation + output_padding + 1
-    dt = _to_np(x).dtype
-    out = _from_numpy(np.zeros((N, C_out * groups, L_out), dtype=dt))
-    for i in range(L_in):
-        start = i * stride - padding
-        for k in range(K):
-            pos = start + k * dilation
-            if 0 <= pos < L_out:
-                contrib = _grouped_conv_t_matmul(x[:, :, i], w[:, :, k], groups)
-                mask = np.zeros((L_out,), dtype=dt)
-                mask[pos] = 1
-                out = out + contrib[:, :, None] * _from_numpy(mask)
-    if bias is not None:
-        b = bias if isinstance(bias, _Tensor) else _from_numpy(_contig(_to_np(bias)))
-        out = out + b.reshape([1, -1, 1])
-    return out
-
+    """Applies a 1D transposed convolution (native kernel; `groups` split the channels)."""
+    return _conv_transpose_nd(1, input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 def conv_transpose2d(
     input: _Tensor,
     weight: _Tensor,
     bias: Optional[_Tensor] = None,
-    stride: Union[int, Tuple[int, int]] = 1,
-    padding: Union[int, Tuple[int, int]] = 0,
-    output_padding: Union[int, Tuple[int, int]] = 0,
+    stride: Any = 1,
+    padding: Any = 0,
+    output_padding: Any = 0,
     groups: int = 1,
-    dilation: Union[int, Tuple[int, int]] = 1,
+    dilation: Any = 1,
 ) -> _Tensor:
-    """Applies a 2D transposed convolution operator over an input image."""
-    # Differentiable masked accumulation (stays in the autograd graph).
-    s = (stride, stride) if isinstance(stride, int) else stride
-    p = (padding, padding) if isinstance(padding, int) else padding
-    op = (output_padding, output_padding) if isinstance(output_padding, int) else output_padding
-    d = (dilation, dilation) if isinstance(dilation, int) else dilation
-
-    x = _as_tensor(input)
-    w = _as_tensor(weight)
-    N, C_in, H_in, W_in = (int(v) for v in x.shape)
-    _, C_out, kH, kW = (int(v) for v in w.shape)
-    H_out = (H_in - 1) * s[0] - 2 * p[0] + (kH - 1) * d[0] + op[0] + 1
-    W_out = (W_in - 1) * s[1] - 2 * p[1] + (kW - 1) * d[1] + op[1] + 1
-
-    dt = _to_np(x).dtype
-    out = _from_numpy(np.zeros((N, C_out * groups, H_out, W_out), dtype=dt))
-    for h in range(H_in):
-        for w_idx in range(W_in):
-            h_start = h * s[0] - p[0]
-            w_start = w_idx * s[1] - p[1]
-            for kh in range(kH):
-                for kw in range(kW):
-                    pos_h = h_start + kh * d[0]
-                    pos_w = w_start + kw * d[1]
-                    if 0 <= pos_h < H_out and 0 <= pos_w < W_out:
-                        contrib = _grouped_conv_t_matmul(x[:, :, h, w_idx], w[:, :, kh, kw], groups)
-                        mask = np.zeros((H_out, W_out), dtype=dt)
-                        mask[pos_h, pos_w] = 1
-                        out = out + contrib[:, :, None, None] * _from_numpy(mask)
-
-    if bias is not None:
-        b = bias if isinstance(bias, _Tensor) else _from_numpy(_contig(_to_np(bias)))
-        out = out + b.reshape([1, -1, 1, 1])
-    return out
-
+    """Applies a 2D transposed convolution (native kernel; `groups` split the channels)."""
+    return _conv_transpose_nd(2, input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 def conv_transpose3d(
     input: _Tensor,
     weight: _Tensor,
     bias: Optional[_Tensor] = None,
-    stride: int = 1,
-    padding: int = 0,
-    output_padding: int = 0,
+    stride: Any = 1,
+    padding: Any = 0,
+    output_padding: Any = 0,
     groups: int = 1,
-    dilation: int = 1,
+    dilation: Any = 1,
 ) -> _Tensor:
-    """Applies a 3D transposed convolution operator over an input volumetric image."""
-    # Differentiable masked accumulation (stays in the autograd graph).
-    x = _as_tensor(input)
-    w = _as_tensor(weight)
-    N, C_in, D_in, H_in, W_in = (int(v) for v in x.shape)
-    _, C_out, kD, kH, kW = (int(v) for v in w.shape)
-    D_out = (D_in - 1) * stride - 2 * padding + (kD - 1) * dilation + output_padding + 1
-    H_out = (H_in - 1) * stride - 2 * padding + (kH - 1) * dilation + output_padding + 1
-    W_out = (W_in - 1) * stride - 2 * padding + (kW - 1) * dilation + output_padding + 1
-
-    dt = _to_np(x).dtype
-    out = _from_numpy(np.zeros((N, C_out * groups, D_out, H_out, W_out), dtype=dt))
-    for d in range(D_in):
-        for h in range(H_in):
-            for w_idx in range(W_in):
-                d_pos = d * stride - padding
-                h_pos = h * stride - padding
-                w_pos = w_idx * stride - padding
-                for kd in range(kD):
-                    for kh in range(kH):
-                        for kw in range(kW):
-                            pd = d_pos + kd * dilation
-                            ph = h_pos + kh * dilation
-                            pw = w_pos + kw * dilation
-                            if 0 <= pd < D_out and 0 <= ph < H_out and 0 <= pw < W_out:
-                                contrib = _grouped_conv_t_matmul(x[:, :, d, h, w_idx], w[:, :, kd, kh, kw], groups)
-                                mask = np.zeros((D_out, H_out, W_out), dtype=dt)
-                                mask[pd, ph, pw] = 1
-                                out = out + contrib[:, :, None, None, None] * _from_numpy(mask)
-    if bias is not None:
-        b = bias if isinstance(bias, _Tensor) else _from_numpy(_contig(_to_np(bias)))
-        out = out + b.reshape([1, -1, 1, 1, 1])
-    return out
-
+    """Applies a 3D transposed convolution (native kernel; `groups` split the channels)."""
+    return _conv_transpose_nd(3, input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 # ---------------------------------------------------------------------------
 # Pooling

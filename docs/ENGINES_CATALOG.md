@@ -1,4 +1,4 @@
-# Oxideon Engines Catalog (0.1.0)
+# Oxideon Engines Catalog (0.1.1)
 
 A comprehensive classification of all 1,000 modular scientific, physical, mathematical, and deep learning engines across the 100 Decadal Eras of Oxideon.
 

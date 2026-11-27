@@ -2783,6 +2783,66 @@ impl PyTensor {
         Ok(Self { inner: out })
     }
 
+    /// Transposed 1-D convolution (`weight` is `[C_in, C_out, k]`); differentiable.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (weight, bias=None, stride=1, padding=0, output_padding=0, dilation=1))]
+    pub fn conv_transpose1d(
+        &self,
+        py: Python<'_>,
+        weight: &PyTensor,
+        bias: Option<&PyTensor>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        dilation: usize,
+    ) -> PyResult<Self> {
+        let b = bias.map(|b| &b.inner);
+        let out = py
+            .detach(|| self.inner.conv_transpose1d(&weight.inner, b, stride, padding, output_padding, dilation))
+            .map_err(to_py_err)?;
+        Ok(Self { inner: out })
+    }
+
+    /// Transposed 2-D convolution (`weight` is `[C_in, C_out, kH, kW]`); differentiable.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (weight, bias=None, stride=(1, 1), padding=(0, 0), output_padding=(0, 0), dilation=(1, 1)))]
+    pub fn conv_transpose2d(
+        &self,
+        py: Python<'_>,
+        weight: &PyTensor,
+        bias: Option<&PyTensor>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        output_padding: (usize, usize),
+        dilation: (usize, usize),
+    ) -> PyResult<Self> {
+        let b = bias.map(|b| &b.inner);
+        let out = py
+            .detach(|| self.inner.conv_transpose2d(&weight.inner, b, stride, padding, output_padding, dilation))
+            .map_err(to_py_err)?;
+        Ok(Self { inner: out })
+    }
+
+    /// Transposed 3-D convolution (`weight` is `[C_in, C_out, kD, kH, kW]`); differentiable.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (weight, bias=None, stride=(1, 1, 1), padding=(0, 0, 0), output_padding=(0, 0, 0), dilation=(1, 1, 1)))]
+    pub fn conv_transpose3d(
+        &self,
+        py: Python<'_>,
+        weight: &PyTensor,
+        bias: Option<&PyTensor>,
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        output_padding: (usize, usize, usize),
+        dilation: (usize, usize, usize),
+    ) -> PyResult<Self> {
+        let b = bias.map(|b| &b.inner);
+        let out = py
+            .detach(|| self.inner.conv_transpose3d(&weight.inner, b, stride, padding, output_padding, dilation))
+            .map_err(to_py_err)?;
+        Ok(Self { inner: out })
+    }
+
     pub fn select(&self, axis: isize, index: isize) -> PyResult<Self> {
         Ok(Self {
             inner: self.inner.select(axis, index).map_err(to_py_err)?,
@@ -2913,6 +2973,11 @@ impl PyTensor {
 
     pub fn relu(&self, py: Python<'_>) -> PyResult<Self> {
         let inner = py.detach(|| self.inner.relu()).map_err(to_py_err)?;
+        Ok(Self { inner })
+    }
+
+    pub fn leaky_relu(&self, py: Python<'_>, slope: f64) -> PyResult<Self> {
+        let inner = py.detach(|| self.inner.leaky_relu(slope)).map_err(to_py_err)?;
         Ok(Self { inner })
     }
 
@@ -3890,8 +3955,18 @@ impl PyTensor {
 
     // --- Autograd (GIL-Released) ---
 
-    pub fn backward(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.inner.backward()).map_err(to_py_err)
+    /// `release=True` frees the graph as backward walks it (PyTorch's `retain_graph=False`); the default keeps it.
+    #[pyo3(signature = (release=false))]
+    pub fn backward(&self, py: Python<'_>, release: bool) -> PyResult<()> {
+        py.detach(|| {
+            if release {
+                let seed = self.inner.ones_like()?;
+                self.inner.backward_release(&seed)
+            } else {
+                self.inner.backward()
+            }
+        })
+        .map_err(to_py_err)
     }
 
     pub fn backward_create_graph(&self, py: Python<'_>) -> PyResult<()> {
@@ -11046,6 +11121,33 @@ impl PyAdamW {
         })
     }
 
+    /// Applies new hyper-parameters (`betas`, `eps`, `weight_decay`, `amsgrad`, `maximize`; missing keys keep their value)
+    /// to the running optimizer, keeping its moments.
+    pub fn _set_hyper(&mut self, hyper: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
+        let mut betas = self.betas;
+        let (mut eps, mut wd, mut ams, mut mx) = (self.eps, self.weight_decay, self.amsgrad, self.maximize);
+        for (k, v) in hyper.iter() {
+            match k.extract::<String>()?.as_str() {
+                "betas" => betas = v.extract()?,
+                "eps" => eps = v.extract()?,
+                "weight_decay" => wd = v.extract()?,
+                "amsgrad" => ams = v.extract()?,
+                "maximize" => mx = v.extract()?,
+                _ => {}
+            }
+        }
+        non_negative("eps", eps)?;
+        non_negative("weight_decay", wd)?;
+        for (name, b) in [("betas[0]", betas.0), ("betas[1]", betas.1)] {
+            if !(0.0..1.0).contains(&b) {
+                return Err(PyValueError::new_err(format!("{name} must be in [0, 1), got {b}")));
+            }
+        }
+        self.inner.set_hyper(betas, eps, wd, ams, mx);
+        (self.betas, self.eps, self.weight_decay, self.amsgrad, self.maximize) = (betas, eps, wd, ams, mx);
+        Ok(())
+    }
+
     pub fn step(&mut self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.inner.step()).map_err(to_py_err)
     }
@@ -11159,6 +11261,30 @@ impl PySGD {
         })
     }
 
+    /// Applies new hyper-parameters (`momentum`, `dampening`, `weight_decay`, `nesterov`, `maximize`; missing keys keep their
+    /// value) to the running optimizer, keeping its momentum buffers.
+    pub fn _set_hyper(&mut self, hyper: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
+        let (mut m, mut d, mut wd, mut nes, mut mx) = (self.momentum, self.dampening, self.weight_decay, self.nesterov, self.maximize);
+        for (k, v) in hyper.iter() {
+            match k.extract::<String>()?.as_str() {
+                "momentum" => m = v.extract()?,
+                "dampening" => d = v.extract()?,
+                "weight_decay" => wd = v.extract()?,
+                "nesterov" => nes = v.extract()?,
+                "maximize" => mx = v.extract()?,
+                _ => {}
+            }
+        }
+        non_negative("momentum", m)?;
+        non_negative("weight_decay", wd)?;
+        if nes && (m <= 0.0 || d != 0.0) {
+            return Err(PyValueError::new_err("Nesterov momentum requires a momentum and zero dampening"));
+        }
+        self.inner.set_hyper(m, d, wd, nes, mx);
+        (self.momentum, self.dampening, self.weight_decay, self.nesterov, self.maximize) = (m, d, wd, nes, mx);
+        Ok(())
+    }
+
     pub fn step(&mut self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.inner.step()).map_err(to_py_err)
     }
@@ -11248,6 +11374,33 @@ impl PyAdam {
             amsgrad,
             maximize,
         })
+    }
+
+    /// Applies new hyper-parameters (`betas`, `eps`, `weight_decay`, `amsgrad`, `maximize`; missing keys keep their value)
+    /// to the running optimizer, keeping its moments.
+    pub fn _set_hyper(&mut self, hyper: &Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
+        let mut betas = self.betas;
+        let (mut eps, mut wd, mut ams, mut mx) = (self.eps, self.weight_decay, self.amsgrad, self.maximize);
+        for (k, v) in hyper.iter() {
+            match k.extract::<String>()?.as_str() {
+                "betas" => betas = v.extract()?,
+                "eps" => eps = v.extract()?,
+                "weight_decay" => wd = v.extract()?,
+                "amsgrad" => ams = v.extract()?,
+                "maximize" => mx = v.extract()?,
+                _ => {}
+            }
+        }
+        non_negative("eps", eps)?;
+        non_negative("weight_decay", wd)?;
+        for (name, b) in [("betas[0]", betas.0), ("betas[1]", betas.1)] {
+            if !(0.0..1.0).contains(&b) {
+                return Err(PyValueError::new_err(format!("{name} must be in [0, 1), got {b}")));
+            }
+        }
+        self.inner.set_hyper(betas, eps, wd, ams, mx);
+        (self.betas, self.eps, self.weight_decay, self.amsgrad, self.maximize) = (betas, eps, wd, ams, mx);
+        Ok(())
     }
 
     pub fn step(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -27819,6 +27972,12 @@ pub fn register_python_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_scatter_reduce, m)?)?;
     m.add_function(wrap_pyfunction!(py_sparse_adam_step, m)?)?;
     m.add_function(wrap_pyfunction!(py_optim_step, m)?)?;
+    m.add_function(wrap_pyfunction!(py_griffin_lim, m)?)?;
+    m.add_function(wrap_pyfunction!(py_pitch_track, m)?)?;
+    m.add_function(wrap_pyfunction!(py_harmonic_synth, m)?)?;
+    m.add_function(wrap_pyfunction!(py_pulse_train, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fused_attention, m)?)?;
+    m.add_function(wrap_pyfunction!(py_refine_boundaries, m)?)?;
     m.add_function(wrap_pyfunction!(py_gcd_lcm, m)?)?;
     m.add_function(wrap_pyfunction!(py_frexp, m)?)?;
     m.add_function(wrap_pyfunction!(py_ldexp, m)?)?;
@@ -27997,6 +28156,102 @@ pub fn py_solve_ex(py: Python<'_>, a: &PyTensor, b: &PyTensor, left: bool) -> Py
 #[pyo3(name = "_cholesky_ex", signature = (a, upper=false))]
 pub fn py_cholesky_ex(py: Python<'_>, a: &PyTensor, upper: bool) -> PyResult<(PyTensor, PyTensor)> {
     Ok(py2(py.detach(|| a.inner.cholesky_ex(upper)).map_err(to_py_err)?))
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(name = "_griffin_lim", signature = (mag, n_fft, hop_length, window, n_iter=32, momentum=0.99, seed=0))]
+pub fn py_griffin_lim(
+    py: Python<'_>,
+    mag: &PyTensor,
+    n_fft: usize,
+    hop_length: usize,
+    window: Option<&PyTensor>,
+    n_iter: usize,
+    momentum: f64,
+    seed: u64,
+) -> PyResult<PyTensor> {
+    let inner = py
+        .detach(|| {
+            let mut o = crate::signal::StftOptions::new(n_fft, hop_length);
+            o.window = window.map(|w| w.inner.clone());
+            crate::signal::griffin_lim(&mag.inner, &o, n_iter, momentum, seed)
+        })
+        .map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+/// YIN pitch track of a mono waveform: `(f0 [frames], confidence [frames])`, frame `t` centred on sample `t * hop`.
+#[pyfunction]
+#[pyo3(name = "_pitch_track", signature = (wave, sample_rate, hop, fmin=60.0, fmax=500.0))]
+pub fn py_pitch_track(py: Python<'_>, wave: &PyTensor, sample_rate: usize, hop: usize, fmin: f32, fmax: f32) -> PyResult<(PyTensor, PyTensor)> {
+    let x = wave.inner.to_dtype(crate::dtype::DType::F32).map_err(to_py_err)?.to_vec::<f32>().map_err(to_py_err)?;
+    let (f0, conf) = py
+        .detach(|| crate::voice::pitch_track(&x, sample_rate, hop, fmin, fmax))
+        .map_err(to_py_err)?;
+    let mk = |v: Vec<f32>| Tensor::from_slice_on(&v, &[v.len()], &crate::backend::Device::Cpu).map_err(to_py_err);
+    Ok((PyTensor { inner: mk(f0)? }, PyTensor { inner: mk(conf)? }))
+}
+
+/// Harmonic-plus-noise waveform from `f0 [frames]`, `voiced [frames]` and a magnitude envelope `env [frames, n_fft / 2 + 1]`.
+#[pyfunction]
+#[pyo3(name = "_refine_boundaries", signature = (feats, dim, durations, max_shift=4, min_len=2, penalty=0.0))]
+pub fn py_refine_boundaries(py: Python<'_>, feats: &PyTensor, dim: usize, durations: Vec<i64>, max_shift: usize, min_len: usize, penalty: f64) -> PyResult<Vec<i64>> {
+    let f = feats.inner.to_dtype(crate::dtype::DType::F32).and_then(|t| t.contiguous()).and_then(|t| t.to_vec::<f32>()).map_err(to_py_err)?;
+    py.detach(|| crate::voice::refine_boundaries(&f, dim, &durations, max_shift, min_len, penalty)).map_err(to_py_err)
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(name = "_harmonic_synth", signature = (f0, voiced, env, sample_rate, n_fft, hop, gain=1.9, breath=0.4, noise_gain=0.65, seed=0))]
+pub fn py_harmonic_synth(
+    py: Python<'_>,
+    f0: &PyTensor,
+    voiced: &PyTensor,
+    env: &PyTensor,
+    sample_rate: usize,
+    n_fft: usize,
+    hop: usize,
+    gain: f32,
+    breath: f32,
+    noise_gain: f32,
+    seed: u64,
+) -> PyResult<PyTensor> {
+    let get = |t: &PyTensor| t.inner.to_dtype(crate::dtype::DType::F32).and_then(|t| t.contiguous()).and_then(|t| t.to_vec::<f32>()).map_err(to_py_err);
+    let (f0, voiced, env) = (get(f0)?, get(voiced)?, get(env)?);
+    let mut o = crate::voice::SynthOptions::new(sample_rate, n_fft, hop);
+    o.gain = gain;
+    o.breath = breath;
+    o.noise_gain = noise_gain;
+    o.seed = seed;
+    let y = py.detach(|| crate::voice::harmonic_synth(&f0, &voiced, &env, &o)).map_err(to_py_err)?;
+    let inner = Tensor::from_slice_on(&y, &[y.len()], &crate::backend::Device::Cpu).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
+}
+
+/// Fused CUDA attention (training too: F32, its own backward), or `None` when it does not apply (CPU, unsupported shape or
+/// dtype, a mask that needs gradients); the caller then uses the composed path.
+#[pyfunction]
+#[pyo3(name = "_fused_attention", signature = (q, k, v, mask=None, causal=false, scale=None))]
+pub fn py_fused_attention(py: Python<'_>, q: &PyTensor, k: &PyTensor, v: &PyTensor, mask: Option<&PyTensor>, causal: bool, scale: Option<f64>) -> PyResult<Option<PyTensor>> {
+    if causal && mask.is_some() {
+        return Ok(None);
+    }
+    let d = *q.inner.shape().last().unwrap_or(&1);
+    let scale = scale.unwrap_or(1.0 / (d.max(1) as f64).sqrt());
+    let out = py
+        .detach(|| crate::nn::functional_ext::attention_fused_cuda(&q.inner, &k.inner, &v.inner, mask.map(|m| &m.inner), causal, scale))
+        .map_err(to_py_err)?;
+    Ok(out.map(|inner| PyTensor { inner }))
+}
+
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(name = "_pulse_train", signature = (f0, rows, frames, sample_rate, hop, limit, phase=None))]
+pub fn py_pulse_train(py: Python<'_>, f0: Vec<f32>, rows: usize, frames: usize, sample_rate: usize, hop: usize, limit: f64, phase: Option<Vec<f64>>) -> PyResult<PyTensor> {
+    let y = py.detach(|| crate::voice::pulse_train(&f0, rows, frames, sample_rate, hop, limit, phase.as_deref())).map_err(to_py_err)?;
+    let inner = Tensor::from_slice_on(&y, &[rows, frames * hop], &crate::backend::Device::Cpu).map_err(to_py_err)?;
+    Ok(PyTensor { inner })
 }
 
 #[pyfunction]

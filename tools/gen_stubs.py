@@ -806,6 +806,8 @@ def main():
         "from .video import *  # noqa: F401, F403",
         "from . import video as video",
         "from .vectorization import *  # noqa: F401, F403",
+        "from .reasoning import *  # noqa: F401, F403",
+        "from . import reasoning as reasoning",
         "from . import vectorization as vectorization",
         "from .tensor_utils import *  # noqa: F401, F403",
         "from . import tensor_utils as tensor_utils",

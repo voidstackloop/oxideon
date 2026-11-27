@@ -358,6 +358,7 @@ class NAdam(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         momentum_decay: float = 0.004,
+        decoupled_weight_decay: bool = False,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -371,7 +372,8 @@ class NAdam(Optimizer):
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
         if not 0.0 <= momentum_decay:
             raise ValueError(f"Invalid momentum_decay value: {momentum_decay}")
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, momentum_decay=momentum_decay)
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, momentum_decay=momentum_decay,
+                        decoupled_weight_decay=decoupled_weight_decay)
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -393,8 +395,12 @@ class NAdam(Optimizer):
                 mu = beta1 * (1.0 - 0.5 * 0.96 ** (step * momentum_decay))
                 mu_next = beta1 * (1.0 - 0.5 * 0.96 ** ((step + 1) * momentum_decay))
                 state["mu_product"] *= mu
+                wd = group["weight_decay"]
+                if wd and group.get("decoupled_weight_decay"):
+                    p.assign(p.detach() * (1.0 - group["lr"] * wd))
+                    wd = 0.0
                 _kernel(self, "nadam", p, state, ("m", "v"),
-                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=group["weight_decay"],
+                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=wd,
                              step=step, mu=mu, mu_next=mu_next, mu_product=state["mu_product"]))
         return loss
 
@@ -409,6 +415,7 @@ class RAdam(Optimizer):
         betas: Tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        decoupled_weight_decay: bool = False,
     ):
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -420,7 +427,7 @@ class RAdam(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, decoupled_weight_decay=decoupled_weight_decay)
         super().__init__(params, defaults)
 
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -436,8 +443,12 @@ class RAdam(Optimizer):
                     state["exp_avg"] = _zeros(p)
                     state["exp_avg_sq"] = _zeros(p)
                 state["step"] += 1
+                wd = group["weight_decay"]
+                if wd and group.get("decoupled_weight_decay"):
+                    p.assign(p.detach() * (1.0 - group["lr"] * wd))
+                    wd = 0.0
                 _kernel(self, "radam", p, state, ("exp_avg", "exp_avg_sq"),
-                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=group["weight_decay"], step=state["step"]))
+                        dict(lr=group["lr"], beta1=beta1, beta2=beta2, eps=group["eps"], weight_decay=wd, step=state["step"]))
         return loss
 
 
@@ -847,3 +858,101 @@ class SparseAdam(Optimizer):
                     bool(group["maximize"]))
                 p.assign(new_p)
         return loss
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# SGD / Adam / AdamW: PyTorch's parameter-group API (per-group hyper-parameters, `param_groups[i][key] = value`,
+# `add_param_group`) over the native Rust optimizers (one native optimizer per group; the update itself runs in Rust).
+# ---------------------------------------------------------------------------------------------------------------------
+
+class _GroupedNative(Optimizer):
+    _native_name = ""
+    _hyper_keys: Tuple[str, ...] = ()
+
+    def __init__(self, params, defaults: Dict[str, Any]):
+        self._opts: List[Any] = []
+        super().__init__(params, defaults)
+
+    def add_param_group(self, param_group: Dict[str, Any]) -> None:
+        from .. import oxideon as _core
+        super().add_param_group(param_group)
+        g = self.param_groups[-1]
+        try:
+            self._opts.append(getattr(_core, self._native_name)(g["params"], **{k: g[k] for k in self.defaults}))
+        except Exception:
+            self.param_groups.pop()
+            raise
+
+    def _sync(self) -> None:
+        """Pushes the (possibly user-edited) group hyper-parameters into the native optimizers."""
+        for g, o in zip(self.param_groups, self._opts):
+            o.set_learning_rate(float(g["lr"]))
+            o._set_hyper({k: g[k] for k in self._hyper_keys})
+
+    def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
+        loss = closure() if closure is not None else None
+        self._sync()
+        for o in self._opts:
+            o.step()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        if set_to_none:
+            return super().zero_grad(True)
+        for o in self._opts:
+            o.zero_grad()
+
+    @property
+    def lr(self) -> float:
+        return float(self.param_groups[0]["lr"])
+
+    def set_learning_rate(self, lr: float) -> None:
+        if not (math.isfinite(lr) and lr >= 0.0):
+            raise ValueError(f"lr must be a finite number >= 0, got {lr}")
+        for g in self.param_groups:
+            g["lr"] = float(lr)
+
+    def state_dict(self) -> Dict[str, Any]:
+        self._sync()
+        if len(self._opts) == 1:
+            return self._opts[0].state_dict()  # the single-group layout of earlier releases
+        return {"groups": [o.state_dict() for o in self._opts]}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        groups = state_dict["groups"] if "groups" in state_dict else [state_dict]
+        if len(groups) != len(self._opts):
+            raise ValueError(f"loaded state dict has {len(groups)} parameter groups, but the optimizer has {len(self._opts)}")
+        for g, o, sd in zip(self.param_groups, self._opts, groups):
+            o.load_state_dict(sd)
+            g["lr"] = float(o.lr)
+
+
+class SGD(_GroupedNative):
+    """Stochastic gradient descent with momentum, Nesterov momentum, dampening and weight decay; parameter groups as in PyTorch."""
+    _native_name = "SGD"
+    _hyper_keys = ("momentum", "dampening", "weight_decay", "nesterov", "maximize")
+
+    def __init__(self, params, lr: float = 1e-2, momentum: float = 0.0, dampening: float = 0.0, weight_decay: float = 0.0,
+                 nesterov: bool = False, maximize: bool = False):
+        super().__init__(params, dict(lr=lr, momentum=momentum, dampening=dampening, weight_decay=weight_decay,
+                                      nesterov=nesterov, maximize=maximize))
+
+
+class Adam(_GroupedNative):
+    """Adam (coupled L2 weight decay, optional AMSGrad); parameter groups as in PyTorch."""
+    _native_name = "Adam"
+    _hyper_keys = ("betas", "eps", "weight_decay", "amsgrad", "maximize")
+
+    def __init__(self, params, lr: float = 1e-3, betas: Tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
+                 weight_decay: float = 0.0, amsgrad: bool = False, maximize: bool = False):
+        super().__init__(params, dict(lr=lr, betas=tuple(betas), eps=eps, weight_decay=weight_decay, amsgrad=amsgrad, maximize=maximize))
+
+
+class AdamW(_GroupedNative):
+    """AdamW (decoupled weight decay); parameter groups as in PyTorch."""
+    _native_name = "AdamW"
+    _hyper_keys = Adam._hyper_keys
+
+    def __init__(self, params, lr: float = 1e-3, betas: Tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
+                 weight_decay: float = 1e-2, amsgrad: bool = False, maximize: bool = False):
+        super().__init__(params, dict(lr=lr, betas=tuple(betas), eps=eps, weight_decay=weight_decay, amsgrad=amsgrad, maximize=maximize))

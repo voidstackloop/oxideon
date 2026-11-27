@@ -301,6 +301,21 @@ fn cuda_available() -> bool {
     crate::backend::cuda_driver::cuda_available()
 }
 
+/// How many times a GPU buffer has been copied back to the host since start-up (each one waits for the GPU): a quick way to
+/// find ops that silently fall back to the CPU. `None` when no wgpu device is available.
+#[cfg(feature = "python")]
+#[pyfunction]
+fn gpu_readbacks() -> Option<usize> {
+    #[cfg(feature = "wgpu")]
+    {
+        crate::backend::WgpuDevice::new().ok().map(|d| d.readbacks())
+    }
+    #[cfg(not(feature = "wgpu"))]
+    {
+        None
+    }
+}
+
 #[cfg(feature = "python")]
 #[pyfunction]
 fn cuda_device_count() -> usize {
@@ -333,6 +348,21 @@ fn cuda_mem_info(index: usize) -> PyResult<(usize, usize)> {
 #[pyo3(signature = (index=0))]
 fn cuda_synchronize(index: usize) -> PyResult<()> {
     crate::backend::cuda_driver::cuda_synchronize(index).map_err(to_py_err)
+}
+
+/// Kernel timings since the last call when OXIDEON_CUDA_PROFILE=1: `[(kernel, launches, seconds)]`, slowest first.
+#[cfg(feature = "python")]
+#[pyfunction]
+fn cuda_kernel_profile() -> Vec<(String, u64, f64)> {
+    crate::backend::cuda_driver::cuda_kernel_profile_take()
+}
+
+/// `(live, peak, pooled)` CUDA bytes: held by tensors, high-water mark since the last `reset_peak=True`, kept for reuse.
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (reset_peak=false))]
+fn cuda_memory_stats(reset_peak: bool) -> (usize, usize, usize) {
+    crate::backend::cuda_driver::cuda_memory_stats(reset_peak)
 }
 
 #[cfg(feature = "python")]
@@ -489,10 +519,13 @@ pub fn register_hardware_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProcessGroup>()?;
     m.add_class::<PyFullyShardedParam>()?;
     m.add_function(wrap_pyfunction!(cuda_available, m)?)?;
+    m.add_function(wrap_pyfunction!(gpu_readbacks, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_device_count, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_device_info, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_mem_info, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_synchronize, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_kernel_profile, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_memory_stats, m)?)?;
     Ok(())
 }
 

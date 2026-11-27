@@ -1,9 +1,41 @@
 # Changelog
 
-## 0.1.0 - 2026-11-23
+## 0.1.1 - 2026-11-26
 
 ### Added
 - **Workflow, tree-mapping, parameterization, data, profiling and vision utilities:** nested container transformations (`ox.treemap`: `tree_flatten`, `tree_unflatten`, `tree_map`, `tree_map_only`, `tree_all`, `tree_any`, `broadcast_tree_prefix`, `flatten_nested`, `assert_same_structure`, `pack_sequence_as`, `map_structure`, custom node registration); neural parameterizations, fusion and pruning (`ox.nn.utils`: `weight_norm`, `spectral_norm`, `bind_reparam` / `unbind_reparam` / `cache_reparam`, `fuse_conv_batchnorm`, `fuse_linear_batchnorm`, `ln_structured_prune`, `mask_prune`, `identity_prune`, `fast_init`, `apply_with_weights`, `total_norm`, `freeze_module_types`, `freeze_by_prefix`); functional `Dataset` combinators (`.map()`, `.filter()`, `.cache()`, `.repeat()`, `.take()`, `.skip()`, `.window()`), `IterableDataset` streaming in `DataLoader`, `padded_collate`, `to_tensors`, `stratified_split`, `BalancedClassSampler`, `LengthBucketSampler`, `InfiniteDataLoader` / `cycle_batches`, and `padding_side` on `pad_sequence` / `unpad_sequence`; multimodal & structured loaders (`image_folder_dataset`, `text_folder_dataset`, `audio_folder_dataset`, `csv_dataset`, `jsonl_dataset`, `sliding_window_dataset`, `split_dataset`, pure-Python `read_wav_tensor` / `save_wav_tensor`, `VocabularyIndex` / `build_vocabulary`, `one_hot_encode`, `axis_normalize`, `pad_sequences`, `compute_class_weight`, `compute_sample_weight`, `pack_batch` / `unpack_batch`); checkpointing & config registry (`save_sharded` / `load_sharded`, `CheckpointVault`, `ShadowWeightEMA`, `fetch_artifact` / `verify_checksum`, `SerializationScope`, `register_serializable`, `serialize_config` / `deserialize_config`); profiling, graph rendering & numerical assertions (`FlopProfiler` / `count_flops`, `MemoryFootprint` / `estimate_memory_footprint`, `MicroTimer` / `TimingReport` / `TimingComparison`, `collect_runtime_info`, `HookHandle` / `ephemeral_hook`, `model_to_dot`, `model_to_mermaid`, `chrome_trace_handler`, `ProgressBar`, `SummaryWriter` histograms/images/hparams/graphs, `gradgradcheck`, `assert_finite`, `assert_shapes`); and `ox.vision.utils` (`image_grid`, `save_image`, `draw_bounding_boxes`, `draw_segmentation_masks`, `draw_keypoints`).
+- **Models, GPU and audio:** `ox.models.GPT` (GPT-2 style decoder, tied embeddings, `num_params()`, `loss()`) and `ox.models.TinyTTS`
+  (about 4 M parameters: phoneme encoder, duration predictor, alignment-matrix length regulator, mel decoder; built from tensor ops so
+  it trains on the GPU backends). `ox.audio.griffin_lim` now runs in Rust (fast Griffin-Lim with momentum, seedable); the old NumPy
+  version used the wrong momentum term. wgpu gets a fused row-wise `softmax` / `log_softmax` kernel, `scaled_dot_product_attention`
+  keeps tensor masks on the device, `where()` moves scalar operands to the tensor's device (it used to break `cross_entropy` on
+  the GPU), and `ox.gpu_readbacks()` counts GPU-to-host copies so silent CPU fallbacks can be found. Voice (Rust,
+  `oxideon-core/src/voice.rs`): `ox.audio.pitch_track` (multi-threaded YIN: F0 and confidence per frame), `ox.audio.harmonic_synth`
+  (a source-filter vocoder: harmonics of F0 with the minimum-phase response of a spectral envelope, plus envelope-shaped noise, so
+  no phase has to be guessed) and `ox.audio.mel_envelope` (log-mel back to a smooth linear envelope). `TinyTTS` takes `n_flags`
+  (stress levels) and `n_aux` (extra per-frame outputs: log-F0 and a voicing logit). `Tensor.to(x.device)` and `Tensor.to(x)` keep
+  the exact device (they used to turn `cuda:0` into wgpu). Examples:
+  `examples/train_gpt.py`, `examples/prepare_code_corpus.py`, `examples/tts/` (SAPI teacher voices, training, synthesis).
+  Voice on the tiny-voca data (`examples/tts/prepare_voca.py`, `train_tts.py`, `synthesize_voca.py`): a CMUdict-based text front end whose
+  ARPABET-to-label mapping is learned from the data (`frontend_cmu.py`, `learn_frontend.py`: text normalisation for numbers / money /
+  abbreviations, label layout rules, `--pron` overrides for names) and an objective check (`evaluate_voca.py` + `asr_wer.py`: held-out
+  sentences scored by a speech recogniser, with the real recordings, true-phoneme and true-mel controls). The front end took the word
+  error rate from 17 % to 3.8 % (recordings: 1.8 %, same recogniser, 40 test sentences; the CLI default speed 0.91 matches the recordings' pace). `harmonic_synth` now runs its per-sample harmonic sum in parallel.
+  `ox.models.FaceFlow` (a 10 M-parameter text-conditioned conv U-Net trained by flow matching, `examples/faces/`) is written and unit
+  tested but not trained.
+- **`ox.reasoning`:** a model-agnostic reasoning toolkit: sampler controls (temperature, top-k, top-p, min-p, repetition / presence / frequency penalties, logit bias, seed; native Rust sampling), a generation engine (stop tokens / strings, streaming, log-probabilities, batches, `causal_lm_step` for `ox.CausalLM`), think-budget decoding with budget forcing, beam search, MCTS, tree of thoughts, adaptive self-consistency, self-refine, answer extraction / numeric matching, rewards, GRPO (`grpo_policy_loss`, `collect_group`), and `ReasoningEngine`.
+- **Pure-Rust PNG encoder & expanded C API:** `image_codec::encode_png` / `save_image` (zero external crates, adaptive row filtering + stored DEFLATE) and C ABI bindings (`include/oxideon.h`) for `conv2d`, `softmax`, `layer_norm`, `gelu`, `silu`, `reshape`, and `transpose` with a standalone C/CMake example (`examples/c_embed`).
+
+### Fixes
+- `nn` (`tests/test_nn_parity.py`): `F.conv1d/2d/3d` accept `padding='same'` / `'valid'`; `conv3d` supports `groups` and `dilation` through the native kernel; `conv_transpose1d/2d/3d` call the Rust kernels (`Tensor.conv_transpose{1,2,3}d`, `groups` supported); `nn.Conv1d/2d/3d` and `nn.LayerNorm` support tuple kernels, `groups`, `dilation`, `bias=False`, `padding='same'`, `padding_mode`, multi-dim `normalized_shape`, `elementwise_affine`; `nn.Upsample` supports `size` / `mode` / `align_corners` with gradients; `Softplus(beta, threshold)`, `Hardshrink`, `Softshrink`, `LogSigmoid`; native layers gained `named_parameters`, `state_dict`, `load_state_dict`, `zero_grad`, `requires_grad_`, `apply`, and chaining `train`/`eval`; `Module` gained `requires_grad_`, `float`/`double`/`half`, `get_parameter`, and `get_submodule`; `CausalLM::forward` rejects empty sequence tensors cleanly.
+- `optim` (`tests/test_optim_parity.py`): `SGD`, `Adam`, and `AdamW` support per-group hyper-parameters (`param_groups` dicts, `add_param_group`, live `g['lr']` / `g['momentum']` / `g['betas']` updates) while running parameter updates in Rust; `OneCycleLR` and `CyclicLR` support momentum / beta1 cycling, `anneal_strategy`, `three_phase`, `epochs` + `steps_per_epoch`, `mode`, `step_size_down`, `scale_fn`, and per-group lists; `NAdam` / `RAdam` accept `decoupled_weight_decay`.
+- `linalg` (`tests/test_linalg_parity.py`): `linalg.solve` handles `[*batch, n]` right-hand sides as batches of vectors; `linalg.vander` defaults to increasing powers; `linalg.lu` / `lu_factor` are differentiable for square matrices; `solve_triangular` broadcasts batch dimensions; `vector_norm(ord=0)` has a zero gradient in `backward`.
+
+---
+
+## 0.1.0 - 2026-11-23
+
+### Added
 - `oxideon.tensor_utils`: 71 PyTorch-named tensor utilities, all exported at the top level and covered by `tests/test_tensor_utils.py`
   (compared against NumPy and PyTorch): `ravel`, `movedim` / `moveaxis`, `swapaxes` / `swapdims`, `tensor_split`, `hsplit` / `vsplit` /
   `dsplit`, `broadcast_shapes` / `broadcast_to` / `broadcast_tensors`, `combinations`, `msort`, `lerp`, `float_power`, `addcmul`, `addcdiv`,

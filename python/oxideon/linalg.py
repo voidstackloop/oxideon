@@ -125,6 +125,8 @@ def vector_norm(
         else:
             dims = list(dim)
         res = x.vector_norm(ord_f, dims, keepdim)
+        if ord_f == 0.0 and x.requires_grad and not res.requires_grad:
+            res = res + (x * 0.0).sum(dim=dims if dims else None, keepdim=keepdim)
         if out is not None:
             out.zero_()
             out.add_(res)
@@ -446,13 +448,14 @@ def eigvalsh(A: Tensor, UPLO: str = "L", *, out: Optional[Tensor] = None) -> Ten
 def solve(A: Tensor, B: Tensor, *, left: bool = True, out: Optional[Tensor] = None) -> Tensor:
     """Solves a system of linear equations A X = B (or X A = B if left=False)."""
     if isinstance(A, Tensor) and isinstance(B, Tensor):
+        vec = B.ndim == 1 or (B.ndim == A.ndim - 1 and list(B.shape) == list(A.shape[:-1]))
         if left:
-            if B.ndim == 1:
+            if vec:
                 res = A.solve(B.unsqueeze(-1)).squeeze(-1)
             else:
                 res = A.solve(B)
         else:
-            if B.ndim == 1:
+            if vec:
                 res = A.transpose(-2, -1).solve(B.unsqueeze(-1)).squeeze(-1)
             else:
                 res = A.transpose(-2, -1).solve(B.transpose(-2, -1)).transpose(-2, -1)
@@ -711,11 +714,32 @@ def diagonal(A: Tensor, offset: int = 0, dim1: int = -2, dim2: int = -1) -> Tens
     return _wrap(res_np, like=A)
 
 
+def _lu_packed(A: Tensor) -> Tensor:
+    """`L - I + U` of a square matrix (batched) as a differentiable function of A (first order): the value is the Rust LU, and
+    the gradient follows `dL = L tril(X, -1)`, `dU = triu(X) U` with `X = L^-1 P^T dA U^-1`, written with `dA = A - A.detach()`."""
+    P, L, U = A.detach().lu()
+    eye = from_numpy(np.eye(A.shape[-1], dtype=np.float32)).to(dtype=A.dtype)
+    Linv = solve_triangular(L, eye, upper=False, unitriangular=True)
+    Uinv = solve_triangular(U, eye, upper=True)
+    X = Linv @ P.transpose(-2, -1) @ (A - A.detach()) @ Uinv
+    return (L.tril(-1) + U) + L @ X.tril(-1) + X.triu() @ U
+
+
+def _lu_is_differentiable(A: Tensor) -> bool:
+    return A.requires_grad and A.ndim >= 2 and A.shape[-1] == A.shape[-2]
+
+
 def lu(A: Tensor, pivot: bool = True) -> Tuple[Tensor, Tensor, Tensor]:
-    """The LU decomposition with partial pivoting, A = P @ L @ U (computed in Rust)."""
+    """The LU decomposition with partial pivoting, A = P @ L @ U (computed in Rust; differentiable for square matrices)."""
     if not pivot:
         raise NotImplementedError("lu: pivot=False is not supported")
-    return _as_t(A).lu()
+    A = _as_t(A)
+    if _lu_is_differentiable(A):
+        P, _, _ = A.detach().lu()
+        packed = _lu_packed(A)
+        eye = from_numpy(np.eye(A.shape[-1], dtype=np.float32)).to(dtype=A.dtype)
+        return P, packed.tril(-1) + eye, packed.triu()
+    return A.lu()
 
 
 def lu_factor(A: Tensor, pivot: bool = True) -> Tuple[Tensor, Tensor]:
@@ -725,7 +749,10 @@ def lu_factor(A: Tensor, pivot: bool = True) -> Tuple[Tensor, Tensor]:
     if not pivot:
         raise NotImplementedError("lu_factor: pivot=False is not supported")
     from .oxideon import _lu_factor_ex
-    lu, piv, _ = _lu_factor_ex(_as_t(A))
+    A = _as_t(A)
+    lu, piv, _ = _lu_factor_ex(A)
+    if _lu_is_differentiable(A):
+        lu = _lu_packed(A)
     return lu, piv
 
 
@@ -759,6 +786,11 @@ def solve_triangular(
             a_eff = (A.triu(1) if upper else A.tril(-1)) + eye_n
         b_1d = B.ndim == 1
         b_eff = B.unsqueeze(-1) if b_1d else B
+        batch = np.broadcast_shapes(tuple(a_eff.shape[:-2]), tuple(b_eff.shape[:-2]))  # torch broadcasts the batch dims
+        if tuple(a_eff.shape[:-2]) != batch:
+            a_eff = a_eff.expand(list(batch) + list(a_eff.shape[-2:]))
+        if tuple(b_eff.shape[:-2]) != batch:
+            b_eff = b_eff.expand(list(batch) + list(b_eff.shape[-2:]))
         if left:
             res = a_eff.triangular_solve(b_eff, not upper, False)
         else:
@@ -807,8 +839,8 @@ def vecdot(x: Tensor, y: Tensor, dim: int = -1, *, out: Optional[Tensor] = None)
     return res
 
 
-def vander(x: Tensor, N: Optional[int] = None, increasing: bool = False) -> Tensor:
-    """Generates a Vandermonde matrix."""
+def vander(x: Tensor, N: Optional[int] = None, increasing: bool = True) -> Tensor:
+    """Generates a Vandermonde matrix with columns x**0, x**1, ... as `torch.linalg.vander` (`increasing=False` reverses them)."""
     if isinstance(x, Tensor):
         n_cols = x.shape[-1] if N is None else int(N)
         if increasing:

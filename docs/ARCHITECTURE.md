@@ -1,6 +1,6 @@
 # Oxideon Architecture & System Design
 
-**Crate version:** `0.1.0` · **Engines:** 1,000 (The Millennial Singularity Apex, see [ENGINES_CATALOG.md](ENGINES_CATALOG.md))  
+**Crate version:** `0.1.1` · **Engines:** 1,000 (The Millennial Singularity Apex, see [ENGINES_CATALOG.md](ENGINES_CATALOG.md))  
 **Edition:** Rust 2024 (1.85+) | **Python ABI:** CPython `abi3` ($\ge 3.9$)  
 **Core Features:** Zero-Copy Strided Views, Higher-Order Autograd, Symbolic Graph Compiler, Autonomous LLM Quantization, Paged Attention & Speculative Decoding, Cloud Native Storage Streaming, 100 Decadal Milestone Syntheses, and Zero-GIL PyO3 Concurrency.
 

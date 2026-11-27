@@ -37,7 +37,7 @@ maturin develop --release
 Add Oxideon to your `Cargo.toml`:
 ```toml
 [dependencies]
-oxideon = { version = "0.1.0", features = ["rayon", "wgpu"] }
+oxideon = { version = "0.1.1", features = ["rayon", "wgpu"] }
 ```
 
 ---

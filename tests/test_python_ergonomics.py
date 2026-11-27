@@ -328,7 +328,7 @@ def test_losses_reject_bad_input_without_panicking():
         raises(RuntimeError, lambda: fn(vec, vec))
     raises(RuntimeError, lambda: ox.Embedding(5, 3)(ox.Tensor.from_i64([7], [1])))  # index out of range
     raises(RuntimeError, lambda: ox.Embedding(2**62, 2**62))
-    raises(ValueError, lambda: ox.LayerNorm([2, 3]))
+    raises(ValueError, lambda: ox.LayerNorm([2, 0]))
 
 
 def test_absurd_arguments_are_ordinary_errors_not_panics_hangs_or_aborts():

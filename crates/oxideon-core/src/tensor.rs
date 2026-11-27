@@ -44,7 +44,9 @@ struct TensorInner {
     requires_grad: AtomicBool,
     retain_grad: AtomicBool,
     grad: Mutex<Option<Tensor>>,
-    node: Option<Node>,
+    /// The op that produced this tensor (`None` = leaf). Behind a lock only so `backward(release)` can swap it for a stub
+    /// that holds no inputs or saved tensors once it has been used; never held while a backward closure runs.
+    node: Mutex<Option<Arc<Node>>>,
     hooks: Mutex<Vec<GradHook>>,
 }
 
@@ -64,7 +66,11 @@ pub struct Tensor(Arc<TensorInner>);
 impl Drop for TensorInner {
     fn drop(&mut self) {
         fn push_children(inner: &mut TensorInner, stack: &mut Vec<Tensor>) {
-            if let Some(node) = inner.node.take() {
+            let node = match inner.node.get_mut() {
+                Ok(n) => n.take(),
+                Err(p) => p.into_inner().take(),
+            };
+            if let Some(node) = node.and_then(|n| Arc::try_unwrap(n).ok()) {
                 let Node {
                     inputs, backward, ..
                 } = node;
@@ -167,7 +173,7 @@ impl Tensor {
             requires_grad: AtomicBool::new(requires_grad),
             retain_grad: AtomicBool::new(false),
             grad: Mutex::new(None),
-            node,
+            node: Mutex::new(node.map(Arc::new)),
             hooks: Mutex::new(Vec::new()),
         }))
     }
@@ -551,7 +557,29 @@ impl Tensor {
     }
 
     pub(crate) fn trace_node(&self) -> Option<(&'static str, Vec<Tensor>)> {
-        self.0.node.as_ref().map(|n| (n.op, n.inputs.clone()))
+        self.node().map(|n| (n.op, n.inputs.clone()))
+    }
+
+    /// The producing op (a cheap `Arc` clone; the lock is released before returning).
+    fn node(&self) -> Option<Arc<Node>> {
+        mutex_guard(&self.0.node).clone()
+    }
+
+    /// Replaces a used node by a stub with no inputs and no saved tensors (`backward(release)`): the tensor stays a non-leaf,
+    /// and a second backward through it fails clearly instead of silently reusing freed state.
+    fn release_node(&self) {
+        let mut slot = mutex_guard(&self.0.node);
+        if let Some(op) = slot.as_ref().map(|n| n.op) {
+            *slot = Some(Arc::new(Node {
+                op,
+                inputs: Vec::new(),
+                backward: Box::new(move |_| {
+                    Err(Error::Autograd(format!(
+                        "backward through `{op}` a second time: its graph was freed by backward(retain_graph=False)"
+                    )))
+                }),
+            }));
+        }
     }
 
     #[inline]
@@ -612,18 +640,18 @@ impl Tensor {
 
     #[inline]
     pub fn is_leaf(&self) -> bool {
-        self.0.node.is_none()
+        mutex_guard(&self.0.node).is_none()
     }
 
     #[inline]
     pub fn op_name(&self) -> Option<&'static str> {
-        self.0.node.as_ref().map(|n| n.op)
+        mutex_guard(&self.0.node).as_ref().map(|n| n.op)
     }
 
     /// Returns the parent input tensors that produced this tensor in the autograd graph.
     #[inline]
-    pub fn op_inputs(&self) -> &[Tensor] {
-        self.0.node.as_ref().map_or(&[], |n| n.inputs.as_slice())
+    pub fn op_inputs(&self) -> Vec<Tensor> {
+        self.node().map_or_else(Vec::new, |n| n.inputs.clone())
     }
 
     #[inline]
@@ -822,6 +850,17 @@ impl Tensor {
     /// Backpropagates with an explicit upstream gradient and optional `create_graph`
     /// for higher-order derivatives.
     pub fn backward_with_grad(&self, grad_output: &Tensor, create_graph: bool) -> Result<()> {
+        self.backward_impl(grad_output, create_graph, false)
+    }
+
+    /// `backward()` that frees the graph as it goes (PyTorch's default, `retain_graph=False`): each op's inputs and saved
+    /// tensors are dropped right after its gradient is computed, so activations do not outlive the step (or wait for every
+    /// Python reference to the loss to go away). A second backward through the same graph then errors.
+    pub fn backward_release(&self, grad_output: &Tensor) -> Result<()> {
+        self.backward_impl(grad_output, false, true)
+    }
+
+    fn backward_impl(&self, grad_output: &Tensor, create_graph: bool, release: bool) -> Result<()> {
         if !self.requires_grad() {
             return Err(Error::Autograd(
                 "called backward on a tensor that does not require grad".into(),
@@ -835,14 +874,19 @@ impl Tensor {
                 self.numel()
             )));
         }
-        let order = self.topological_order();
+        let mut order = self.topological_order();
         let mut grads: HashMap<usize, Tensor> = HashMap::new();
         grads.insert(self.id(), grad_output.clone());
 
         let _grad_guard = set_grad_enabled(create_graph);
 
-        for t in order.iter().rev() {
+        // popped (not iterated) so that, with `release`, each processed tensor's last engine-held reference goes right away
+        while let Some(t) = order.pop() {
+            let t = &t;
             let Some(mut g) = grads.remove(&t.id()) else {
+                if release {
+                    t.release_node();
+                }
                 continue;
             };
             g = t.run_hooks(g)?;
@@ -862,7 +906,7 @@ impl Tensor {
                 });
             }
 
-            if let Some(node) = &t.0.node {
+            if let Some(node) = t.node() {
                 let input_grads = (node.backward)(&g)?;
                 if input_grads.len() != node.inputs.len() {
                     return Err(Error::Autograd(format!(
@@ -885,6 +929,10 @@ impl Tensor {
                             grads.insert(inp.id(), ig);
                         }
                     }
+                }
+                drop(node);
+                if release {
+                    t.release_node();
                 }
             }
         }
@@ -914,7 +962,7 @@ impl Tensor {
                 continue;
             }
             stack.push((t.clone(), true));
-            if let Some(node) = &t.0.node {
+            if let Some(node) = t.node() {
                 for inp in &node.inputs {
                     if inp.requires_grad() && !visited.contains(&inp.id()) {
                         stack.push((inp.clone(), false));
@@ -1019,7 +1067,7 @@ pub fn grad(
         if input_ids.contains(&t.id()) {
             captured.insert(t.id(), g.clone());
         }
-        if let Some(node) = &t.0.node {
+        if let Some(node) = t.node() {
             let input_grads = (node.backward)(&g)?;
             if input_grads.len() != node.inputs.len() {
                 return Err(Error::Autograd(format!(
@@ -1156,5 +1204,39 @@ impl fmt::Debug for Tensor {
             write!(f, ", op={op}")?;
         }
         write!(f, ")")
+    }
+}
+
+#[cfg(test)]
+mod release_graph_tests {
+    use super::Tensor;
+    use std::sync::Arc;
+
+    // y = sum(exp(x) * x): exp saves its output, mul saves both inputs
+    fn run(release: bool) -> (Vec<f32>, std::sync::Weak<super::TensorInner>, Tensor) {
+        let x = Tensor::from_slice(&[0.5f32, -1.0, 2.0], &[3]).unwrap().requires_grad_(true);
+        let e = x.exp().unwrap();
+        let weak = Arc::downgrade(&e.0);
+        let y = e.mul(&x).unwrap().sum().unwrap();
+        drop(e);
+        let seed = y.ones_like().unwrap();
+        if release { y.backward_release(&seed).unwrap() } else { y.backward_with_grad(&seed, false).unwrap() }
+        (x.grad().unwrap().to_vec::<f32>().unwrap(), weak, y)
+    }
+
+    #[test]
+    fn release_frees_intermediates_and_keeps_grads() {
+        let (kept, weak_kept, y_kept) = run(false);
+        let (freed, weak_freed, y_freed) = run(true);
+        assert_eq!(kept, freed);
+        for (g, x) in freed.iter().zip([0.5f32, -1.0, 2.0]) {
+            assert!((g - x.exp() * (1.0 + x)).abs() < 1e-5);
+        }
+        assert!(weak_kept.upgrade().is_some(), "default backward keeps the graph alive through the output");
+        assert!(weak_freed.upgrade().is_none(), "released backward must drop the intermediate exp(x)");
+        assert!(!y_freed.is_leaf() && !y_kept.is_leaf());
+        let again = y_freed.backward_release(&y_freed.ones_like().unwrap());
+        assert!(again.is_err(), "a second backward through a released graph must fail loudly");
+        assert!(y_kept.backward_with_grad(&y_kept.ones_like().unwrap(), false).is_ok());
     }
 }

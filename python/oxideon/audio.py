@@ -220,55 +220,58 @@ def griffin_lim(
     hop_length: int = 160,
     n_iter: int = 32,
     momentum: float = 0.99,
+    seed: Optional[int] = None,
 ) -> _Tensor:
-    """Reconstructs a time-domain audio signal from a magnitude spectrogram using the Griffin-Lim algorithm."""
+    """Reconstructs a waveform from a magnitude spectrogram `[freq, frames]` (or `[B, freq, frames]`) with the fast Griffin-Lim
+    algorithm (Perraudin et al., 2013). The spectrogram is the one `Spectrogram` makes (Hann window, centred frames), and every
+    STFT / inverse STFT runs in Rust. The result has `(frames - 1) * hop_length` samples."""
+    from .oxideon import _griffin_lim
     arr = _to_np(spec).astype(np.float32)
-    is_batched = arr.ndim == 3
-    if not is_batched:
-        arr = arr[None, ...]
+    seed0 = 0 if seed is None else int(seed)
+    if seed is None:
+        seed0 = int(np.random.default_rng().integers(0, 2**31))
+    win = _from_numpy(np.hanning(n_fft).astype(np.float32))
+    return _griffin_lim(_from_numpy(np.ascontiguousarray(arr)), n_fft, hop_length, win, n_iter, momentum, seed0)
 
-    b, freqs, frames = arr.shape
-    expected_len = max(n_fft, (frames - 1) * hop_length)
-    win = np.hanning(n_fft).astype(np.float32)
 
-    reconstructed = []
-    for bi in range(b):
-        mag = arr[bi]
-        phase = np.exp(1j * np.random.uniform(0, 2 * np.pi, mag.shape))
-        prev_phase = phase
+def pitch_track(waveform: Any, sample_rate: int = 24000, hop: int = 256, fmin: float = 60.0, fmax: float = 500.0):
+    """YIN pitch tracking (Rust, all cores): `(f0, confidence)` per frame, frame `t` centred on sample `t * hop`
+    (`len(waveform) // hop + 1` frames). `f0` is the best candidate in `[fmin, fmax]` Hz; `confidence` in `[0, 1]` is about 0.8 and
+    above for clearly voiced frames and 0 for silence."""
+    from .oxideon import _pitch_track
+    x = _to_np(waveform).astype(np.float32).reshape(-1)
+    return _pitch_track(_from_numpy(np.ascontiguousarray(x)), int(sample_rate), int(hop), float(fmin), float(fmax))
 
-        for _ in range(n_iter):
-            complex_spec = mag * phase
-            time_signal = np.zeros(expected_len + n_fft, dtype=np.float32)
-            window_norm = np.zeros(expected_len + n_fft, dtype=np.float32)
 
-            for t in range(frames):
-                half_spec = complex_spec[:, t]
-                full_spec = np.concatenate([half_spec, np.conj(half_spec[-2:0:-1])])
-                frame_time = np.real(np.fft.ifft(full_spec)) * win
-                pos = t * hop_length
-                time_signal[pos : pos + n_fft] += frame_time
-                window_norm[pos : pos + n_fft] += win * win
+def mel_envelope(log_mel: Any, n_mels: int = 80, n_fft: int = 1024, sample_rate: int = 24000) -> np.ndarray:
+    """Smooth linear-magnitude spectral envelope `[frames, n_fft // 2 + 1]` from log-mel frames `[frames, n_mels]` made with
+    `mel_filter_bank` and `Spectrogram(power=1)`: every mel band is spread back over its own triangular filter (a flat spectrum of
+    magnitude m comes back as m)."""
+    fb = mel_filter_bank(n_mels=n_mels, n_fft=n_fft, sample_rate=sample_rate).astype(np.float64)
+    mel = np.exp(_to_np(log_mel).astype(np.float64))
+    per_band = mel / np.maximum(fb.sum(1), 1e-9)
+    return ((per_band @ fb) / np.maximum(fb.sum(0), 1e-9)).astype(np.float32)
 
-            signal = time_signal / np.maximum(window_norm, 1e-8)
 
-            new_spec = np.zeros_like(complex_spec)
-            for t in range(frames):
-                pos = t * hop_length
-                frame = signal[pos : pos + n_fft] * win
-                fft_res = np.fft.fft(frame)[:freqs]
-                new_spec[:, t] = fft_res
+def refine_boundaries(features: Any, durations: Any, max_shift: int = 4, min_len: int = 2, penalty: float = 0.0) -> np.ndarray:
+    """Moves forced-alignment phone boundaries (by at most `max_shift` frames each) to where `features` (`[frames, dim]`, e.g. a
+    normalised log-mel) change: the segmentation into the same phones minimising every frame's squared deviation from its phone's
+    mean, plus `penalty` per frame moved (Rust, exact dynamic programming). Durations must sum to the frames; zero-length phones
+    stay zero. Returns the new durations (`int64`)."""
+    from .oxideon import _refine_boundaries
+    f = np.ascontiguousarray(_to_np(features), dtype=np.float32)
+    d = [int(x) for x in np.asarray(durations).reshape(-1)]
+    return np.asarray(_refine_boundaries(_from_numpy(f.reshape(-1)), int(f.shape[1]), d, int(max_shift), int(min_len), float(penalty)), np.int64)
 
-            phase = new_spec / np.maximum(np.abs(new_spec), 1e-12)
-            if momentum > 0:
-                phase = phase + momentum * prev_phase
-                phase = phase / np.maximum(np.abs(phase), 1e-12)
-                prev_phase = phase
 
-        reconstructed.append(signal[:expected_len])
-
-    res = np.stack(reconstructed, axis=0) if is_batched else reconstructed[0]
-    return _from_numpy(np.ascontiguousarray(res, dtype=np.float32))
+def harmonic_synth(f0: Any, voiced: Any, envelope: Any, sample_rate: int = 24000, n_fft: int = 1024, hop: int = 256,
+                   gain: float = 1.9, breath: float = 0.4, noise_gain: float = 0.65, seed: int = 0) -> _Tensor:
+    """Source-filter vocoder (Rust): a sum of harmonics of `f0` (Hz per frame; phases from the minimum-phase response of the
+    envelope) where `voiced` (0..1 per frame) is high, plus noise shaped by `envelope` (`[frames, n_fft // 2 + 1]` linear STFT
+    magnitudes, e.g. from `mel_envelope`). Returns `(frames - 1) * hop` samples."""
+    from .oxideon import _harmonic_synth
+    t = lambda a: _from_numpy(np.ascontiguousarray(_to_np(a).astype(np.float32)))
+    return _harmonic_synth(t(f0), t(voiced), t(envelope), int(sample_rate), int(n_fft), int(hop), float(gain), float(breath), float(noise_gain), int(seed))
 
 
 def resample(waveform: Any, orig_freq: int, new_freq: int) -> _Tensor:
@@ -456,6 +459,9 @@ __all__ = [
     "MelSpectrogram",
     "MFCC",
     "griffin_lim",
+    "pitch_track",
+    "mel_envelope",
+    "harmonic_synth",
     "resample",
     "compute_deltas",
     "gain",

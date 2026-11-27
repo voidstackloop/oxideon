@@ -7,9 +7,6 @@ Sophia, Prodigy, Shampoo, Lookahead, RiemannianAdam, ScheduleFreeAdamW).
 """
 
 from ..oxideon import (
-    SGD,
-    Adam,
-    AdamW,
     Muon,
     RiemannianAdam,
     ScheduleFreeAdamW,
@@ -22,6 +19,9 @@ from ..optim_ext import (
 )
 from .optimizer import (
     Optimizer,
+    SGD,
+    Adam,
+    AdamW,
     RMSprop,
     Adagrad,
     Adadelta,

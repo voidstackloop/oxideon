@@ -14,6 +14,31 @@ import math
 from typing import Any, Callable, List, Optional, Sequence, Union
 
 
+def _momentum_key(optimizer: Any, who: str) -> bool:
+    """True when the optimizer's momentum lives in `betas[0]` (Adam family), False for a plain `momentum` entry."""
+    groups = getattr(optimizer, "param_groups", None) or []
+    if groups and all("betas" in g for g in groups):
+        return True
+    if groups and all("momentum" in g for g in groups):
+        return False
+    raise ValueError(f"{who}: optimizer must support momentum or beta1 with `cycle_momentum` enabled (pass cycle_momentum=False)")
+
+
+def _set_momentum(group: dict, use_beta1: bool, value: float) -> None:
+    if use_beta1:
+        group["betas"] = (value, *tuple(group["betas"])[1:])
+    else:
+        group["momentum"] = value
+
+
+def _per_group(value: Any, n: int, name: str) -> List[float]:
+    if isinstance(value, (list, tuple)):
+        if len(value) != n:
+            raise ValueError(f"expected {n} values for {name}, got {len(value)}")
+        return [float(v) for v in value]
+    return [float(value)] * n
+
+
 class _LRScheduler:
     """Base class for all learning rate schedulers."""
 
@@ -75,7 +100,7 @@ class _LRScheduler:
                 raise ValueError(f"scheduler produced {len(vals)} lr values for {len(groups)} param groups")
             for g, lr in zip(groups, vals):
                 g["lr"] = float(lr)
-            if hasattr(self.optimizer, "set_learning_rate") and callable(self.optimizer.set_learning_rate):
+            if hasattr(self.optimizer, "set_learning_rate") and callable(self.optimizer.set_learning_rate) and not hasattr(self.optimizer, "_opts"):
                 try:
                     self.optimizer.set_learning_rate(float(vals[0]))
                 except Exception:
@@ -289,65 +314,74 @@ class LinearLR(_LRScheduler):
 
 
 class OneCycleLR(_LRScheduler):
-    """Sets the learning rate according to the 1cycle learning rate policy (Smith & Topin, 2019).
+    """The 1cycle policy (Smith & Topin, 2019), as `torch.optim.lr_scheduler.OneCycleLR`: the learning rate rises from
+    `max_lr / div_factor` to `max_lr` and falls to `initial_lr / final_div_factor`; with `cycle_momentum` the momentum
+    (or Adam's beta1) moves inversely between `max_momentum` and `base_momentum`.
 
-    Args:
-        optimizer (Optimizer): Wrapped optimizer.
-        max_lr (float or list): Upper learning rate boundary in the cycle.
-        total_steps (int): The total number of steps in the cycle.
-        pct_start (float): The percentage of the cycle spent increasing the learning rate. Default: 0.3.
-        div_factor (float): Determines the initial learning rate via initial_lr = max_lr/div_factor. Default: 25.
-        final_div_factor (float): Determines the minimum learning rate via min_lr = initial_lr/final_div_factor. Default: 1e4.
-    """
+    `total_steps` (or `epochs * steps_per_epoch`), `pct_start`, `anneal_strategy` ("cos" | "linear"), `three_phase`,
+    and per-group `max_lr` lists are supported."""
 
-    def __init__(
-        self,
-        optimizer: Any,
-        max_lr: float,
-        total_steps: int,
-        pct_start: float = 0.3,
-        div_factor: float = 25.0,
-        final_div_factor: float = 1e4,
-        last_epoch: int = -1,
-    ):
-        if total_steps <= 0 or not isinstance(total_steps, int):
+    def __init__(self, optimizer: Any, max_lr: Any, total_steps: Optional[int] = None, epochs: Optional[int] = None,
+                 steps_per_epoch: Optional[int] = None, pct_start: float = 0.3, anneal_strategy: str = "cos",
+                 cycle_momentum: bool = True, base_momentum: Any = 0.85, max_momentum: Any = 0.95, div_factor: float = 25.0,
+                 final_div_factor: float = 1e4, three_phase: bool = False, last_epoch: int = -1):
+        if total_steps is None:
+            if epochs is None or steps_per_epoch is None:
+                raise ValueError("You must define either total_steps OR (epochs AND steps_per_epoch)")
+            total_steps = int(epochs) * int(steps_per_epoch)
+        if not isinstance(total_steps, int) or total_steps <= 0:
             raise ValueError(f"Expected positive integer total_steps, but got {total_steps}")
-        if pct_start < 0 or pct_start > 1:
-            raise ValueError(f"Expected pct_start between 0 and 1, but got {pct_start}")
-        if div_factor <= 0:
-            raise ValueError(f"OneCycleLR: div_factor must be positive, got {div_factor}")
-        if final_div_factor <= 0:
-            raise ValueError(f"OneCycleLR: final_div_factor must be positive, got {final_div_factor}")
-        self.max_lr = max_lr
+        if not isinstance(pct_start, (int, float)) or pct_start < 0 or pct_start > 1:
+            raise ValueError(f"Expected float between 0 and 1 pct_start, but got {pct_start}")
+        if anneal_strategy not in ("cos", "linear"):
+            raise ValueError(f"anneal_strategy must be one of 'cos' or 'linear', instead got {anneal_strategy}")
+        if div_factor <= 0 or final_div_factor <= 0:
+            raise ValueError("OneCycleLR: div_factor and final_div_factor must be positive")
         self.total_steps = total_steps
-        self.pct_start = pct_start
-        self.div_factor = div_factor
-        self.final_div_factor = final_div_factor
+        self.pct_start, self.div_factor, self.final_div_factor = pct_start, div_factor, final_div_factor
+        self.anneal_strategy, self.three_phase, self.cycle_momentum = anneal_strategy, three_phase, cycle_momentum
+        groups = optimizer.param_groups
+        n = len(groups)
+        self.max_lrs = _per_group(max_lr, n, "max_lr")
+        self.initial_lrs = [m / div_factor for m in self.max_lrs]
+        self.min_lrs = [i / final_div_factor for i in self.initial_lrs]
+        for g, a, b, c in zip(groups, self.initial_lrs, self.max_lrs, self.min_lrs):
+            g["initial_lr"], g["max_lr"], g["min_lr"] = a, b, c
+        t = float(total_steps)
+        if three_phase:
+            self._phases = [("initial", "max", "max_m", "base_m", pct_start * t - 1), ("max", "initial", "base_m", "max_m", 2 * pct_start * t - 2),
+                            ("initial", "min", "max_m", "max_m", t - 1)]
+        else:
+            self._phases = [("initial", "max", "max_m", "base_m", pct_start * t - 1), ("max", "min", "base_m", "max_m", t - 1)]
+        if cycle_momentum:
+            self._use_beta1 = _momentum_key(optimizer, "OneCycleLR")
+            self.base_moms = _per_group(base_momentum, n, "base_momentum")
+            self.max_moms = _per_group(max_momentum, n, "max_momentum")
+            for g, mm in zip(groups, self.max_moms):
+                _set_momentum(g, self._use_beta1, mm)
+        self._anneal = ((lambda a, b, pct: b + (a - b) / 2.0 * (math.cos(math.pi * pct) + 1)) if anneal_strategy == "cos"
+                        else (lambda a, b, pct: (b - a) * pct + a))
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self) -> List[float]:
-        # torch parity: linear ramp peaking after `up = pct*total - 1` steps,
-        # cosine tail over `down = total - up - 1` steps, ValueError past total.
         step = self.last_epoch
         if step > self.total_steps:
-            raise ValueError(
-                f"Tried to step {step} times. The specified number of total steps is {self.total_steps}"
-            )
-        initial_lr = self.max_lr / self.div_factor
-        final_lr = initial_lr / self.final_div_factor
-        up = max(1.0, self.total_steps * self.pct_start - 1.0)
-        down = max(1.0, self.total_steps - up - 1.0)
-
-        if step <= up:
-            # Cosine ramp (torch default anneal_strategy='cos'); linear only
-            # matches at the midpoint, quarter points discriminate.
-            lr = initial_lr + (self.max_lr - initial_lr) * (1.0 - math.cos(math.pi * step / up)) / 2.0
-        else:
-            pct = (step - up) / down
-            cos_val = math.cos(math.pi * pct)
-            lr = final_lr + (self.max_lr - final_lr) * (1.0 + cos_val) / 2.0
-        return [lr]
-
+            raise ValueError(f"Tried to step {step} times. The specified number of total steps is {self.total_steps}")
+        lrs = []
+        for k, g in enumerate(self.optimizer.param_groups):
+            vals = {"initial": self.initial_lrs[k], "max": self.max_lrs[k], "min": self.min_lrs[k]}
+            moms = {"max_m": self.max_moms[k], "base_m": self.base_moms[k]} if self.cycle_momentum else {}
+            start = 0.0
+            for i, (a, b, ma, mb, end) in enumerate(self._phases):
+                if step <= end or i == len(self._phases) - 1:
+                    pct = (step - start) / (end - start) if end != start else 1.0
+                    lr = self._anneal(vals[a], vals[b], pct)
+                    if self.cycle_momentum:
+                        _set_momentum(g, self._use_beta1, self._anneal(moms[ma], moms[mb], pct))
+                    break
+                start = end
+            lrs.append(lr)
+        return lrs
 
 class ReduceLROnPlateau:
     """Reduce learning rate when a metric has stopped improving.
@@ -437,7 +471,7 @@ class ReduceLROnPlateau:
                 nlr = max(float(g["lr"]) * self.factor, self.min_lr)
                 g["lr"] = nlr
                 new_lrs.append(nlr)
-            if hasattr(self.optimizer, "set_learning_rate") and callable(self.optimizer.set_learning_rate):
+            if hasattr(self.optimizer, "set_learning_rate") and callable(self.optimizer.set_learning_rate) and not hasattr(self.optimizer, "_opts"):
                 try:
                     self.optimizer.set_learning_rate(new_lrs[0])
                 except Exception:
@@ -518,29 +552,53 @@ class PolynomialLR(_LRScheduler):
 
 
 class CyclicLR(_LRScheduler):
-    """Sets the learning rate according to the cyclical learning rate (CLR) policy."""
+    """Cyclical learning rate policy (Smith, 2017), as `torch.optim.lr_scheduler.CyclicLR`: `mode` is "triangular",
+    "triangular2" or "exp_range" (with `gamma`), or pass `scale_fn` and `scale_mode` ("cycle" | "iterations"). With
+    `cycle_momentum` the momentum (or Adam's beta1) cycles inversely between `max_momentum` and `base_momentum`."""
 
-    def __init__(
-        self,
-        optimizer: Any,
-        base_lr: float,
-        max_lr: float,
-        step_size_up: int = 2000,
-        last_epoch: int = -1,
-    ):
-        if step_size_up <= 0:
-            raise ValueError(f"CyclicLR: step_size_up must be positive, got {step_size_up}")
-        self.clr_base_lr = float(base_lr)
-        self.clr_max_lr = float(max_lr)
-        self.step_size_up = step_size_up
+    def __init__(self, optimizer: Any, base_lr: Any, max_lr: Any, step_size_up: int = 2000, step_size_down: Optional[int] = None,
+                 mode: str = "triangular", gamma: float = 1.0, scale_fn: Optional[Callable[[float], float]] = None,
+                 scale_mode: str = "cycle", cycle_momentum: bool = True, base_momentum: Any = 0.8, max_momentum: Any = 0.9,
+                 last_epoch: int = -1):
+        if step_size_up <= 0 or (step_size_down is not None and step_size_down <= 0):
+            raise ValueError(f"CyclicLR: step_size_up and step_size_down must be positive, got {step_size_up} and {step_size_down}")
+        if mode not in ("triangular", "triangular2", "exp_range") and scale_fn is None:
+            raise ValueError("mode is invalid and scale_fn is None")
+        groups = optimizer.param_groups
+        n = len(groups)
+        self.clr_base_lrs = _per_group(base_lr, n, "base_lr")
+        self.max_lrs = _per_group(max_lr, n, "max_lr")
+        for g, b in zip(groups, self.clr_base_lrs):
+            g["lr"] = b
+        down = float(step_size_up if step_size_down is None else step_size_down)
+        self.total_size = float(step_size_up) + down
+        self.step_ratio = float(step_size_up) / self.total_size
+        self.mode, self.gamma = mode, gamma
+        if scale_fn is None:
+            self._scale_fn = {"triangular": lambda x: 1.0, "triangular2": lambda x: 1 / (2.0 ** (x - 1)), "exp_range": lambda x: gamma ** x}[mode]
+            self.scale_mode = "iterations" if mode == "exp_range" else "cycle"
+        else:
+            self._scale_fn, self.scale_mode = scale_fn, scale_mode
+        self.cycle_momentum = cycle_momentum
+        if cycle_momentum:
+            self._use_beta1 = _momentum_key(optimizer, "CyclicLR")
+            self.base_moms = _per_group(base_momentum, n, "base_momentum")
+            self.max_moms = _per_group(max_momentum, n, "max_momentum")
+            for g, mm in zip(groups, self.max_moms):
+                _set_momentum(g, self._use_beta1, mm)
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self) -> List[float]:
-        cycle = math.floor(1.0 + float(self.last_epoch) / (2.0 * self.step_size_up))
-        x = abs(float(self.last_epoch) / float(self.step_size_up) - 2.0 * cycle + 1.0)
-        lr = self.clr_base_lr + (self.clr_max_lr - self.clr_base_lr) * max(0.0, 1.0 - x)
-        return [lr for _ in self.base_lrs]
-
+        cycle = math.floor(1 + self.last_epoch / self.total_size)
+        x = 1.0 + self.last_epoch / self.total_size - cycle
+        scale = x / self.step_ratio if x <= self.step_ratio else (x - 1) / (self.step_ratio - 1)
+        factor = self._scale_fn(cycle if self.scale_mode == "cycle" else self.last_epoch)
+        lrs = []
+        for k, g in enumerate(self.optimizer.param_groups):
+            lrs.append(self.clr_base_lrs[k] + (self.max_lrs[k] - self.clr_base_lrs[k]) * scale * factor)
+            if self.cycle_momentum:
+                _set_momentum(g, self._use_beta1, self.max_moms[k] - (self.max_moms[k] - self.base_moms[k]) * scale * factor)
+        return lrs
 
 class ChainedScheduler:
     """Chains a list of learning rate schedulers."""

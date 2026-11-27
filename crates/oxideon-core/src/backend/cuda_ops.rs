@@ -553,6 +553,16 @@ impl CudaStorage {
         let (rsa, csa) = (lhs_l.strides()[ar - 2] as i64, lhs_l.strides()[ar - 1] as i64);
         let (rsb, csb) = (rhs_l.strides()[br - 2] as i64, rhs_l.strides()[br - 1] as i64);
         let dt = dtype_code(self.dtype).unwrap();
+        // f32 through cuBLAS when it is present (OXIDEON_CUDA_CUBLAS=0 turns it off): a batch that is one strided dimension
+        // (or none) and operands with a unit row or column stride; anything else falls through to the .cu kernels below
+        if self.dtype == DType::F32 && bs.nd <= 1 && super::cublas::available() {
+            let (sa, sb) = if bs.nd == 1 { (bs.stride[0][0], bs.stride[1][0]) } else { (0, 0) };
+            let a = super::cublas::Mat { ptr: self.base(lhs_l), rs: rsa, cs: csa, bs: sa };
+            let b = super::cublas::Mat { ptr: rhs.base(rhs_l), rs: rsb, cs: csb, bs: sb };
+            if super::cublas::sgemm_strided_batched(self.device_index, a, b, out.buf.device_ptr(), m, n, k, nbatch, allow_tf32())? {
+                return Ok(Some((out, out_shape)));
+            }
+        }
         let large = m >= 64 && n >= 64;
         // tensor cores (sm_80+): always for f16 / bf16, for f32 only as TF32 when enabled (it lowers the precision)
         let tensor_cores = cuda_driver::cuda_device_info(self.device_index).is_ok_and(|i| i.major >= 8)
@@ -1412,7 +1422,8 @@ impl CudaStorage {
     /// `softmax(q k^T * scale + mask) v` without materializing the scores (inference: no gradient is recorded). `mask` is an
     /// additive tensor with its (batch, head, query, key) element strides. `q`, `k`, `v` must be contiguous.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_gpu(&self, q_off: usize, k: &Self, k_off: usize, v: &Self, v_off: usize, mask: Option<(&Self, usize, [i64; 4])>, causal: bool, scale: f64, dims: AttnDims) -> Result<Option<Self>> {
+    /// `lse` (a device pointer to `bh * l` compute-type values, or 0) receives each row's log-sum-exp for the backward pass.
+    pub fn attention_gpu(&self, q_off: usize, k: &Self, k_off: usize, v: &Self, v_off: usize, mask: Option<(&Self, usize, [i64; 4])>, causal: bool, scale: f64, dims: AttnDims, lse: u64) -> Result<Option<Self>> {
         if !self.float_module_ready() || k.dtype != self.dtype || v.dtype != self.dtype || dims.d > 128 || dims.dv > 128 || dims.bh > 65535 {
             return Ok(None);
         }
@@ -1448,15 +1459,63 @@ impl CudaStorage {
             .i64(strides[1])
             .i64(strides[2])
             .i64(strides[3])
+            .ptr(lse)
             .launch(&f, [dims.l.div_ceil(4) as u32, dims.bh as u32, 1], [128, 1, 1], 0)?;
         Ok(Some(out))
+    }
+
+    /// Gradients `(dq, dk, dv)` of [`Self::attention_gpu`] for F32 from the saved output `o`, the output gradient `g` (all
+    /// contiguous, offsets in elements) and the forward log-sum-exp `lse` (`bh * l` F32). No `[l, s]` buffer is allocated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_bwd_gpu(q: (&Self, usize), k: (&Self, usize), v: (&Self, usize), o: (&Self, usize), g: (&Self, usize), lse: &Self, mask: Option<(&Self, usize, [i64; 4])>, causal: bool, scale: f64, dims: AttnDims) -> Result<Option<(Self, Self, Self)>> {
+        let me = q.0;
+        if me.dtype != DType::F32 || !me.float_module_ready() || dims.d > 128 || dims.dv > 128 || dims.bh > 65535 {
+            return Ok(None);
+        }
+        let dev = me.device_index;
+        let at = |(t, off): (&Self, usize)| t.buf.device_ptr() + (off * 4) as u64;
+        let dq = Self::alloc(dev, DType::F32, dims.bh * dims.l * dims.d)?;
+        let dk = Self::alloc(dev, DType::F32, dims.bh * dims.s * dims.d)?;
+        let dv = Self::alloc(dev, DType::F32, dims.bh * dims.s * dims.dv)?;
+        if dims.bh * dims.l == 0 || dims.s == 0 {
+            for t in [&dq, &dk, &dv] {
+                t.buf.memset(0)?;
+            }
+            return Ok(Some((dq, dk, dv)));
+        }
+        let drow = Self::alloc(dev, DType::F32, dims.bh * dims.l)?;
+        let (mptr, st) = match mask {
+            Some((m, off, st)) => (m.buf.device_ptr() + (off * 4) as u64, st),
+            None => (0, [0; 4]),
+        };
+        let tail = |a: Args| {
+            a.u64(dims.l as u64)
+                .u64(dims.s as u64)
+                .i32(dims.d as i32)
+                .i32(dims.dv as i32)
+                .f64(scale)
+                .i32(i32::from(causal))
+                .u64(dims.h as u64)
+                .i64(st[0])
+                .i64(st[1])
+                .i64(st[2])
+                .i64(st[3])
+        };
+        let f = cuda_rt::func(dev, "attention.cu", dtype_code(DType::F32).unwrap(), "attn_bwd_dq")?;
+        tail(Args::new().ptr(at(q)).ptr(at(k)).ptr(at(v)).ptr(at(o)).ptr(at(g)).ptr(lse.buf.device_ptr()).ptr(mptr).ptr(dq.buf.device_ptr()).ptr(drow.buf.device_ptr()))
+            .launch(&f, [dims.l.div_ceil(4) as u32, dims.bh as u32, 1], [128, 1, 1], 0)?;
+        let f = cuda_rt::func(dev, "attention.cu", dtype_code(DType::F32).unwrap(), "attn_bwd_dkv")?;
+        tail(Args::new().ptr(at(q)).ptr(at(k)).ptr(at(v)).ptr(at(g)).ptr(lse.buf.device_ptr()).ptr(drow.buf.device_ptr()).ptr(mptr).ptr(dk.buf.device_ptr()).ptr(dv.buf.device_ptr()))
+            .launch(&f, [dims.s.div_ceil(4) as u32, dims.bh as u32, 1], [128, 1, 1], 0)?;
+        Ok(Some((dq, dk, dv)))
     }
 }
 
 impl super::Storage {
     /// Fused attention over CUDA storages (see [`CudaStorage::attention_gpu`]); `None` when it does not apply.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cuda_attention(q: (&super::Storage, &Layout), k: (&super::Storage, &Layout), v: (&super::Storage, &Layout), mask: Option<(&super::Storage, &Layout)>, causal: bool, scale: f64, dims: AttnDims) -> Result<Option<super::Storage>> {
+    /// With `lse` (an F32 CUDA storage of `bh * l`), each row's log-sum-exp is written there too (training).
+    pub(crate) fn cuda_attention(q: (&super::Storage, &Layout), k: (&super::Storage, &Layout), v: (&super::Storage, &Layout), mask: Option<(&super::Storage, &Layout)>, causal: bool, scale: f64, dims: AttnDims, lse: Option<&super::Storage>) -> Result<Option<super::Storage>> {
         let (gq, gk, gv) = (q.0.read(), k.0.read(), v.0.read());
         let (super::StorageInner::Cuda(cq), super::StorageInner::Cuda(ck), super::StorageInner::Cuda(cv)) = (&*gq, &*gk, &*gv) else { return Ok(None) };
         if !(q.1.is_contiguous() && k.1.is_contiguous() && v.1.is_contiguous()) {
@@ -1481,7 +1540,47 @@ impl super::Storage {
             },
             _ => None,
         };
-        Ok(cq.attention_gpu(q.1.offset(), ck, k.1.offset(), cv, v.1.offset(), mask_arg, causal, scale, dims)?.map(super::Storage::new_cuda))
+        let gl = lse.map(|l| l.read());
+        let lse_ptr = match gl.as_deref() {
+            Some(super::StorageInner::Cuda(cl)) => cl.buf.device_ptr(),
+            Some(_) => return Ok(None),
+            None => 0,
+        };
+        Ok(cq.attention_gpu(q.1.offset(), ck, k.1.offset(), cv, v.1.offset(), mask_arg, causal, scale, dims, lse_ptr)?.map(super::Storage::new_cuda))
+    }
+
+    /// `(dq, dk, dv)` storages for [`CudaStorage::attention_bwd_gpu`]; every operand contiguous, the mask already broadcast to
+    /// `[lead.., l, s]` as in the forward call. `None` when it does not apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cuda_attention_bwd(q: (&super::Storage, &Layout), k: (&super::Storage, &Layout), v: (&super::Storage, &Layout), o: (&super::Storage, &Layout), g: (&super::Storage, &Layout), lse: &super::Storage, mask: Option<(&super::Storage, &Layout)>, causal: bool, scale: f64, dims: AttnDims) -> Result<Option<(super::Storage, super::Storage, super::Storage)>> {
+        let guards = [q.0.read(), k.0.read(), v.0.read(), o.0.read(), g.0.read(), lse.read()];
+        let mut cs = Vec::with_capacity(6);
+        for gd in &guards {
+            let super::StorageInner::Cuda(c) = &**gd else { return Ok(None) };
+            cs.push(c);
+        }
+        if ![q.1, k.1, v.1, o.1, g.1].iter().all(|l| l.is_contiguous()) {
+            return Ok(None);
+        }
+        let gm = mask.map(|m| m.0.read());
+        let mask_arg = match (&gm, mask) {
+            (Some(gd), Some((_, ml))) => match &**gd {
+                super::StorageInner::Cuda(cm) => {
+                    let st = ml.strides();
+                    let n = st.len();
+                    let (m_b, m_h) = match n {
+                        2 => (0, 0),
+                        3 => (st[0] as i64, 0),
+                        _ => (st[0] as i64, st[1] as i64),
+                    };
+                    Some((cm, ml.offset(), [m_b, m_h, st[n - 2] as i64, st[n - 1] as i64]))
+                }
+                _ => return Ok(None),
+            },
+            _ => None,
+        };
+        let r = CudaStorage::attention_bwd_gpu((cs[0], q.1.offset()), (cs[1], k.1.offset()), (cs[2], v.1.offset()), (cs[3], o.1.offset()), (cs[4], g.1.offset()), cs[5], mask_arg, causal, scale, dims)?;
+        Ok(r.map(|(a, b, c)| (super::Storage::new_cuda(a), super::Storage::new_cuda(b), super::Storage::new_cuda(c))))
     }
 }
 
